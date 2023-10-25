@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -29,6 +29,8 @@
 #include "mm-bearer.h"
 #include "mm-pco.h"
 
+#define MM_GDBUS_MODEM_3GPP MM_GDBUS_MODEM3GPP
+
 /**
  * SECTION: mm-modem-3gpp
  * @title: MMModem3gpp
@@ -45,10 +47,11 @@
 G_DEFINE_TYPE (MMModem3gpp, mm_modem_3gpp, MM_GDBUS_TYPE_MODEM3GPP_PROXY)
 
 struct _MMModem3gppPrivate {
-    /* Properties */
-    GMutex              initial_eps_bearer_settings_mutex;
-    guint               initial_eps_bearer_settings_id;
-    MMBearerProperties *initial_eps_bearer_settings;
+    /* Common mutex to sync access */
+    GMutex mutex;
+
+    PROPERTY_OBJECT_DECLARE (initial_eps_bearer_settings, MMBearerProperties)
+    PROPERTY_OBJECT_DECLARE (nr5g_registration_settings,  MMNr5gRegistrationSettings)
 };
 
 /*****************************************************************************/
@@ -278,37 +281,6 @@ mm_modem_3gpp_get_registration_state (MMModem3gpp *self)
 
 /*****************************************************************************/
 
-#ifndef MM_DISABLE_DEPRECATED
-
-/**
- * mm_modem_3gpp_get_subscription_state:
- * @self: A #MMModem.
- *
- * Get the current subscription status of the account. This value is only
- * available after the modem attempts to register with the network.
- *
- * The value of this property can only be obtained with operator specific logic
- * (e.g. processing specific PCO info), and therefore it doesn't make sense to
- * expose it in the ModemManager interface.
- *
- * Returns: A #MMModem3gppSubscriptionState value, specifying the current
- * subscription state.
- *
- * Since: 1.0
- * Deprecated: 1.10.0. The value of this property can only be obtained with
- * operator specific logic (e.g. processing specific PCO info), and therefore
- * it doesn't make sense to expose it in the ModemManager interface.
- */
-MMModem3gppSubscriptionState
-mm_modem_3gpp_get_subscription_state (MMModem3gpp *self)
-{
-    return MM_MODEM_3GPP_SUBSCRIPTION_STATE_UNKNOWN;
-}
-
-#endif /* MM_DISABLE_DEPRECATED */
-
-/*****************************************************************************/
-
 /**
  * mm_modem_3gpp_get_enabled_facility_locks:
  * @self: A #MMModem3gpp.
@@ -431,6 +403,27 @@ mm_modem_3gpp_dup_initial_eps_bearer_path (MMModem3gpp *self)
 
     RETURN_NON_EMPTY_STRING (
         mm_gdbus_modem3gpp_dup_initial_eps_bearer (MM_GDBUS_MODEM3GPP (self)));
+}
+
+/*****************************************************************************/
+
+/**
+ * mm_modem_3gpp_get_packet_service_state:
+ * @self: A #MMModem.
+ *
+ * Get the packet domain service state.
+ *
+ * Returns: A #MMModem3gppPacketServiceState value, specifying the current PS attach
+ *  state.
+ *
+ * Since: 1.20
+ */
+MMModem3gppPacketServiceState
+mm_modem_3gpp_get_packet_service_state (MMModem3gpp *self)
+{
+    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), MM_MODEM_3GPP_PACKET_SERVICE_STATE_UNKNOWN);
+
+    return mm_gdbus_modem3gpp_get_packet_service_state (MM_GDBUS_MODEM3GPP (self));
 }
 
 /*****************************************************************************/
@@ -659,67 +652,6 @@ mm_modem_3gpp_network_get_access_technology (const MMModem3gppNetwork *network)
 
 /*****************************************************************************/
 
-static void
-initial_eps_bearer_settings_updated (MMModem3gpp *self,
-                                     GParamSpec  *pspec)
-{
-    g_mutex_lock (&self->priv->initial_eps_bearer_settings_mutex);
-    {
-        GVariant *dictionary;
-
-        g_clear_object (&self->priv->initial_eps_bearer_settings);
-
-        dictionary = mm_gdbus_modem3gpp_get_initial_eps_bearer_settings (MM_GDBUS_MODEM3GPP (self));
-        if (dictionary) {
-            GError *error = NULL;
-
-            self->priv->initial_eps_bearer_settings = mm_bearer_properties_new_from_dictionary (dictionary, &error);
-            if (error) {
-                g_warning ("Invalid bearer properties received: %s", error->message);
-                g_error_free (error);
-            }
-        }
-    }
-    g_mutex_unlock (&self->priv->initial_eps_bearer_settings_mutex);
-}
-
-static void
-ensure_internal_initial_eps_bearer_settings (MMModem3gpp         *self,
-                                             MMBearerProperties **dup)
-{
-    g_mutex_lock (&self->priv->initial_eps_bearer_settings_mutex);
-    {
-        /* If this is the first time ever asking for the object, setup the
-         * update listener and the initial object, if any. */
-        if (!self->priv->initial_eps_bearer_settings_id) {
-            GVariant *dictionary;
-
-            dictionary = mm_gdbus_modem3gpp_dup_initial_eps_bearer_settings (MM_GDBUS_MODEM3GPP (self));
-            if (dictionary) {
-                GError *error = NULL;
-
-                self->priv->initial_eps_bearer_settings = mm_bearer_properties_new_from_dictionary (dictionary, &error);
-                if (error) {
-                    g_warning ("Invalid initial bearer properties: %s", error->message);
-                    g_error_free (error);
-                }
-                g_variant_unref (dictionary);
-            }
-
-            /* No need to clear this signal connection when freeing self */
-            self->priv->initial_eps_bearer_settings_id =
-                g_signal_connect (self,
-                                  "notify::initial-eps-bearer-properties",
-                                  G_CALLBACK (initial_eps_bearer_settings_updated),
-                                  NULL);
-        }
-
-        if (dup && self->priv->initial_eps_bearer_settings)
-            *dup = g_object_ref (self->priv->initial_eps_bearer_settings);
-    }
-    g_mutex_unlock (&self->priv->initial_eps_bearer_settings_mutex);
-}
-
 /**
  * mm_modem_3gpp_get_initial_eps_bearer_settings:
  * @self: A #MMModem3gpp.
@@ -737,16 +669,6 @@ ensure_internal_initial_eps_bearer_settings (MMModem3gpp         *self,
  *
  * Since: 1.10
  */
-MMBearerProperties *
-mm_modem_3gpp_get_initial_eps_bearer_settings (MMModem3gpp *self)
-{
-    MMBearerProperties *props = NULL;
-
-    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), NULL);
-
-    ensure_internal_initial_eps_bearer_settings (self, &props);
-    return props;
-}
 
 /**
  * mm_modem_3gpp_peek_initial_eps_bearer_settings:
@@ -765,14 +687,14 @@ mm_modem_3gpp_get_initial_eps_bearer_settings (MMModem3gpp *self)
  *
  * Since: 1.10
  */
-MMBearerProperties *
-mm_modem_3gpp_peek_initial_eps_bearer_settings (MMModem3gpp *self)
-{
-    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), NULL);
 
-    ensure_internal_initial_eps_bearer_settings (self, NULL);
-    return self->priv->initial_eps_bearer_settings;
-}
+/* helpers to match the property substring name with the one in our API */
+#define mm_gdbus_modem_3gpp_dup_initial_eps_bearer_settings mm_gdbus_modem3gpp_dup_initial_eps_bearer_settings
+
+PROPERTY_OBJECT_DEFINE_FAILABLE (initial_eps_bearer_settings,
+                                 Modem3gpp, modem_3gpp, MODEM_3GPP,
+                                 MMBearerProperties,
+                                 mm_bearer_properties_new_from_dictionary)
 
 /*****************************************************************************/
 
@@ -818,6 +740,8 @@ create_networks_list (GVariant *variant)
         list = g_list_prepend (list, network);
         g_variant_unref (dict);
     }
+
+    g_variant_unref (variant);
 
     return list;
 }
@@ -1260,11 +1184,435 @@ mm_modem_3gpp_set_initial_eps_bearer_settings_sync (MMModem3gpp         *self,
 
 /*****************************************************************************/
 
+/**
+ * mm_modem_3gpp_disable_facility_lock:
+ * @self: A #MMModem3gpp.
+ * @facility: Single bit value describing the modem personalization lock to disable.
+ * @control_key: String with control key required to unlock the personalization.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @callback: A #GAsyncReadyCallback to call when the request is satisfied or
+ *  %NULL.
+ * @user_data: User data to pass to @callback.
+ *
+ * Asynchronously disables the modem personalization lock.
+ *
+ * When the operation is finished, @callback will be invoked in the
+ * <link linkend="g-main-context-push-thread-default">thread-default main loop</link>
+ * of the thread you are calling this method from. You can then call
+ * mm_modem_3gpp_disable_facility_lock_finish() to get the result of
+ * the operation.
+ *
+ * Since: 1.20
+ */
+void
+mm_modem_3gpp_disable_facility_lock (MMModem3gpp         *self,
+                                     MMModem3gppFacility  facility,
+                                     const gchar         *control_key,
+                                     GCancellable        *cancellable,
+                                     GAsyncReadyCallback  callback,
+                                     gpointer             user_data)
+{
+    GVariant *properties;
+
+    properties = g_variant_ref_sink (g_variant_new ("(us)", (guint)facility, control_key));
+    mm_gdbus_modem3gpp_call_disable_facility_lock (MM_GDBUS_MODEM3GPP (self),
+                                                   properties,
+                                                   cancellable,
+                                                   callback,
+                                                   user_data);
+    g_variant_unref (properties);
+}
+
+/**
+ * mm_modem_3gpp_disable_facility_lock_finish:
+ * @self: A #MMModem3gpp.
+ * @res: The #GAsyncResult obtained from the #GAsyncReadyCallback passed to
+ *  mm_modem_3gpp_disable_facility_lock().
+ * @error: Return location for error or %NULL.
+ *
+ * Finishes an operation started with mm_modem_3gpp_disable_facility_lock().
+ *
+ * Returns: %TRUE if the operation was successful, %FALSE if @error is set.
+ *
+ * Since: 1.20
+ */
+gboolean
+mm_modem_3gpp_disable_facility_lock_finish (MMModem3gpp   *self,
+                                            GAsyncResult  *res,
+                                            GError       **error)
+{
+    return mm_gdbus_modem3gpp_call_disable_facility_lock_finish (MM_GDBUS_MODEM3GPP (self),
+                                                                 res,
+                                                                 error);
+}
+
+/**
+ * mm_modem_3gpp_disable_facility_lock_sync:
+ * @self: A #MMModem3gpp.
+ * @facility: Single bit value describing the modem personalization lock to disable.
+ * @control_key: String with control key required to unlock the personalization.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @error: Return location for error or %NULL.
+ *
+ * Synchronously disables facility lock.
+ *
+ * The calling thread is blocked until a reply is received.
+ * See mm_modem_3gpp_disable_facility_lock() for the asynchronous
+ * version of this method.
+ *
+ * Returns: %TRUE if the operation was successful, %FALSE if @error is set.
+ *
+ * Since: 1.20
+ */
+gboolean
+mm_modem_3gpp_disable_facility_lock_sync (MMModem3gpp          *self,
+                                          MMModem3gppFacility   facility,
+                                          const gchar          *control_key,
+                                          GCancellable         *cancellable,
+                                          GError              **error)
+{
+    GVariant *properties;
+    gboolean  result;
+
+    properties = g_variant_ref_sink (g_variant_new ("(us)", (guint)facility, control_key));
+    result = mm_gdbus_modem3gpp_call_disable_facility_lock_sync (MM_GDBUS_MODEM3GPP (self),
+                                                                 properties,
+                                                                 cancellable,
+                                                                 error);
+    g_variant_unref (properties);
+    return result;
+}
+
+/*****************************************************************************/
+
+/**
+ * mm_modem_3gpp_set_packet_service_state_finish:
+ * @self: A #MMModem3gpp.
+ * @res: The #GAsyncResult obtained from the #GAsyncReadyCallback passed to
+ *  mm_modem_3gpp_set_packet_service_state().
+ * @error: Return location for error or %NULL.
+ *
+ * Finishes an operation started with mm_modem_3gpp_set_packet_service_state().
+ *
+ * Returns: %TRUE if the operation was successful, %FALSE if @error is set.
+ *
+ * Since: 1.20
+ */
+gboolean
+mm_modem_3gpp_set_packet_service_state_finish (MMModem3gpp   *self,
+                                               GAsyncResult  *res,
+                                               GError       **error)
+{
+    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), FALSE);
+
+    return mm_gdbus_modem3gpp_call_set_packet_service_state_finish (MM_GDBUS_MODEM3GPP (self), res, error);
+}
+
+/**
+ * mm_modem_3gpp_set_packet_service_state:
+ * @self: A #MMModem3gpp.
+ * @state: A #MMModem3gppPacketServiceState.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @callback: A #GAsyncReadyCallback to call when the request is satisfied or
+ *  %NULL.
+ * @user_data: User data to pass to @callback.
+ *
+ * Asynchronously tries to attach or detach from the packet domain service.
+ *
+ *
+ * When the operation is finished, @callback will be invoked in the
+ * <link linkend="g-main-context-push-thread-default">thread-default main loop</link>
+ * of the thread you are calling this method from. You can then call
+ * mm_modem_3gpp_set_packet_service_state_finish() to get the result of the operation.
+ *
+ * See mm_modem_3gpp_set_packet_service_state_sync() for the synchronous,
+ * blocking version of this method.
+ *
+ * Since: 1.20
+ */
+void
+mm_modem_3gpp_set_packet_service_state (MMModem3gpp                   *self,
+                                        MMModem3gppPacketServiceState  state,
+                                        GCancellable                  *cancellable,
+                                        GAsyncReadyCallback            callback,
+                                        gpointer                       user_data)
+{
+    g_return_if_fail (MM_IS_MODEM_3GPP (self));
+
+    mm_gdbus_modem3gpp_call_set_packet_service_state (MM_GDBUS_MODEM3GPP (self), state, cancellable, callback, user_data);
+}
+
+/**
+ * mm_modem_3gpp_set_packet_service_state_sync:
+ * @self: A #MMModem3gpp.
+ * @state: A #MMModem3gppPacketServiceState.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @error: Return location for error or %NULL.
+ *
+ * Synchronously tries to attach or detach from the packet domain service.
+ *
+ * The calling thread is blocked until a reply is received. See
+ * mm_modem_3gpp_set_packet_service_state() for the asynchronous version of
+ * this method.
+ *
+ * Returns: %TRUE if the operation was successful, %FALSE if @error is set.
+ *
+ * Since: 1.20
+ */
+gboolean
+mm_modem_3gpp_set_packet_service_state_sync (MMModem3gpp                    *self,
+                                             MMModem3gppPacketServiceState   state,
+                                             GCancellable                   *cancellable,
+                                             GError                        **error)
+{
+    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), FALSE);
+
+    return mm_gdbus_modem3gpp_call_set_packet_service_state_sync (MM_GDBUS_MODEM3GPP (self), state, cancellable, error);
+}
+
+/*****************************************************************************/
+
+/**
+ * mm_modem_3gpp_get_nr5g_registration_settings:
+ * @self: A #MMModem3gpp.
+ *
+ * Gets a #MMNr5gRegistrationSettings object including the configured 5GNR
+ * registration settings.
+ *
+ * <warning>The values reported by @self are not updated when the values in the
+ * interface change. Instead, the client is expected to call
+ * mm_modem_3gpp_get_nr5g_registration_settings() again to get a new
+ * #MMNr5gRegistrationSettings with the new values.</warning>
+ *
+ * Returns: (transfer full): A #MMNr5gRegistrationSettings that must be freed with
+ * g_object_unref() or %NULL if unknown.
+ *
+ * Since: 1.20
+ */
+
+/**
+ * mm_modem_3gpp_peek_nr5g_registration_settings:
+ * @self: A #MMModem3gpp.
+ *
+ * Gets a #MMNr5gRegistrationSettings object including the configured 5GNR
+ * registration settings.
+ *
+ * <warning>The returned value is only valid until the property changes so
+ * it is only safe to use this function on the thread where
+ * @self was constructed. Use mm_modem_3gpp_get_nr5g_registration_settings()
+ * if on another thread.</warning>
+ *
+ * Returns: (transfer none): A #MMNr5gRegistrationSettings Do not free the returned
+ * value, it belongs to @self.
+ *
+ * Since: 1.20
+ */
+
+/* helpers to match the property substring name with the one in our API */
+#define mm_gdbus_modem_3gpp_dup_nr5g_registration_settings mm_gdbus_modem3gpp_dup_nr5g_registration_settings
+PROPERTY_OBJECT_DEFINE_FAILABLE (nr5g_registration_settings,
+                                 Modem3gpp, modem_3gpp, MODEM_3GPP,
+                                 MMNr5gRegistrationSettings,
+                                 mm_nr5g_registration_settings_new_from_dictionary)
+
+/*****************************************************************************/
+
+/**
+ * mm_modem_3gpp_set_nr5g_registration_settings_finish:
+ * @self: A #MMModem3gpp.
+ * @res: The #GAsyncResult obtained from the #GAsyncReadyCallback passed to
+ *  mm_modem_3gpp_set_nr5g_registration_settings().
+ * @error: Return location for error or %NULL.
+ *
+ * Finishes an operation started with mm_modem_3gpp_set_nr5g_registration_settings().
+ *
+ * Returns: %TRUE if the operation was successful, %FALSE if @error is set.
+ *
+ * Since: 1.20
+ */
+gboolean
+mm_modem_3gpp_set_nr5g_registration_settings_finish (MMModem3gpp   *self,
+                                                     GAsyncResult  *res,
+                                                     GError       **error)
+{
+    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), FALSE);
+
+    return mm_gdbus_modem3gpp_call_set_nr5g_registration_settings_finish (MM_GDBUS_MODEM3GPP (self), res, error);
+}
+
+/**
+ * mm_modem_3gpp_set_nr5g_registration_settings:
+ * @self: A #MMModem3gpp.
+ * @settings: A #MMNr5gRegistrationSettings.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @callback: A #GAsyncReadyCallback to call when the request is satisfied or %NULL.
+ * @user_data: User data to pass to @callback.
+ *
+ * Asynchronously configures the 5GNR registration settings.
+ *
+ * When the operation is finished, @callback will be invoked in the
+ * <link linkend="g-main-context-push-thread-default">thread-default main loop</link>
+ * of the thread you are calling this method from. You can then call
+ * mm_modem_3gpp_set_nr5g_registration_settings_finish() to get the result of the operation.
+ *
+ * See mm_modem_3gpp_set_nr5g_registration_settings_sync() for the synchronous,
+ * blocking version of this method.
+ *
+ * Since: 1.20
+ */
+void
+mm_modem_3gpp_set_nr5g_registration_settings (MMModem3gpp                *self,
+                                              MMNr5gRegistrationSettings *settings,
+                                              GCancellable               *cancellable,
+                                              GAsyncReadyCallback         callback,
+                                              gpointer                    user_data)
+{
+    g_autoptr(GVariant) dictionary = NULL;
+
+    g_return_if_fail (MM_IS_MODEM_3GPP (self));
+
+    dictionary = mm_nr5g_registration_settings_get_dictionary (settings);
+
+    mm_gdbus_modem3gpp_call_set_nr5g_registration_settings (MM_GDBUS_MODEM3GPP (self), dictionary, cancellable, callback, user_data);
+}
+
+/**
+ * mm_modem_3gpp_set_nr5g_registration_settings_sync:
+ * @self: A #MMModem3gpp.
+ * @settings: A #MMNr5gRegistrationSettings.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @error: Return location for error or %NULL.
+ *
+ * Synchronously configures the 5GNR registration settings.
+ *
+ * The calling thread is blocked until a reply is received. See
+ * mm_modem_3gpp_set_nr5g_registration_settings() for the asynchronous
+ * version of this method.
+ *
+ * Returns: %TRUE if the operation was successful, %FALSE if @error is set.
+ *
+ * Since: 1.20
+ */
+gboolean
+mm_modem_3gpp_set_nr5g_registration_settings_sync (MMModem3gpp                 *self,
+                                                   MMNr5gRegistrationSettings  *settings,
+                                                   GCancellable                *cancellable,
+                                                   GError                     **error)
+{
+    g_autoptr(GVariant) dictionary = NULL;
+
+    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), FALSE);
+
+    dictionary = mm_nr5g_registration_settings_get_dictionary (settings);
+
+    return mm_gdbus_modem3gpp_call_set_nr5g_registration_settings_sync (MM_GDBUS_MODEM3GPP (self), dictionary, cancellable, error);
+}
+
+/*****************************************************************************/
+
+/**
+ * mm_modem_3gpp_set_carrier_lock_finish:
+ * @self: A #MMModem3gpp.
+ * @res: The #GAsyncResult obtained from the #GAsyncReadyCallback passed to mm_gdbus_modem3gpp_call_set_carrier_lock().
+ * @error: Return location for error or %NULL.
+ *
+ * Finishes an operation started with mm_modem_3gpp_set_carrier_lock().
+ *
+ * Returns: (skip): %TRUE if the call succeded, %FALSE if @error is set.
+ * Since: 1.22
+ */
+gboolean
+mm_modem_3gpp_set_carrier_lock_finish (MMModem3gpp   *self,
+                                       GAsyncResult  *res,
+                                       GError       **error)
+{
+    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), FALSE);
+
+    return mm_gdbus_modem3gpp_call_set_carrier_lock_finish (MM_GDBUS_MODEM3GPP (self), res, error);
+}
+
+/**
+ * mm_modem_3gpp_set_carrier_lock:
+ * @self: A #MMModem3gpp.
+ * @data: (array length=data_size): Carrier lock information.
+ * @data_size: size of @data.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @callback: A #GAsyncReadyCallback to call when the request is satisfied or
+ *  %NULL.
+ * @user_data: User data to pass to @callback.
+ *
+ * Asynchronously sends the carrier lock information to the modem.
+ *
+ * When the operation is finished, @callback will be invoked in the
+ * <link linkend="g-main-context-push-thread-default">thread-default main loop</link>
+ * of the thread you are calling this method from. You can then call
+ * mm_modem_location_inject_assistance_data_finish() to get the result of the
+ * operation.
+ *
+ * See mm_modem_3gpp_set_carrier_lock_sync() for the synchronous,
+ * blocking version of this method.
+ *
+ * Since: 1.22
+ */
+void
+mm_modem_3gpp_set_carrier_lock (MMModem3gpp         *self,
+                                const guint8        *data,
+                                gsize                data_size,
+                                GCancellable        *cancellable,
+                                GAsyncReadyCallback  callback,
+                                gpointer             user_data)
+{
+    g_return_if_fail (MM_IS_MODEM_3GPP (self));
+
+    mm_gdbus_modem3gpp_call_set_carrier_lock (MM_GDBUS_MODEM3GPP (self),
+                                              g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, data, data_size, sizeof (guint8)),
+                                              cancellable,
+                                              callback,
+                                              user_data);
+}
+
+/**
+ * mm_modem_3gpp_set_carrier_lock_sync:
+ * @self: A #MMModem3gpp.
+ * @data: (array length=data_size): Carrier lock information.
+ * @data_size: size of @data.
+ * @cancellable: (allow-none): A #GCancellable or %NULL.
+ * @error: Return location for error or %NULL.
+ *
+ * Synchronously sends the carrier lock information to the modem..
+ *
+ * The calling thread is blocked until a reply is received. See
+ * mm_modem_3gpp_set_carrier_lock() for the asynchronous version of this method.
+ *
+ * Returns: %TRUE if the carrier network info is successfully send, %FALSE if @error is set.
+ *
+ * Since: 1.22
+ */
+gboolean
+mm_modem_3gpp_set_carrier_lock_sync (MMModem3gpp   *self,
+                                     const guint8  *data,
+                                     gsize          data_size,
+                                     GCancellable  *cancellable,
+                                     GError       **error)
+{
+    g_return_val_if_fail (MM_IS_MODEM_3GPP (self), FALSE);
+
+    return mm_gdbus_modem3gpp_call_set_carrier_lock_sync (MM_GDBUS_MODEM3GPP (self),
+                                                          g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, data, data_size, sizeof (guint8)),
+                                                          cancellable,
+                                                          error);
+}
+
+/*****************************************************************************/
+
 static void
 mm_modem_3gpp_init (MMModem3gpp *self)
 {
     self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self, MM_TYPE_MODEM_3GPP, MMModem3gppPrivate);
-    g_mutex_init (&self->priv->initial_eps_bearer_settings_mutex);
+    g_mutex_init (&self->priv->mutex);
+
+    PROPERTY_INITIALIZE (initial_eps_bearer_settings, "initial-eps-bearer-settings")
+    PROPERTY_INITIALIZE (nr5g_registration_settings,  "nr5g-registration-settings")
 }
 
 static void
@@ -1272,19 +1620,12 @@ finalize (GObject *object)
 {
     MMModem3gpp *self = MM_MODEM_3GPP (object);
 
-    g_mutex_clear (&self->priv->initial_eps_bearer_settings_mutex);
+    g_mutex_clear (&self->priv->mutex);
+
+    PROPERTY_OBJECT_FINALIZE (initial_eps_bearer_settings);
+    PROPERTY_OBJECT_FINALIZE (nr5g_registration_settings);
 
     G_OBJECT_CLASS (mm_modem_3gpp_parent_class)->finalize (object);
-}
-
-static void
-dispose (GObject *object)
-{
-    MMModem3gpp *self = MM_MODEM_3GPP (object);
-
-    g_clear_object (&self->priv->initial_eps_bearer_settings);
-
-    G_OBJECT_CLASS (mm_modem_3gpp_parent_class)->dispose (object);
 }
 
 static void
@@ -1294,7 +1635,5 @@ mm_modem_3gpp_class_init (MMModem3gppClass *modem_class)
 
     g_type_class_add_private (object_class, sizeof (MMModem3gppPrivate));
 
-    /* Virtual methods */
-    object_class->dispose  = dispose;
     object_class->finalize = finalize;
 }

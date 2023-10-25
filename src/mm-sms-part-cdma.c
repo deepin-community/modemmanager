@@ -13,6 +13,7 @@
  * Copyright (C) 2013 Google, Inc.
  */
 
+#include "mm-sms-part.h"
 #include <ctype.h>
 #include <string.h>
 
@@ -317,24 +318,17 @@ mm_sms_part_cdma_new_from_pdu (guint         index,
                                gpointer      log_object,
                                GError      **error)
 {
-    gsize pdu_len;
-    guint8 *pdu;
-    MMSmsPart *part;
+    g_autofree guint8 *pdu = NULL;
+    gsize              pdu_len;
 
     /* Convert PDU from hex to binary */
-    pdu = (guint8 *) mm_utils_hexstr2bin (hexpdu, &pdu_len);
+    pdu = mm_utils_hexstr2bin (hexpdu, -1, &pdu_len, error);
     if (!pdu) {
-        g_set_error_literal (error,
-                             MM_CORE_ERROR,
-                             MM_CORE_ERROR_FAILED,
-                             "Couldn't convert CDMA PDU from hex to binary");
+        g_prefix_error (error, "Couldn't convert CDMA PDU from hex to binary: ");
         return NULL;
     }
 
-    part = mm_sms_part_cdma_new_from_binary_pdu (index, pdu, pdu_len, log_object, error);
-    g_free (pdu);
-
-    return part;
+    return mm_sms_part_cdma_new_from_binary_pdu (index, pdu, pdu_len, log_object, error);
 }
 
 struct Parameter {
@@ -681,7 +675,7 @@ read_cause_codes (MMSmsPart              *sms_part,
     guint8 cause_code;
     MMSmsDeliveryState delivery_state;
 
-    g_assert (parameter->parameter_id == PARAMETER_ID_BEARER_REPLY_OPTION);
+    g_assert (parameter->parameter_id == PARAMETER_ID_CAUSE_CODES);
 
     if (parameter->parameter_len != 1 && parameter->parameter_len != 2) {
         mm_obj_dbg (log_object, "        invalid cause codes length found (%u): ignoring",
@@ -767,6 +761,7 @@ read_bearer_data_message_identifier (MMSmsPart              *sms_part,
     message_id = ((read_bits (&subparameter->parameter_value[0], 4, 8) << 8) |
                   (read_bits (&subparameter->parameter_value[1], 4, 8)));
     message_id = GUINT16_FROM_BE (message_id);
+    mm_sms_part_set_message_id (sms_part, message_id);
     mm_obj_dbg (log_object, "            message id: %u", (guint) message_id);
 
     header_ind = read_bits (&subparameter->parameter_value[2], 4, 1);
@@ -781,6 +776,8 @@ read_bearer_data_user_data (MMSmsPart              *sms_part,
     guint8 message_encoding;
     guint8 message_type = 0;
     guint8 num_fields;
+    guint wdp_total_segments;
+    guint wdp_segment_number;
     guint byte_offset = 0;
     guint bit_offset = 0;
 
@@ -792,32 +789,39 @@ read_bearer_data_user_data (MMSmsPart              *sms_part,
         }                           \
     } while (0)
 
-#define SUBPARAMETER_SIZE_CHECK(required_size)                             \
-    if (subparameter->parameter_len < required_size) {                  \
-        mm_obj_dbg (log_object, "        cannot read user data, need at least %u bytes (got %u)", \
-                required_size,                                          \
-                subparameter->parameter_len);                           \
-        return;                                                         \
-    }
+#define SUBPARAMETER_SIZE_CHECK_BITS(required_bits)                     \
+    do {                                                                \
+        guint required_bytes;                                           \
+                                                                        \
+        required_bytes = byte_offset + ((bit_offset + required_bits) / 8); \
+        if ((bit_offset + required_bits) % 8)                           \
+            required_bytes++;                                           \
+        if (subparameter->parameter_len < required_bytes) {             \
+            mm_obj_dbg (log_object, "        cannot read user data, need at least %u bytes (got %u)", \
+                        required_bytes,                                 \
+                        subparameter->parameter_len);                   \
+            return;                                                     \
+        }                                                               \
+    } while (0)
 
     g_assert (subparameter->parameter_id == SUBPARAMETER_ID_USER_DATA);
 
     /* Message encoding */
-    SUBPARAMETER_SIZE_CHECK (1);
+    SUBPARAMETER_SIZE_CHECK_BITS (5);
     message_encoding = read_bits (&subparameter->parameter_value[byte_offset], bit_offset, 5);
     OFFSETS_UPDATE (5);
     mm_obj_dbg (log_object, "            message encoding: %s", encoding_to_string (message_encoding));
 
     /* Message type, only if extended protocol message */
     if (message_encoding == ENCODING_EXTENDED_PROTOCOL_MESSAGE) {
-        SUBPARAMETER_SIZE_CHECK (2);
+        SUBPARAMETER_SIZE_CHECK_BITS (8);
         message_type = read_bits (&subparameter->parameter_value[byte_offset], bit_offset, 8);
         OFFSETS_UPDATE (8);
         mm_obj_dbg (log_object, "            message type: %u", message_type);
     }
 
     /* Number of fields */
-    SUBPARAMETER_SIZE_CHECK (byte_offset + 1 + ((bit_offset + 8) / 8));
+    SUBPARAMETER_SIZE_CHECK_BITS (8);
     num_fields = read_bits (&subparameter->parameter_value[byte_offset], bit_offset, 8);
     OFFSETS_UPDATE (8);
     mm_obj_dbg (log_object, "            num fields: %u", num_fields);
@@ -828,13 +832,39 @@ read_bearer_data_user_data (MMSmsPart              *sms_part,
         GByteArray *data;
         guint i;
 
-        SUBPARAMETER_SIZE_CHECK (byte_offset + 1 + ((bit_offset + (num_fields * 8)) / 8));
+        SUBPARAMETER_SIZE_CHECK_BITS (num_fields * 8);
 
         data = g_byte_array_sized_new (num_fields);
         g_byte_array_set_size (data, num_fields);
         for (i = 0; i < num_fields; i++) {
             data->data[i] = read_bits (&subparameter->parameter_value[byte_offset], bit_offset, 8);
             OFFSETS_UPDATE (8);
+        }
+
+        if ((mm_sms_part_get_cdma_teleservice_id (sms_part) == MM_SMS_CDMA_TELESERVICE_ID_WAP) &&
+            (num_fields >= 3) &&
+            (data->data[0] == 0x00)) {
+            /* This is a CDMA WAP WDP message with a segmentation header, as
+             * defined in section 6.5 of WAP-256-WDP-20010614-a */
+            wdp_total_segments = data->data[1];
+            wdp_segment_number = data->data[2];
+            mm_obj_dbg (log_object, "    WAP WDP Payload, segment: %d total: %d",
+                        wdp_segment_number, wdp_total_segments);
+
+            /* Use message id as the reference number, since it is the same
+             * across message sets*/
+            mm_sms_part_set_concat_reference (sms_part, mm_sms_part_get_message_id (sms_part));
+            mm_sms_part_set_concat_max (sms_part, wdp_total_segments);
+            /* Segment Number is 0-indexed, concat_sequence expects 1-indexed values */
+            mm_sms_part_set_concat_sequence (sms_part, wdp_segment_number + 1);
+
+            if (wdp_segment_number == 0) {
+                /* Remove the 3 byte segmentation header as well as the 16 bit source and dest port fields */
+                g_byte_array_remove_range (data, 0, 7);
+            } else {
+                /* Remove segmentation header from additional segments to merge cleanly */
+                g_byte_array_remove_range (data, 0, 3);
+            }
         }
 
         mm_obj_dbg (log_object, "            data: (%u bytes)", num_fields);
@@ -846,7 +876,13 @@ read_bearer_data_user_data (MMSmsPart              *sms_part,
         gchar *text;
         guint i;
 
-        SUBPARAMETER_SIZE_CHECK (byte_offset + ((bit_offset + (num_fields * 7)) / 8));
+        if (num_fields == 0) {
+            mm_obj_dbg (log_object, "            text: ''");
+            mm_sms_part_set_text (sms_part, "");
+            break;
+        }
+
+        SUBPARAMETER_SIZE_CHECK_BITS (num_fields * 7);
 
         text = g_malloc (num_fields + 1);
         for (i = 0; i < num_fields; i++) {
@@ -865,7 +901,13 @@ read_bearer_data_user_data (MMSmsPart              *sms_part,
         gchar *text;
         guint i;
 
-        SUBPARAMETER_SIZE_CHECK (byte_offset + 1 + ((bit_offset + (num_fields * 8)) / 8));
+        if (num_fields == 0) {
+            mm_obj_dbg (log_object, "            text: ''");
+            mm_sms_part_set_text (sms_part, "");
+            break;
+        }
+
+        SUBPARAMETER_SIZE_CHECK_BITS (num_fields * 8);
 
         latin = g_malloc (num_fields + 1);
         for (i = 0; i < num_fields; i++) {
@@ -892,10 +934,16 @@ read_bearer_data_user_data (MMSmsPart              *sms_part,
         guint i;
         guint num_bytes;
 
+        if (num_fields == 0) {
+            mm_obj_dbg (log_object, "            text: ''");
+            mm_sms_part_set_text (sms_part, "");
+            break;
+        }
+
         /* 2 bytes per field! */
         num_bytes = num_fields * 2;
 
-        SUBPARAMETER_SIZE_CHECK (byte_offset + 1 + ((bit_offset + (num_bytes * 8)) / 8));
+        SUBPARAMETER_SIZE_CHECK_BITS (num_bytes * 8);
 
         utf16 = g_malloc (num_bytes);
         for (i = 0; i < num_bytes; i++) {
@@ -920,7 +968,7 @@ read_bearer_data_user_data (MMSmsPart              *sms_part,
     }
 
 #undef OFFSETS_UPDATE
-#undef SUBPARAMETER_SIZE_CHECK
+#undef SUBPARAMETER_SIZE_CHECK_BITS
 }
 
 static void
@@ -1375,65 +1423,49 @@ write_bearer_data_message_identifier (MMSmsPart  *part,
     return TRUE;
 }
 
-static void
+static GByteArray *
 decide_best_encoding (const gchar *text,
                       gpointer     log_object,
-                      GByteArray **out,
                       guint       *num_fields,
                       guint       *num_bits_per_field,
-                      Encoding    *encoding)
+                      Encoding    *encoding,
+                      GError     **error)
 {
-    guint ascii_unsupported = 0;
-    guint i;
-    guint len;
-    g_autoptr(GError) error = NULL;
+    g_autoptr(GByteArray) barray = NULL;
+    MMModemCharset        target_charset = MM_MODEM_CHARSET_UNKNOWN;
+    guint                 len;
 
     len = strlen (text);
 
-    /* Check if we can do ASCII-7 */
-    for (i = 0; i < len; i++) {
-        if (text[i] & 0x80) {
-            ascii_unsupported++;
-            break;
-        }
+    if (mm_charset_can_convert_to (text, MM_MODEM_CHARSET_IRA))
+        target_charset = MM_MODEM_CHARSET_IRA;
+    else if (mm_charset_can_convert_to (text, MM_MODEM_CHARSET_8859_1))
+        target_charset = MM_MODEM_CHARSET_8859_1;
+    else
+        target_charset = MM_MODEM_CHARSET_UCS2;
+
+    barray = mm_modem_charset_bytearray_from_utf8 (text, target_charset, FALSE, error);
+    if (!barray) {
+        g_prefix_error (error, "Couldn't decide best encoding: ");
+        return NULL;
     }
 
-    /* If ASCII-7 already supported, done we are */
-    if (!ascii_unsupported) {
-        *out = g_byte_array_sized_new (len);
-        g_byte_array_append (*out, (const guint8 *)text, len);
+    if (target_charset == MM_MODEM_CHARSET_IRA) {
         *num_fields = len;
         *num_bits_per_field = 7;
         *encoding = ENCODING_ASCII_7BIT;
-        return;
-    }
-
-    /* Check if we can do Latin encoding */
-    if (mm_charset_can_convert_to (text, MM_MODEM_CHARSET_8859_1)) {
-        *out = g_byte_array_sized_new (len);
-        if (!mm_modem_charset_byte_array_append (*out,
-                                                 text,
-                                                 FALSE,
-                                                 MM_MODEM_CHARSET_8859_1,
-                                                 &error))
-            mm_obj_warn (log_object, "failed to convert to latin encoding: %s", error->message);
-        *num_fields = (*out)->len;
+    } else if (target_charset == MM_MODEM_CHARSET_8859_1) {
+        *num_fields = barray->len;
         *num_bits_per_field = 8;
         *encoding = ENCODING_LATIN;
-        return;
-    }
+    } else if (target_charset == MM_MODEM_CHARSET_UCS2) {
+        *num_fields = barray->len / 2;
+        *num_bits_per_field = 16;
+        *encoding = ENCODING_UNICODE;
+    } else
+        g_assert_not_reached ();
 
-    /* If no Latin and no ASCII, default to UTF-16 */
-    *out = g_byte_array_sized_new (len * 2);
-    if (!mm_modem_charset_byte_array_append (*out,
-                                             text,
-                                             FALSE,
-                                             MM_MODEM_CHARSET_UCS2,
-                                             &error))
-        mm_obj_warn (log_object, "failed to convert to UTF-16 encoding: %s", error->message);
-    *num_fields = (*out)->len / 2;
-    *num_bits_per_field = 16;
-    *encoding = ENCODING_UNICODE;
+    return g_steal_pointer (&barray);
 }
 
 static gboolean
@@ -1477,12 +1509,14 @@ write_bearer_data_user_data (MMSmsPart  *part,
 
     /* Text or Data */
     if (text) {
-        decide_best_encoding (text,
-                              log_object,
-                              &converted,
-                              &num_fields,
-                              &num_bits_per_field,
-                              &encoding);
+        converted = decide_best_encoding (text,
+                                          log_object,
+                                          &num_fields,
+                                          &num_bits_per_field,
+                                          &encoding,
+                                          error);
+        if (!converted)
+            return FALSE;
         aux = (const GByteArray *)converted;
     } else {
         aux = data;

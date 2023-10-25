@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -33,6 +33,7 @@
 #include "mm-gdbus-modem.h"
 #include "mm-modem.h"
 #include "mm-modem-3gpp.h"
+#include "mm-modem-3gpp-profile-manager.h"
 #include "mm-modem-3gpp-ussd.h"
 #include "mm-modem-cdma.h"
 #include "mm-modem-simple.h"
@@ -41,6 +42,7 @@
 #include "mm-modem-voice.h"
 #include "mm-modem-time.h"
 #include "mm-modem-firmware.h"
+#include "mm-modem-sar.h"
 #include "mm-modem-signal.h"
 #include "mm-modem-oma.h"
 
@@ -79,31 +81,35 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMObject, g_object_unref)
 const gchar *mm_object_get_path (MMObject *self);
 gchar       *mm_object_dup_path (MMObject *self);
 
-MMModem          *mm_object_get_modem            (MMObject *self);
-MMModem3gpp      *mm_object_get_modem_3gpp       (MMObject *self);
-MMModem3gppUssd  *mm_object_get_modem_3gpp_ussd  (MMObject *self);
-MMModemCdma      *mm_object_get_modem_cdma       (MMObject *self);
-MMModemSimple    *mm_object_get_modem_simple     (MMObject *self);
-MMModemLocation  *mm_object_get_modem_location   (MMObject *self);
-MMModemMessaging *mm_object_get_modem_messaging  (MMObject *self);
-MMModemVoice     *mm_object_get_modem_voice      (MMObject *self);
-MMModemTime      *mm_object_get_modem_time       (MMObject *self);
-MMModemFirmware  *mm_object_get_modem_firmware   (MMObject *self);
-MMModemSignal    *mm_object_get_modem_signal     (MMObject *self);
-MMModemOma       *mm_object_get_modem_oma        (MMObject *self);
+MMModem                    *mm_object_get_modem                       (MMObject *self);
+MMModem3gpp                *mm_object_get_modem_3gpp                  (MMObject *self);
+MMModem3gppProfileManager  *mm_object_get_modem_3gpp_profile_manager  (MMObject *self);
+MMModem3gppUssd            *mm_object_get_modem_3gpp_ussd             (MMObject *self);
+MMModemCdma                *mm_object_get_modem_cdma                  (MMObject *self);
+MMModemSimple              *mm_object_get_modem_simple                (MMObject *self);
+MMModemLocation            *mm_object_get_modem_location              (MMObject *self);
+MMModemMessaging           *mm_object_get_modem_messaging             (MMObject *self);
+MMModemVoice               *mm_object_get_modem_voice                 (MMObject *self);
+MMModemTime                *mm_object_get_modem_time                  (MMObject *self);
+MMModemFirmware            *mm_object_get_modem_firmware              (MMObject *self);
+MMModemSar                 *mm_object_get_modem_sar                   (MMObject *self);
+MMModemSignal              *mm_object_get_modem_signal                (MMObject *self);
+MMModemOma                 *mm_object_get_modem_oma                   (MMObject *self);
 
-MMModem          *mm_object_peek_modem           (MMObject *self);
-MMModem3gpp      *mm_object_peek_modem_3gpp      (MMObject *self);
-MMModem3gppUssd  *mm_object_peek_modem_3gpp_ussd (MMObject *self);
-MMModemCdma      *mm_object_peek_modem_cdma      (MMObject *self);
-MMModemSimple    *mm_object_peek_modem_simple    (MMObject *self);
-MMModemLocation  *mm_object_peek_modem_location  (MMObject *self);
-MMModemMessaging *mm_object_peek_modem_messaging (MMObject *self);
-MMModemVoice     *mm_object_peek_modem_voice     (MMObject *self);
-MMModemTime      *mm_object_peek_modem_time      (MMObject *self);
-MMModemFirmware  *mm_object_peek_modem_firmware  (MMObject *self);
-MMModemSignal    *mm_object_peek_modem_signal    (MMObject *self);
-MMModemOma       *mm_object_peek_modem_oma       (MMObject *self);
+MMModem                    *mm_object_peek_modem                      (MMObject *self);
+MMModem3gpp                *mm_object_peek_modem_3gpp                 (MMObject *self);
+MMModem3gppProfileManager  *mm_object_peek_modem_3gpp_profile_manager (MMObject *self);
+MMModem3gppUssd            *mm_object_peek_modem_3gpp_ussd            (MMObject *self);
+MMModemCdma                *mm_object_peek_modem_cdma                 (MMObject *self);
+MMModemSimple              *mm_object_peek_modem_simple               (MMObject *self);
+MMModemLocation            *mm_object_peek_modem_location             (MMObject *self);
+MMModemMessaging           *mm_object_peek_modem_messaging            (MMObject *self);
+MMModemVoice               *mm_object_peek_modem_voice                (MMObject *self);
+MMModemTime                *mm_object_peek_modem_time                 (MMObject *self);
+MMModemFirmware            *mm_object_peek_modem_firmware             (MMObject *self);
+MMModemSar                 *mm_object_peek_modem_sar                  (MMObject *self);
+MMModemSignal              *mm_object_peek_modem_signal               (MMObject *self);
+MMModemOma                 *mm_object_peek_modem_oma                  (MMObject *self);
 
 G_END_DECLS
 

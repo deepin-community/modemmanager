@@ -133,53 +133,81 @@ mmcli_bearer_shutdown (void)
 static void
 print_bearer_info (MMBearer *bearer)
 {
-    MMBearerIpConfig   *ipv4_config;
-    MMBearerIpConfig   *ipv6_config;
-    MMBearerProperties *properties;
-    MMBearerStats      *stats;
+    g_autoptr(MMBearerIpConfig)    ipv4_config = NULL;
+    g_autoptr(MMBearerIpConfig)    ipv6_config = NULL;
+    g_autoptr(MMBearerProperties)  properties = NULL;
+    g_autoptr(MMBearerStats)       stats = NULL;
+    g_autoptr(GError)              connection_error = NULL;
+    gint                           profile_id;
+    gchar                         *profile_id_str;
 
-    ipv4_config = mm_bearer_get_ipv4_config (bearer);
-    ipv6_config = mm_bearer_get_ipv6_config (bearer);
-    properties  = mm_bearer_get_properties (bearer);
-    stats       = mm_bearer_get_stats (bearer);
+    ipv4_config      = mm_bearer_get_ipv4_config (bearer);
+    ipv6_config      = mm_bearer_get_ipv6_config (bearer);
+    properties       = mm_bearer_get_properties (bearer);
+    stats            = mm_bearer_get_stats (bearer);
+    profile_id       = mm_bearer_get_profile_id (bearer);
+    connection_error = mm_bearer_get_connection_error (bearer);
+
+    profile_id_str = (profile_id != MM_3GPP_PROFILE_ID_UNKNOWN) ? g_strdup_printf ("%d", profile_id) : NULL;
 
     mmcli_output_string      (MMC_F_BEARER_GENERAL_DBUS_PATH, mm_bearer_get_path (bearer));
     mmcli_output_string      (MMC_F_BEARER_GENERAL_TYPE,      mm_bearer_type_get_string (mm_bearer_get_bearer_type (bearer)));
 
-    mmcli_output_string      (MMC_F_BEARER_STATUS_CONNECTED,  mm_bearer_get_connected (bearer) ? "yes" : "no");
-    mmcli_output_string      (MMC_F_BEARER_STATUS_SUSPENDED,  mm_bearer_get_suspended (bearer) ? "yes" : "no");
-    mmcli_output_string      (MMC_F_BEARER_STATUS_INTERFACE,  mm_bearer_get_interface (bearer));
-    mmcli_output_string_take (MMC_F_BEARER_STATUS_IP_TIMEOUT, g_strdup_printf ("%u", mm_bearer_get_ip_timeout (bearer)));
+    mmcli_output_string      (MMC_F_BEARER_STATUS_CONNECTED,                mm_bearer_get_connected (bearer) ? "yes" : "no");
+    mmcli_output_string_take (MMC_F_BEARER_STATUS_CONNECTION_ERROR_NAME,    connection_error ? g_dbus_error_encode_gerror (connection_error) : NULL);
+    mmcli_output_string      (MMC_F_BEARER_STATUS_CONNECTION_ERROR_MESSAGE, connection_error ? connection_error->message : NULL);
+    mmcli_output_string      (MMC_F_BEARER_STATUS_SUSPENDED,                mm_bearer_get_suspended (bearer) ? "yes" : "no");
+    mmcli_output_string      (MMC_F_BEARER_STATUS_MULTIPLEXED,              mm_bearer_get_multiplexed (bearer) ? "yes" : "no");
+    mmcli_output_string      (MMC_F_BEARER_STATUS_INTERFACE,                mm_bearer_get_interface (bearer));
+    mmcli_output_string_take (MMC_F_BEARER_STATUS_IP_TIMEOUT,               g_strdup_printf ("%u", mm_bearer_get_ip_timeout (bearer)));
+    mmcli_output_string_take (MMC_F_BEARER_STATUS_PROFILE_ID,               profile_id_str);
 
     /* Properties */
     {
         const gchar *apn = NULL;
+        gchar       *apn_type_str = NULL;
         const gchar *roaming = NULL;
         gchar       *ip_family_str = NULL;
         const gchar *user = NULL;
         const gchar *password = NULL;
         const gchar *rm_protocol = NULL;
         gchar       *allowed_auth_str = NULL;
+        gchar       *properties_profile_id_str = NULL;
+        const gchar *access_type_preference_str = NULL;
+        gchar       *roaming_allowance_str = NULL;
 
         if (properties) {
+            gint properties_profile_id;
+
+            properties_profile_id = mm_bearer_properties_get_profile_id (properties);
+            if (properties_profile_id != MM_3GPP_PROFILE_ID_UNKNOWN)
+                properties_profile_id_str = g_strdup_printf ("%d", properties_profile_id);
+
             apn              = mm_bearer_properties_get_apn (properties);
-            ip_family_str    = (properties ? mm_bearer_ip_family_build_string_from_mask (mm_bearer_properties_get_ip_type (properties)) : NULL);
-            allowed_auth_str = (properties ? mm_bearer_allowed_auth_build_string_from_mask (mm_bearer_properties_get_allowed_auth (properties)) : NULL);
+            apn_type_str     = mm_bearer_apn_type_build_string_from_mask (mm_bearer_properties_get_apn_type (properties));
+            ip_family_str    = mm_bearer_ip_family_build_string_from_mask (mm_bearer_properties_get_ip_type (properties));
+            allowed_auth_str = mm_bearer_allowed_auth_build_string_from_mask (mm_bearer_properties_get_allowed_auth (properties));
             user             = mm_bearer_properties_get_user (properties);
             password         = mm_bearer_properties_get_password (properties);
             if (mm_bearer_get_bearer_type (bearer) != MM_BEARER_TYPE_DEFAULT_ATTACH) {
                 roaming     = mm_bearer_properties_get_allow_roaming (properties) ? "allowed" : "forbidden";
                 rm_protocol = mm_modem_cdma_rm_protocol_get_string (mm_bearer_properties_get_rm_protocol (properties));
             }
+            access_type_preference_str = mm_bearer_access_type_preference_get_string (mm_bearer_properties_get_access_type_preference (properties));
+            roaming_allowance_str      = mm_bearer_roaming_allowance_build_string_from_mask (mm_bearer_properties_get_roaming_allowance (properties));
         }
 
-        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_APN,          apn);
-        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_ROAMING,      roaming);
-        mmcli_output_string_take      (MMC_F_BEARER_PROPERTIES_IP_TYPE,      ip_family_str);
-        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_USER,         user);
-        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_PASSWORD,     password);
-        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_RM_PROTOCOL,  rm_protocol);
-        mmcli_output_string_list_take (MMC_F_BEARER_PROPERTIES_ALLOWED_AUTH, allowed_auth_str);
+        mmcli_output_string_take      (MMC_F_BEARER_PROPERTIES_PROFILE_ID,             properties_profile_id_str);
+        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_APN,                    apn);
+        mmcli_output_string_take      (MMC_F_BEARER_PROPERTIES_APN_TYPE,               apn_type_str);
+        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_ROAMING,                roaming);
+        mmcli_output_string_take      (MMC_F_BEARER_PROPERTIES_IP_TYPE,                ip_family_str);
+        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_USER,                   user);
+        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_PASSWORD,               password);
+        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_RM_PROTOCOL,            rm_protocol);
+        mmcli_output_string_list_take (MMC_F_BEARER_PROPERTIES_ALLOWED_AUTH,           allowed_auth_str);
+        mmcli_output_string           (MMC_F_BEARER_PROPERTIES_ACCESS_TYPE_PREFERENCE, access_type_preference_str);
+        mmcli_output_string_take      (MMC_F_BEARER_PROPERTIES_ROAMING_ALLOWANCE,      roaming_allowance_str);
     }
 
     /* IPv4 config */
@@ -248,17 +276,22 @@ print_bearer_info (MMBearer *bearer)
 
     /* Stats */
     {
-        gchar *duration = NULL;
-        gchar *bytes_rx = NULL;
-        gchar *bytes_tx = NULL;
-        gchar *attempts = NULL;
-        gchar *failed_attempts = NULL;
-        gchar *total_duration = NULL;
-        gchar *total_bytes_rx = NULL;
-        gchar *total_bytes_tx = NULL;
+        guint64  start_date = 0;
+        gchar   *duration = NULL;
+        gchar   *bytes_rx = NULL;
+        gchar   *bytes_tx = NULL;
+        gchar   *attempts = NULL;
+        gchar   *failed_attempts = NULL;
+        gchar   *total_duration = NULL;
+        gchar   *total_bytes_rx = NULL;
+        gchar   *total_bytes_tx = NULL;
+        gchar   *uplink_speed = NULL;
+        gchar   *downlink_speed = NULL;
 
         if (stats) {
             guint64 val;
+
+            start_date = mm_bearer_stats_get_start_date (stats);
 
             val = mm_bearer_stats_get_duration (stats);
             if (val)
@@ -284,8 +317,16 @@ print_bearer_info (MMBearer *bearer)
             val = mm_bearer_stats_get_total_tx_bytes (stats);
             if (val)
                 total_bytes_tx = g_strdup_printf ("%" G_GUINT64_FORMAT, val);
+            val = mm_bearer_stats_get_uplink_speed (stats);
+            if (val)
+                uplink_speed = g_strdup_printf ("%" G_GUINT64_FORMAT, val);
+            val = mm_bearer_stats_get_downlink_speed (stats);
+            if (val)
+                downlink_speed = g_strdup_printf ("%" G_GUINT64_FORMAT, val);
         }
 
+        if (start_date)
+            mmcli_output_start_date (start_date);
         mmcli_output_string_take (MMC_F_BEARER_STATS_DURATION,        duration);
         mmcli_output_string_take (MMC_F_BEARER_STATS_BYTES_RX,        bytes_rx);
         mmcli_output_string_take (MMC_F_BEARER_STATS_BYTES_TX,        bytes_tx);
@@ -294,14 +335,11 @@ print_bearer_info (MMBearer *bearer)
         mmcli_output_string_take (MMC_F_BEARER_STATS_TOTAL_DURATION,  total_duration);
         mmcli_output_string_take (MMC_F_BEARER_STATS_TOTAL_BYTES_RX,  total_bytes_rx);
         mmcli_output_string_take (MMC_F_BEARER_STATS_TOTAL_BYTES_TX,  total_bytes_tx);
+        mmcli_output_string_take (MMC_F_BEARER_STATS_UPLINK_SPEED,    uplink_speed);
+        mmcli_output_string_take (MMC_F_BEARER_STATS_DOWNLINK_SPEED,  downlink_speed);
     }
 
     mmcli_output_dump ();
-
-    g_clear_object (&stats);
-    g_clear_object (&properties);
-    g_clear_object (&ipv4_config);
-    g_clear_object (&ipv6_config);
 }
 
 static void

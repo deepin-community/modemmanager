@@ -11,6 +11,7 @@
  * GNU General Public License for more details:
  *
  * Copyright (C) 2018 Aleksander Morgado <aleksander@aleksander.es>
+ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc.
  */
 
 #include <config.h>
@@ -29,6 +30,7 @@
 #include "mm-iface-modem.h"
 #include "mm-iface-modem-3gpp.h"
 #include "mm-iface-modem-location.h"
+#include "mm-sim-qmi.h"
 #include "mm-shared-qmi.h"
 #include "mm-modem-helpers-qmi.h"
 
@@ -68,12 +70,14 @@ config_info_clear (ConfigInfo *config_info)
 
 typedef struct {
     /* Capabilities & modes helpers */
+    gboolean           multimode;
     MMModemCapability  current_capabilities;
     GArray            *supported_radio_interfaces;
-    Feature            feature_nas_technology_preference;
-    Feature            feature_nas_system_selection_preference;
-    Feature            feature_extended_lte_band_preference;
-    gboolean           disable_4g_only_mode;
+    Feature            feature_nas_tp;
+    Feature            feature_nas_ssp;
+    Feature            feature_nas_ssp_extended_lte_band_preference;
+    Feature            feature_nas_ssp_acquisition_order_preference;
+    GArray            *feature_nas_ssp_acquisition_order_preference_array;
     GArray            *supported_bands;
 
     /* Location helpers */
@@ -91,6 +95,13 @@ typedef struct {
     gboolean  config_active_default;
     GArray   *config_list;
     gint      config_active_i;
+
+    /* Slot status monitoring */
+    GArray    *slots_status;
+    QmiClient *uim_client;
+    gulong     uim_slot_status_indication_id;
+    gulong     uim_refresh_indication_id;
+    guint      uim_refresh_start_timeout_id;
 } Private;
 
 static void
@@ -110,6 +121,18 @@ private_free (Private *priv)
         g_signal_handler_disconnect (priv->loc_client, priv->loc_location_nmea_indication_id);
     if (priv->loc_client)
         g_object_unref (priv->loc_client);
+    if (priv->uim_slot_status_indication_id)
+        g_signal_handler_disconnect (priv->uim_client, priv->uim_slot_status_indication_id);
+    if (priv->slots_status)
+        g_array_unref (priv->slots_status);
+    if (priv->uim_refresh_indication_id)
+        g_signal_handler_disconnect (priv->uim_client, priv->uim_refresh_indication_id);
+    if (priv->uim_client)
+        g_object_unref (priv->uim_client);
+    if (priv->uim_refresh_start_timeout_id)
+        g_source_remove (priv->uim_refresh_start_timeout_id);
+    if (priv->feature_nas_ssp_acquisition_order_preference_array)
+        g_array_unref (priv->feature_nas_ssp_acquisition_order_preference_array);
     g_strfreev (priv->loc_assistance_data_servers);
     g_slice_free (Private, priv);
 }
@@ -126,8 +149,10 @@ get_private (MMSharedQmi *self)
     if (!priv) {
         priv = g_slice_new0 (Private);
 
-        priv->feature_nas_technology_preference = FEATURE_UNKNOWN;
-        priv->feature_nas_system_selection_preference = FEATURE_UNKNOWN;
+        priv->feature_nas_tp = FEATURE_UNKNOWN;
+        priv->feature_nas_ssp = FEATURE_UNKNOWN;
+        priv->feature_nas_ssp_extended_lte_band_preference = FEATURE_UNKNOWN;
+        priv->feature_nas_ssp_acquisition_order_preference = FEATURE_UNKNOWN;
         priv->config_active_i = -1;
 
         /* Setup parent class' MMIfaceModemLocation */
@@ -185,8 +210,8 @@ register_in_network_cancelled (GCancellable *cancellable,
     ctx = g_task_get_task_data (task);
 
     g_assert (ctx->cancellable);
-    g_assert (ctx->cancellable_id);
-    ctx->cancellable_id = 0;
+    if (ctx->cancellable_id)
+        ctx->cancellable_id = 0;
 
     g_assert (ctx->timeout_id);
     g_source_remove (ctx->timeout_id);
@@ -216,9 +241,10 @@ register_in_network_timeout (GTask *task)
     g_signal_handler_disconnect (ctx->client, ctx->serving_system_indication_id);
     ctx->serving_system_indication_id = 0;
 
-    g_assert (!ctx->cancellable || ctx->cancellable_id);
-    g_cancellable_disconnect (ctx->cancellable, ctx->cancellable_id);
-    ctx->cancellable_id = 0;
+    if (ctx->cancellable && ctx->cancellable_id) {
+        g_cancellable_disconnect (ctx->cancellable, ctx->cancellable_id);
+        ctx->cancellable_id = 0;
+    }
 
     /* the 3GPP interface will take care of checking if the registration is
      * the one we asked for */
@@ -258,9 +284,10 @@ register_in_network_ready (GTask                               *task,
     g_source_remove (ctx->timeout_id);
     ctx->timeout_id = 0;
 
-    g_assert (!ctx->cancellable || ctx->cancellable_id);
-    g_cancellable_disconnect (ctx->cancellable, ctx->cancellable_id);
-    ctx->cancellable_id = 0;
+    if (ctx->cancellable && ctx->cancellable_id) {
+        g_cancellable_disconnect (ctx->cancellable, ctx->cancellable_id);
+        ctx->cancellable_id = 0;
+    }
 
     /* the 3GPP interface will take care of checking if the registration is
      * the one we asked for */
@@ -305,12 +332,6 @@ initiate_network_register_ready (QmiClientNas *client,
      * will cancel the others.
      */
 
-    if (ctx->cancellable)
-        ctx->cancellable_id = g_cancellable_connect (ctx->cancellable,
-                                                     G_CALLBACK (register_in_network_cancelled),
-                                                     task,
-                                                     NULL);
-
     ctx->serving_system_indication_id = g_signal_connect_swapped (client,
                                                                   "serving-system",
                                                                   G_CALLBACK (register_in_network_ready),
@@ -319,6 +340,15 @@ initiate_network_register_ready (QmiClientNas *client,
     ctx->timeout_id = g_timeout_add_seconds (REGISTER_IN_NETWORK_TIMEOUT_SECS,
                                              (GSourceFunc) register_in_network_timeout,
                                              task);
+
+    /* The cancellable may already be cancelled, and if so the given callback will be called
+     * right away. So make sure this cancellable is always configured last, so that it clears the
+     * timeout or signal handler upon early cancellation. */
+    if (ctx->cancellable)
+        ctx->cancellable_id = g_cancellable_connect (ctx->cancellable,
+                                                     G_CALLBACK (register_in_network_cancelled),
+                                                     task,
+                                                     NULL);
 
 out:
 
@@ -331,7 +361,8 @@ register_in_network_inr (GTask        *task,
                          QmiClient    *client,
                          GCancellable *cancellable,
                          guint16       mcc,
-                         guint16       mnc)
+                         guint16       mnc,
+                         gboolean      mnc_pcs_digit)
 {
     QmiMessageNasInitiateNetworkRegisterInput *input;
 
@@ -349,6 +380,12 @@ register_in_network_inr (GTask        *task,
             mnc,
             QMI_NAS_RADIO_INTERFACE_UNKNOWN, /* don't change radio interface */
             NULL);
+        if (mnc_pcs_digit && mnc < 100)
+            qmi_message_nas_initiate_network_register_input_set_mnc_pcs_digit_include_status (
+                input,
+                mnc_pcs_digit,
+                NULL
+            );
     } else {
         /* Otherwise, automatic registration */
         qmi_message_nas_initiate_network_register_input_set_action (
@@ -400,7 +437,8 @@ register_in_network_sssp (GTask        *task,
                           QmiClient    *client,
                           GCancellable *cancellable,
                           guint16       mcc,
-                          guint16       mnc)
+                          guint16       mnc,
+                          gboolean      mnc_pcs_digit)
 {
     QmiMessageNasSetSystemSelectionPreferenceInput *input;
 
@@ -412,6 +450,13 @@ register_in_network_sssp (GTask        *task,
         mcc,
         mnc,
         NULL);
+
+    if (mnc_pcs_digit && mnc < 100)
+        qmi_message_nas_set_system_selection_preference_input_set_mnc_pcs_digit_include_status (
+            input,
+            mnc_pcs_digit,
+            NULL
+        );
 
     qmi_client_nas_set_system_selection_preference (
         QMI_CLIENT_NAS (client),
@@ -434,7 +479,8 @@ mm_shared_qmi_3gpp_register_in_network (MMIfaceModem3gpp    *self,
     GTask                    *task;
     RegisterInNetworkContext *ctx;
     guint16                   mcc = 0;
-    guint16                   mnc;
+    guint16                   mnc = 0;
+    gboolean                  mnc_pcs_digit = FALSE;
     QmiClient                *client = NULL;
     GError                   *error = NULL;
     Private                  *priv = NULL;
@@ -448,12 +494,12 @@ mm_shared_qmi_3gpp_register_in_network (MMIfaceModem3gpp    *self,
     task = g_task_new (self, cancellable, callback, user_data);
 
     ctx = g_slice_new0 (RegisterInNetworkContext);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_NAS (g_object_ref (client));
     ctx->cancellable = cancellable ? g_object_ref (cancellable) : NULL;
     g_task_set_task_data (task, ctx, (GDestroyNotify)register_in_network_context_free);
 
     /* Parse input MCC/MNC */
-    if (operator_id && !mm_3gpp_parse_operator_id (operator_id, &mcc, &mnc, &error)) {
+    if (operator_id && !mm_3gpp_parse_operator_id (operator_id, &mcc, &mnc, &mnc_pcs_digit, &error)) {
         g_assert (error != NULL);
         g_task_return_error (task, error);
         g_object_unref (task);
@@ -461,10 +507,10 @@ mm_shared_qmi_3gpp_register_in_network (MMIfaceModem3gpp    *self,
     }
 
     priv = get_private (MM_SHARED_QMI (self));
-    if (priv->feature_nas_system_selection_preference == FEATURE_SUPPORTED)
-        register_in_network_sssp (task, client, cancellable, mcc, mnc);
+    if (priv->feature_nas_ssp == FEATURE_SUPPORTED)
+        register_in_network_sssp (task, client, cancellable, mcc, mnc, mnc_pcs_digit);
     else
-        register_in_network_inr (task, client, cancellable, mcc, mnc);
+        register_in_network_inr (task, client, cancellable, mcc, mnc, mnc_pcs_digit);
 }
 
 /*****************************************************************************/
@@ -673,8 +719,8 @@ set_current_capabilities_step (GTask *task)
     switch (ctx->step) {
     case SET_CURRENT_CAPABILITIES_STEP_FIRST:
         /* Error out early if both unsupported */
-        if ((priv->feature_nas_system_selection_preference != FEATURE_SUPPORTED) &&
-            (priv->feature_nas_technology_preference       != FEATURE_SUPPORTED)) {
+        if ((priv->feature_nas_ssp != FEATURE_SUPPORTED) &&
+            (priv->feature_nas_tp != FEATURE_SUPPORTED)) {
             g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
                                      "Setting capabilities is not supported by this device");
             g_object_unref (task);
@@ -684,7 +730,7 @@ set_current_capabilities_step (GTask *task)
         /* fall-through */
 
     case SET_CURRENT_CAPABILITIES_STEP_NAS_SYSTEM_SELECTION_PREFERENCE:
-        if (priv->feature_nas_system_selection_preference == FEATURE_SUPPORTED) {
+        if (priv->feature_nas_ssp == FEATURE_SUPPORTED) {
             set_current_capabilities_system_selection_preference (task);
             return;
         }
@@ -692,7 +738,7 @@ set_current_capabilities_step (GTask *task)
         /* fall-through */
 
     case SET_CURRENT_CAPABILITIES_STEP_NAS_TECHNOLOGY_PREFERENCE:
-        if (priv->feature_nas_technology_preference == FEATURE_SUPPORTED) {
+        if (priv->feature_nas_tp == FEATURE_SUPPORTED) {
             set_current_capabilities_technology_preference (task);
             return;
         }
@@ -732,11 +778,11 @@ mm_shared_qmi_set_current_capabilities (MMIfaceModem        *self,
         return;
 
     priv = get_private (MM_SHARED_QMI (self));
-    g_assert (priv->feature_nas_technology_preference       != FEATURE_UNKNOWN);
-    g_assert (priv->feature_nas_system_selection_preference != FEATURE_UNKNOWN);
+    g_assert (priv->feature_nas_tp != FEATURE_UNKNOWN);
+    g_assert (priv->feature_nas_ssp != FEATURE_UNKNOWN);
 
     ctx = g_slice_new0 (SetCurrentCapabilitiesContext);
-    ctx->client       = g_object_ref (client);
+    ctx->client       = QMI_CLIENT_NAS (g_object_ref (client));
     ctx->capabilities = capabilities;
     ctx->step = SET_CURRENT_CAPABILITIES_STEP_FIRST;
 
@@ -758,10 +804,10 @@ typedef enum {
 } LoadCurrentCapabilitiesStep;
 
 typedef struct {
-    QmiClientNas                *nas_client;
-    QmiClientDms                *dms_client;
-    LoadCurrentCapabilitiesStep  step;
-    MMQmiCapabilitiesContext     capabilities_context;
+    QmiClientNas                    *nas_client;
+    QmiClientDms                    *dms_client;
+    LoadCurrentCapabilitiesStep      step;
+    MMQmiCurrentCapabilitiesContext  capabilities_context;
 } LoadCurrentCapabilitiesContext;
 
 MMModemCapability
@@ -869,18 +915,18 @@ load_current_capabilities_get_technology_preference_ready (QmiClientNas *client,
     if (!output) {
         mm_obj_dbg (self, "QMI operation failed: %s", error->message);
         g_error_free (error);
-        priv->feature_nas_technology_preference = FEATURE_UNSUPPORTED;
+        priv->feature_nas_tp = FEATURE_UNSUPPORTED;
     } else if (!qmi_message_nas_get_technology_preference_output_get_result (output, &error)) {
         mm_obj_dbg (self, "couldn't get technology preference: %s", error->message);
         g_error_free (error);
-        priv->feature_nas_technology_preference = FEATURE_SUPPORTED;
+        priv->feature_nas_tp = FEATURE_UNSUPPORTED;
     } else {
         qmi_message_nas_get_technology_preference_output_get_active (
             output,
             &ctx->capabilities_context.nas_tp_mask,
             NULL, /* duration */
             NULL);
-        priv->feature_nas_technology_preference = FEATURE_SUPPORTED;
+        priv->feature_nas_tp = FEATURE_SUPPORTED;
     }
 
     if (output)
@@ -905,21 +951,35 @@ load_current_capabilities_get_system_selection_preference_ready (QmiClientNas *c
     ctx  = g_task_get_task_data (task);
     priv = get_private (MM_SHARED_QMI (self));
 
+    priv->feature_nas_ssp = FEATURE_UNSUPPORTED;
+    priv->feature_nas_ssp_extended_lte_band_preference = FEATURE_UNSUPPORTED;
+    priv->feature_nas_ssp_acquisition_order_preference = FEATURE_UNSUPPORTED;
+
     output = qmi_client_nas_get_system_selection_preference_finish (client, res, &error);
     if (!output) {
         mm_obj_dbg (self, "QMI operation failed: %s", error->message);
         g_error_free (error);
-        priv->feature_nas_system_selection_preference = FEATURE_UNSUPPORTED;
     } else if (!qmi_message_nas_get_system_selection_preference_output_get_result (output, &error)) {
         mm_obj_dbg (self, "couldn't get system selection preference: %s", error->message);
         g_error_free (error);
-        priv->feature_nas_system_selection_preference = FEATURE_SUPPORTED;
     } else {
+        GArray *acquisition_order_preference_array = NULL;
+
+        /* SSP is supported, perform feature checks */
+        priv->feature_nas_ssp = FEATURE_SUPPORTED;
+        if (qmi_message_nas_get_system_selection_preference_output_get_extended_lte_band_preference (output, NULL, NULL, NULL, NULL, NULL))
+            priv->feature_nas_ssp_extended_lte_band_preference = FEATURE_SUPPORTED;
+        if (qmi_message_nas_get_system_selection_preference_output_get_acquisition_order_preference (output, &acquisition_order_preference_array, NULL) &&
+            acquisition_order_preference_array &&
+            acquisition_order_preference_array->len) {
+            priv->feature_nas_ssp_acquisition_order_preference = FEATURE_SUPPORTED;
+            priv->feature_nas_ssp_acquisition_order_preference_array = g_array_ref (acquisition_order_preference_array);
+        }
+
         qmi_message_nas_get_system_selection_preference_output_get_mode_preference (
             output,
             &ctx->capabilities_context.nas_ssp_mode_preference_mask,
             NULL);
-        priv->feature_nas_system_selection_preference = FEATURE_SUPPORTED;
     }
 
     if (output)
@@ -967,10 +1027,21 @@ load_current_capabilities_step (GTask *task)
         return;
 
     case LOAD_CURRENT_CAPABILITIES_STEP_LAST:
-        g_assert (priv->feature_nas_technology_preference       != FEATURE_UNKNOWN);
-        g_assert (priv->feature_nas_system_selection_preference != FEATURE_UNKNOWN);
-        priv->current_capabilities = mm_modem_capability_from_qmi_capabilities_context (&ctx->capabilities_context, self);
-        g_task_return_int (task, priv->current_capabilities);
+        g_assert (priv->feature_nas_tp != FEATURE_UNKNOWN);
+        g_assert (priv->feature_nas_ssp != FEATURE_UNKNOWN);
+
+        /* At this point we can already know if this is a multimode device or not */
+        if ((ctx->capabilities_context.dms_capabilities & MM_MODEM_CAPABILITY_MULTIMODE) == MM_MODEM_CAPABILITY_MULTIMODE)
+            priv->multimode = ctx->capabilities_context.multimode = TRUE;
+
+        priv->current_capabilities = mm_current_capability_from_qmi_current_capabilities_context (&ctx->capabilities_context, self);
+
+        if (priv->current_capabilities == MM_MODEM_CAPABILITY_NONE)
+            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                     "modem has no current capabilities");
+        else
+            g_task_return_int (task, priv->current_capabilities);
+
         g_object_unref (task);
         return;
 
@@ -1018,12 +1089,12 @@ mm_shared_qmi_load_current_capabilities (MMIfaceModem        *self,
     /* Current capabilities is the first thing run, and will only be run once per modem,
      * so we should here check support for the optional features. */
     priv = get_private (MM_SHARED_QMI (self));
-    g_assert (priv->feature_nas_technology_preference       == FEATURE_UNKNOWN);
-    g_assert (priv->feature_nas_system_selection_preference == FEATURE_UNKNOWN);
+    g_assert (priv->feature_nas_tp == FEATURE_UNKNOWN);
+    g_assert (priv->feature_nas_ssp == FEATURE_UNKNOWN);
 
     ctx = g_slice_new0 (LoadCurrentCapabilitiesContext);
-    ctx->nas_client = g_object_ref (nas_client);
-    ctx->dms_client = g_object_ref (dms_client);
+    ctx->nas_client = QMI_CLIENT_NAS (g_object_ref (nas_client));
+    ctx->dms_client = QMI_CLIENT_DMS (g_object_ref (dms_client));
     ctx->step = LOAD_CURRENT_CAPABILITIES_STEP_FIRST;
 
     task = g_task_new (self, NULL, callback, user_data);
@@ -1048,12 +1119,11 @@ mm_shared_qmi_load_supported_capabilities (MMIfaceModem        *self,
                                            GAsyncReadyCallback  callback,
                                            gpointer             user_data)
 {
-    GTask             *task;
-    Private           *priv;
-    MMModemCapability  mask;
-    MMModemCapability  single;
-    GArray            *supported_combinations;
-    guint              i;
+    GTask                             *task;
+    Private                           *priv;
+    GArray                            *supported_combinations;
+    guint                              i;
+    MMQmiSupportedCapabilitiesContext  ctx = { 0 };
 
     task = g_task_new (self, NULL, callback, user_data);
 
@@ -1067,55 +1137,78 @@ mm_shared_qmi_load_supported_capabilities (MMIfaceModem        *self,
     }
 
     /* Build mask with all supported capabilities */
-    mask = MM_MODEM_CAPABILITY_NONE;
+    ctx.dms_capabilities = MM_MODEM_CAPABILITY_NONE;
     for (i = 0; i < priv->supported_radio_interfaces->len; i++)
-        mask |= mm_modem_capability_from_qmi_radio_interface (g_array_index (priv->supported_radio_interfaces, QmiDmsRadioInterface, i), self);
+        ctx.dms_capabilities |= mm_modem_capability_from_qmi_radio_interface (g_array_index (priv->supported_radio_interfaces, QmiDmsRadioInterface, i), self);
 
-    supported_combinations = g_array_sized_new (FALSE, FALSE, sizeof (MMModemCapability), 3);
+    ctx.nas_tp_supported = (priv->feature_nas_tp == FEATURE_SUPPORTED);
+    ctx.nas_ssp_supported = (priv->feature_nas_ssp == FEATURE_SUPPORTED);
+    ctx.multimode = priv->multimode;
 
-    /* Add all possible supported capability combinations.
-     * In order to avoid unnecessary modem reboots, we will only implement capabilities
-     * switching only when switching GSM/UMTS+CDMA/EVDO multimode devices, and only if
-     * we have support for the commands doing it.
-     */
-    if (priv->feature_nas_technology_preference == FEATURE_SUPPORTED || priv->feature_nas_system_selection_preference == FEATURE_SUPPORTED) {
-        if (mask == (MM_MODEM_CAPABILITY_GSM_UMTS | MM_MODEM_CAPABILITY_CDMA_EVDO)) {
-            /* Multimode GSM/UMTS+CDMA/EVDO device switched to GSM/UMTS only */
-            single = MM_MODEM_CAPABILITY_GSM_UMTS;
-            g_array_append_val (supported_combinations, single);
-            /* Multimode GSM/UMTS+CDMA/EVDO device switched to CDMA/EVDO only */
-            single = MM_MODEM_CAPABILITY_CDMA_EVDO;
-            g_array_append_val (supported_combinations, single);
-        } else if (mask == (MM_MODEM_CAPABILITY_GSM_UMTS | MM_MODEM_CAPABILITY_CDMA_EVDO | MM_MODEM_CAPABILITY_LTE)) {
-            /* Multimode GSM/UMTS+CDMA/EVDO+LTE device switched to GSM/UMTS+LTE only */
-            single = MM_MODEM_CAPABILITY_GSM_UMTS | MM_MODEM_CAPABILITY_LTE;
-            g_array_append_val (supported_combinations, single);
-            /* Multimode GSM/UMTS+CDMA/EVDO+LTE device switched to CDMA/EVDO+LTE only */
-            single = MM_MODEM_CAPABILITY_CDMA_EVDO | MM_MODEM_CAPABILITY_LTE;
-            g_array_append_val (supported_combinations, single);
-            /*
-             * Multimode GSM/UMTS+CDMA/EVDO+LTE device switched to LTE only.
-             *
-             * This case is required because we use the same methods and operations to
-             * switch capabilities and modes. For the LTE capability there is a direct
-             * related 4G mode, and so we cannot select a '4G only' mode in this device
-             * because we wouldn't be able to know the full list of current capabilities
-             * if the device was rebooted, as we would only see LTE capability. So,
-             * handle this special case so that the LTE/4G-only mode can exclusively be
-             * selected as capability switching in this kind of devices.
-             */
-            priv->disable_4g_only_mode = TRUE;
-            single = MM_MODEM_CAPABILITY_LTE;
-            g_array_append_val (supported_combinations, single);
-        }
-    }
-
-    /* Add the full mask itself */
-    single = mask;
-    g_array_append_val (supported_combinations, single);
-
+    /* Build list of supported combinations */
+    supported_combinations = mm_supported_capabilities_from_qmi_supported_capabilities_context (&ctx, self);
     g_task_return_pointer (task, supported_combinations, (GDestroyNotify) g_array_unref);
     g_object_unref (task);
+}
+
+/*****************************************************************************/
+/* Load model (Modem interface) */
+
+gchar *
+mm_shared_qmi_load_model_finish (MMIfaceModem *self,
+                                 GAsyncResult *res,
+                                 GError **error)
+{
+    return g_task_propagate_pointer (G_TASK (res), error);
+}
+
+static void
+dms_get_model_ready (QmiClientDms *client,
+                     GAsyncResult *res,
+                     GTask *task)
+{
+    QmiMessageDmsGetModelOutput *output = NULL;
+    GError *error = NULL;
+
+    output = qmi_client_dms_get_model_finish (client, res, &error);
+    if (!output) {
+        g_prefix_error (&error, "QMI operation failed: ");
+        g_task_return_error (task, error);
+    } else if (!qmi_message_dms_get_model_output_get_result (output, &error)) {
+        g_prefix_error (&error, "Couldn't get Model: ");
+        g_task_return_error (task, error);
+    } else {
+        const gchar *str;
+
+        qmi_message_dms_get_model_output_get_model (output, &str, NULL);
+        g_task_return_pointer (task, g_strdup (str), g_free);
+    }
+
+    if (output)
+        qmi_message_dms_get_model_output_unref (output);
+
+    g_object_unref (task);
+}
+
+void
+mm_shared_qmi_load_model (MMIfaceModem *self,
+                          GAsyncReadyCallback callback,
+                          gpointer user_data)
+{
+    QmiClient *client = NULL;
+
+    if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                      QMI_SERVICE_DMS, &client,
+                                      callback, user_data))
+        return;
+
+    mm_obj_dbg (self, "loading model...");
+    qmi_client_dms_get_model (QMI_CLIENT_DMS (client),
+                              NULL,
+                              5,
+                              NULL,
+                              (GAsyncReadyCallback)dms_get_model_ready,
+                              g_task_new (self, NULL, callback, user_data));
 }
 
 /*****************************************************************************/
@@ -1236,11 +1329,13 @@ static void
 set_current_modes_system_selection_preference (GTask *task)
 {
     MMIfaceModem                                   *self;
+    Private                                        *priv;
     SetCurrentModesContext                         *ctx;
     QmiMessageNasSetSystemSelectionPreferenceInput *input;
     QmiNasRatModePreference                         pref;
 
     self = g_task_get_source_object (task);
+    priv = get_private (MM_SHARED_QMI (self));
     ctx  = g_task_get_task_data (task);
 
     input = qmi_message_nas_set_system_selection_preference_input_new ();
@@ -1249,16 +1344,17 @@ set_current_modes_system_selection_preference (GTask *task)
     /* Preferred modes */
 
     if (ctx->preferred != MM_MODEM_MODE_NONE) {
-        GArray *array;
+        if (priv->feature_nas_ssp_acquisition_order_preference == FEATURE_SUPPORTED) {
+            GArray *array;
 
-        /* Acquisition order array */
-        array = mm_modem_mode_to_qmi_acquisition_order_preference (ctx->allowed,
-                                                                   ctx->preferred,
-                                                                   mm_iface_modem_is_cdma (self),
-                                                                   mm_iface_modem_is_3gpp (self));
-        g_assert (array);
-        qmi_message_nas_set_system_selection_preference_input_set_acquisition_order_preference (input, array, NULL);
-        g_array_unref (array);
+            /* Acquisition order array */
+            array = mm_modem_mode_to_qmi_acquisition_order_preference (ctx->allowed,
+                                                                       ctx->preferred,
+                                                                       priv->feature_nas_ssp_acquisition_order_preference_array);
+            g_assert (array);
+            qmi_message_nas_set_system_selection_preference_input_set_acquisition_order_preference (input, array, NULL);
+            g_array_unref (array);
+        }
 
         /* Only set GSM/WCDMA acquisition order preference if both 2G and 3G given as allowed */
         if (mm_iface_modem_is_3gpp (self) && ((ctx->allowed & (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G)) == (MM_MODEM_MODE_2G | MM_MODEM_MODE_3G))) {
@@ -1303,7 +1399,7 @@ mm_shared_qmi_set_current_modes (MMIfaceModem        *self,
         return;
 
     ctx = g_slice_new0 (SetCurrentModesContext);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_NAS (g_object_ref (client));
 
     if (allowed == MM_MODEM_MODE_ANY && ctx->preferred == MM_MODEM_MODE_NONE) {
         ctx->allowed = MM_MODEM_MODE_NONE;
@@ -1313,6 +1409,8 @@ mm_shared_qmi_set_current_modes (MMIfaceModem        *self,
             ctx->allowed |= MM_MODEM_MODE_3G;
         if (mm_iface_modem_is_4g (self))
             ctx->allowed |= MM_MODEM_MODE_4G;
+        if (mm_iface_modem_is_5g (self))
+            ctx->allowed |= MM_MODEM_MODE_5G;
         ctx->preferred = MM_MODEM_MODE_NONE;
     } else {
         ctx->allowed = allowed;
@@ -1324,12 +1422,12 @@ mm_shared_qmi_set_current_modes (MMIfaceModem        *self,
 
     priv = get_private (MM_SHARED_QMI (self));
 
-    if (priv->feature_nas_system_selection_preference == FEATURE_SUPPORTED) {
+    if (priv->feature_nas_ssp == FEATURE_SUPPORTED) {
         set_current_modes_system_selection_preference (task);
         return;
     }
 
-    if (priv->feature_nas_technology_preference == FEATURE_SUPPORTED) {
+    if (priv->feature_nas_tp == FEATURE_SUPPORTED) {
         set_current_modes_technology_preference (task);
         return;
     }
@@ -1377,16 +1475,37 @@ mm_shared_qmi_load_current_modes_finish (MMIfaceModem  *self,
     return TRUE;
 }
 
+static MMModemMode
+filter_modes_by_supported_radio_interfaces (MMSharedQmi *self,
+                                            GArray      *supported_radio_interfaces,
+                                            MMModemMode  allowed_modes)
+{
+    MMModemMode modem_modes;
+    guint       i;
+
+    modem_modes = MM_MODEM_MODE_NONE;
+
+    for (i = 0; i < supported_radio_interfaces->len; i++)
+        modem_modes |= mm_modem_mode_from_qmi_radio_interface (g_array_index (supported_radio_interfaces, QmiDmsRadioInterface, i), self);
+
+    return allowed_modes & modem_modes;
+}
+
 static void
 get_technology_preference_ready (QmiClientNas *client,
                                  GAsyncResult *res,
                                  GTask        *task)
 {
+    MMSharedQmi                                *self;
+    Private                                    *priv;
     LoadCurrentModesResult                     *result = NULL;
     QmiMessageNasGetTechnologyPreferenceOutput *output = NULL;
     GError                                     *error = NULL;
     MMModemMode                                 allowed;
     QmiNasRadioTechnologyPreference             preference_mask;
+
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
 
     output = qmi_client_nas_get_technology_preference_finish (client, res, &error);
     if (!output || !qmi_message_nas_get_technology_preference_output_get_result (output, &error)) {
@@ -1409,6 +1528,9 @@ get_technology_preference_ready (QmiClientNas *client,
         g_free (str);
         goto out;
     }
+
+    g_assert (priv->supported_radio_interfaces);
+    allowed = filter_modes_by_supported_radio_interfaces (self, priv->supported_radio_interfaces, allowed);
 
     /* We got a valid value from here */
     result = g_new (LoadCurrentModesResult, 1);
@@ -1444,6 +1566,7 @@ load_current_modes_system_selection_preference_ready (QmiClientNas *client,
                                                       GTask        *task)
 {
     MMSharedQmi                                     *self;
+    Private                                         *priv;
     LoadCurrentModesResult                          *result = NULL;
     QmiMessageNasGetSystemSelectionPreferenceOutput *output = NULL;
     GError                                          *error = NULL;
@@ -1451,6 +1574,7 @@ load_current_modes_system_selection_preference_ready (QmiClientNas *client,
     MMModemMode                                      allowed;
 
     self = g_task_get_source_object (task);
+    priv = get_private (self);
 
     output = qmi_client_nas_get_system_selection_preference_finish (client, res, &error);
     if (!output || !qmi_message_nas_get_system_selection_preference_output_get_result (output, &error)) {
@@ -1478,29 +1602,19 @@ load_current_modes_system_selection_preference_ready (QmiClientNas *client,
         goto out;
     }
 
+    g_assert (priv->supported_radio_interfaces);
+    allowed = filter_modes_by_supported_radio_interfaces (self, priv->supported_radio_interfaces, allowed);
+
     /* We got a valid value from here */
     result = g_new (LoadCurrentModesResult, 1);
     result->allowed = allowed;
     result->preferred = MM_MODEM_MODE_NONE;
 
-    /* For 2G+3G only rely on the GSM/WCDMA acquisition order preference TLV */
-    if (mode_preference_mask == (QMI_NAS_RAT_MODE_PREFERENCE_GSM | QMI_NAS_RAT_MODE_PREFERENCE_UMTS)) {
-        QmiNasGsmWcdmaAcquisitionOrderPreference gsm_or_wcdma;
-
-        if (qmi_message_nas_get_system_selection_preference_output_get_gsm_wcdma_acquisition_order_preference (
-                output,
-                &gsm_or_wcdma,
-                NULL))
-            result->preferred = mm_modem_mode_from_qmi_gsm_wcdma_acquisition_order_preference (gsm_or_wcdma, self);
-    }
-    /* Otherwise, rely on the acquisition order array TLV */
-    else {
+    /* If acquisition order preference is available, always use that first */
+    if (priv->feature_nas_ssp_acquisition_order_preference == FEATURE_SUPPORTED) {
         GArray *array;
 
-        if (qmi_message_nas_get_system_selection_preference_output_get_acquisition_order_preference (
-                output,
-                &array,
-                NULL) &&
+        if (qmi_message_nas_get_system_selection_preference_output_get_acquisition_order_preference (output, &array, NULL) &&
             array->len > 0) {
             guint i;
 
@@ -1520,6 +1634,16 @@ load_current_modes_system_selection_preference_ready (QmiClientNas *client,
                 }
             }
         }
+    }
+    /* For 2G+3G only rely on the GSM/WCDMA acquisition order preference TLV */
+    else if (mode_preference_mask == (QMI_NAS_RAT_MODE_PREFERENCE_GSM | QMI_NAS_RAT_MODE_PREFERENCE_UMTS)) {
+        QmiNasGsmWcdmaAcquisitionOrderPreference gsm_or_wcdma;
+
+        if (qmi_message_nas_get_system_selection_preference_output_get_gsm_wcdma_acquisition_order_preference (
+                output,
+                &gsm_or_wcdma,
+                NULL))
+            result->preferred = mm_modem_mode_from_qmi_gsm_wcdma_acquisition_order_preference (gsm_or_wcdma, self);
     }
 
     g_task_return_pointer (task, result, g_free);
@@ -1561,18 +1685,18 @@ mm_shared_qmi_load_current_modes (MMIfaceModem        *self,
         return;
 
     ctx = g_new0 (LoadCurrentModesContext, 1);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_NAS (g_object_ref (client));
     task = g_task_new (self, NULL, callback, user_data);
     g_task_set_task_data (task, ctx, (GDestroyNotify)load_current_modes_context_free);
 
     priv = get_private (MM_SHARED_QMI (self));
 
-    if (priv->feature_nas_system_selection_preference != FEATURE_UNSUPPORTED) {
+    if (priv->feature_nas_ssp != FEATURE_UNSUPPORTED) {
         load_current_modes_system_selection_preference (task);
         return;
     }
 
-    if (priv->feature_nas_technology_preference != FEATURE_UNSUPPORTED) {
+    if (priv->feature_nas_tp != FEATURE_UNSUPPORTED) {
         load_current_modes_technology_preference (task);
         return;
     }
@@ -1599,106 +1723,38 @@ mm_shared_qmi_load_supported_modes (MMIfaceModem        *self,
                                     GAsyncReadyCallback  callback,
                                     gpointer             user_data)
 {
-    GTask                  *task;
-    GArray                 *combinations;
-    MMModemModeCombination  mode;
-    Private                *priv;
-    MMModemMode             mask_all;
-    guint                   i;
-    GArray                 *all;
-    GArray                 *filtered;
+    GTask                      *task;
+    Private                    *priv;
+    MMQmiSupportedModesContext  ctx = { 0 };
+    guint                       i;
+    GArray                     *combinations;
 
     task = g_task_new (self, NULL, callback, user_data);
 
     priv = get_private (MM_SHARED_QMI (self));
     g_assert (priv->supported_radio_interfaces);
+    g_assert (priv->current_capabilities != MM_MODEM_CAPABILITY_NONE);
 
     /* Build all, based on the supported radio interfaces */
-    mask_all = MM_MODEM_MODE_NONE;
+    ctx.all = MM_MODEM_MODE_NONE;
     for (i = 0; i < priv->supported_radio_interfaces->len; i++)
-        mask_all |= mm_modem_mode_from_qmi_radio_interface (g_array_index (priv->supported_radio_interfaces, QmiDmsRadioInterface, i), self);
-    mode.allowed = mask_all;
-    mode.preferred = MM_MODEM_MODE_NONE;
-    all = g_array_sized_new (FALSE, FALSE, sizeof (MMModemModeCombination), 1);
-    g_array_append_val (all, mode);
+        ctx.all |= mm_modem_mode_from_qmi_radio_interface (g_array_index (priv->supported_radio_interfaces, QmiDmsRadioInterface, i), self);
 
-    /* If SSP and TP are not supported, ignore supported mode management */
-    if (priv->feature_nas_system_selection_preference == FEATURE_UNSUPPORTED && priv->feature_nas_technology_preference == FEATURE_UNSUPPORTED) {
-        g_task_return_pointer (task, all, (GDestroyNotify) g_array_unref);
-        g_object_unref (task);
-        return;
-    }
+    /* Filter out those unsupported by the current capabilities */
+    if (!(priv->current_capabilities & (MM_MODEM_CAPABILITY_GSM_UMTS | MM_MODEM_CAPABILITY_CDMA_EVDO)))
+        ctx.all &= ~(MM_MODEM_MODE_2G | MM_MODEM_MODE_3G);
+    else if (!(priv->current_capabilities & MM_MODEM_CAPABILITY_LTE))
+        ctx.all &= ~MM_MODEM_MODE_4G;
+    else if (!(priv->current_capabilities & MM_MODEM_CAPABILITY_5GNR))
+        ctx.all &= ~MM_MODEM_MODE_5G;
 
-    combinations = g_array_new (FALSE, FALSE, sizeof (MMModemModeCombination));
+    ctx.nas_ssp_supported = (priv->feature_nas_ssp == FEATURE_SUPPORTED);
+    ctx.nas_tp_supported = (priv->feature_nas_tp == FEATURE_SUPPORTED);
+    ctx.current_capabilities = priv->current_capabilities;
+    ctx.multimode = priv->multimode;
 
-#define ADD_MODE_PREFERENCE(MODE1, MODE2, MODE3, MODE4) do {            \
-        mode.allowed = MODE1;                                           \
-        if (MODE2 != MM_MODEM_MODE_NONE) {                              \
-            mode.allowed |= MODE2;                                      \
-            if (MODE3 != MM_MODEM_MODE_NONE) {                          \
-                mode.allowed |= MODE3;                                  \
-                if (MODE4 != MM_MODEM_MODE_NONE)                        \
-                    mode.allowed |= MODE4;                              \
-            }                                                           \
-            if (priv->feature_nas_system_selection_preference != FEATURE_UNSUPPORTED) { \
-                if (MODE3 != MM_MODEM_MODE_NONE) {                      \
-                    if (MODE4 != MM_MODEM_MODE_NONE) {                  \
-                        mode.preferred = MODE4;                         \
-                        g_array_append_val (combinations, mode);        \
-                    }                                                   \
-                    mode.preferred = MODE3;                             \
-                    g_array_append_val (combinations, mode);            \
-                }                                                       \
-                mode.preferred = MODE2;                                 \
-                g_array_append_val (combinations, mode);                \
-                mode.preferred = MODE1;                                 \
-                g_array_append_val (combinations, mode);                \
-            } else {                                                    \
-                mode.preferred = MM_MODEM_MODE_NONE;                    \
-                g_array_append_val (combinations, mode);                \
-            }                                                           \
-        } else {                                                        \
-            mode.allowed = MODE1;                                       \
-            mode.preferred = MM_MODEM_MODE_NONE;                        \
-            g_array_append_val (combinations, mode);                    \
-        }                                                               \
-    } while (0)
-
-    /* 2G-only, 3G-only */
-    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-    ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-
-    /* 4G-only mode is not possible in multimode GSM/UMTS+CDMA/EVDO+LTE
-     * devices. This configuration may be selected as "LTE only" capability
-     * instead. */
-    if (!priv->disable_4g_only_mode)
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_4G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-
-    /* 2G, 3G, 4G combinations */
-    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_4G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-    ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_4G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G, MM_MODEM_MODE_4G,   MM_MODEM_MODE_NONE);
-
-    /* 5G related mode combinations are only supported when NAS SSP is supported,
-     * as there is no 5G support in NAS TP. */
-    if (priv->feature_nas_system_selection_preference != FEATURE_UNSUPPORTED) {
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_5G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_4G, MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G,   MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE);
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_4G,   MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE);
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_4G,   MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE);
-        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G,   MM_MODEM_MODE_4G,   MM_MODEM_MODE_5G);
-    }
-
-    /* Filter out unsupported modes */
-    filtered = mm_filter_supported_modes (all, combinations, self);
-    g_array_unref (all);
-    g_array_unref (combinations);
-
-    g_task_return_pointer (task, filtered, (GDestroyNotify) g_array_unref);
+    combinations = mm_supported_modes_from_qmi_supported_modes_context (&ctx, self);
+    g_task_return_pointer (task, combinations, (GDestroyNotify) g_array_unref);
     g_object_unref (task);
 }
 
@@ -1726,6 +1782,7 @@ dms_get_band_capabilities_ready (QmiClientDms *client,
     QmiDmsBandCapability                    qmi_bands = 0;
     QmiDmsLteBandCapability                 qmi_lte_bands = 0;
     GArray                                 *extended_qmi_lte_bands = NULL;
+    GArray                                 *qmi_nr5g_bands = NULL;
 
     self = g_task_get_source_object (task);
     priv = get_private (self);
@@ -1748,8 +1805,12 @@ dms_get_band_capabilities_ready (QmiClientDms *client,
         output,
         &extended_qmi_lte_bands,
         NULL);
+    qmi_message_dms_get_band_capabilities_output_get_nr5g_band_capability (
+        output,
+        &qmi_nr5g_bands,
+        NULL);
 
-    mm_bands = mm_modem_bands_from_qmi_band_capabilities (qmi_bands, qmi_lte_bands, extended_qmi_lte_bands, self);
+    mm_bands = mm_modem_bands_from_qmi_band_capabilities (qmi_bands, qmi_lte_bands, extended_qmi_lte_bands, qmi_nr5g_bands, self);
     if (mm_bands->len == 0) {
         g_clear_pointer (&mm_bands, g_array_unref);
         error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
@@ -1822,6 +1883,10 @@ load_bands_get_system_selection_preference_ready (QmiClientNas *client,
     QmiNasLteBandPreference                          lte_band_preference_mask = 0;
     guint64                                          extended_lte_band_preference[4] = { 0 };
     guint                                            extended_lte_band_preference_size = 0;
+    guint64                                          nr5g_sa_band_preference[8] = { 0 };
+    guint64                                          nr5g_nsa_band_preference[8] = { 0 };
+    guint64                                          nr5g_band_preference[8] = { 0 };
+    guint                                            nr5g_band_preference_size = 0;
 
     self = g_task_get_source_object (task);
     priv = get_private (self);
@@ -1842,7 +1907,8 @@ load_bands_get_system_selection_preference_ready (QmiClientNas *client,
         &lte_band_preference_mask,
         NULL);
 
-    if (qmi_message_nas_get_system_selection_preference_output_get_extended_lte_band_preference (
+    if ((priv->feature_nas_ssp_extended_lte_band_preference == FEATURE_SUPPORTED) &&
+        qmi_message_nas_get_system_selection_preference_output_get_extended_lte_band_preference (
             output,
             &extended_lte_band_preference[0],
             &extended_lte_band_preference[1],
@@ -1851,13 +1917,40 @@ load_bands_get_system_selection_preference_ready (QmiClientNas *client,
             NULL))
         extended_lte_band_preference_size = G_N_ELEMENTS (extended_lte_band_preference);
 
-    if (G_UNLIKELY (priv->feature_extended_lte_band_preference == FEATURE_UNKNOWN))
-        priv->feature_extended_lte_band_preference = extended_lte_band_preference_size ? FEATURE_SUPPORTED : FEATURE_UNSUPPORTED;
+    if (qmi_message_nas_get_system_selection_preference_output_get_nr5g_sa_band_preference (
+            output,
+            &nr5g_sa_band_preference[0],
+            &nr5g_sa_band_preference[1],
+            &nr5g_sa_band_preference[2],
+            &nr5g_sa_band_preference[3],
+            &nr5g_sa_band_preference[4],
+            &nr5g_sa_band_preference[5],
+            &nr5g_sa_band_preference[6],
+            &nr5g_sa_band_preference[7],
+            NULL) || qmi_message_nas_get_system_selection_preference_output_get_nr5g_nsa_band_preference (
+            output,
+            &nr5g_nsa_band_preference[0],
+            &nr5g_nsa_band_preference[1],
+            &nr5g_nsa_band_preference[2],
+            &nr5g_nsa_band_preference[3],
+            &nr5g_nsa_band_preference[4],
+            &nr5g_nsa_band_preference[5],
+            &nr5g_nsa_band_preference[6],
+            &nr5g_nsa_band_preference[7],
+            NULL)) {
+        guint i;
+
+        nr5g_band_preference_size = G_N_ELEMENTS (nr5g_band_preference);
+        for (i = 0; i < nr5g_band_preference_size; i++)
+            nr5g_band_preference[i] = nr5g_sa_band_preference[i] | nr5g_nsa_band_preference[i];
+    }
 
     mm_bands = mm_modem_bands_from_qmi_band_preference (band_preference_mask,
                                                         lte_band_preference_mask,
                                                         extended_lte_band_preference_size ? extended_lte_band_preference : NULL,
                                                         extended_lte_band_preference_size,
+                                                        nr5g_band_preference_size ? nr5g_band_preference : NULL,
+                                                        nr5g_band_preference_size,
                                                         self);
 
     if (mm_bands->len == 0) {
@@ -1949,6 +2042,7 @@ mm_shared_qmi_set_current_bands (MMIfaceModem        *self,
     QmiNasBandPreference                            qmi_bands = 0;
     QmiNasLteBandPreference                         qmi_lte_bands = 0;
     guint64                                         extended_qmi_lte_bands[4] = { 0 };
+    guint64                                         qmi_nr5g_bands[8] = { 0 };
 
     if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
                                       QMI_SERVICE_NAS, &client,
@@ -1972,14 +2066,16 @@ mm_shared_qmi_set_current_bands (MMIfaceModem        *self,
     mm_modem_bands_to_qmi_band_preference (bands_array,
                                            &qmi_bands,
                                            &qmi_lte_bands,
-                                           priv->feature_extended_lte_band_preference == FEATURE_SUPPORTED ? extended_qmi_lte_bands : NULL,
+                                           priv->feature_nas_ssp_extended_lte_band_preference == FEATURE_SUPPORTED ? extended_qmi_lte_bands : NULL,
                                            G_N_ELEMENTS (extended_qmi_lte_bands),
+                                           qmi_nr5g_bands,
+                                           G_N_ELEMENTS (qmi_nr5g_bands),
                                            self);
 
     input = qmi_message_nas_set_system_selection_preference_input_new ();
     qmi_message_nas_set_system_selection_preference_input_set_band_preference (input, qmi_bands, NULL);
     if (mm_iface_modem_is_3gpp_lte (self)) {
-        if (priv->feature_extended_lte_band_preference == FEATURE_SUPPORTED)
+        if (priv->feature_nas_ssp_extended_lte_band_preference == FEATURE_SUPPORTED)
             qmi_message_nas_set_system_selection_preference_input_set_extended_lte_band_preference (
                 input,
                 extended_qmi_lte_bands[0],
@@ -1990,6 +2086,28 @@ mm_shared_qmi_set_current_bands (MMIfaceModem        *self,
         else
             qmi_message_nas_set_system_selection_preference_input_set_lte_band_preference (input, qmi_lte_bands, NULL);
     }
+	qmi_message_nas_set_system_selection_preference_input_set_nr5g_sa_band_preference (
+		input,
+		qmi_nr5g_bands[0],
+		qmi_nr5g_bands[1],
+		qmi_nr5g_bands[2],
+		qmi_nr5g_bands[3],
+		qmi_nr5g_bands[4],
+		qmi_nr5g_bands[5],
+		qmi_nr5g_bands[6],
+		qmi_nr5g_bands[7],
+		NULL);
+	qmi_message_nas_set_system_selection_preference_input_set_nr5g_nsa_band_preference (
+		input,
+		qmi_nr5g_bands[0],
+		qmi_nr5g_bands[1],
+		qmi_nr5g_bands[2],
+		qmi_nr5g_bands[3],
+		qmi_nr5g_bands[4],
+		qmi_nr5g_bands[5],
+		qmi_nr5g_bands[6],
+		qmi_nr5g_bands[7],
+		NULL);
     qmi_message_nas_set_system_selection_preference_input_set_change_duration (input, QMI_NAS_CHANGE_DURATION_PERMANENT, NULL);
 
     qmi_client_nas_set_system_selection_preference (
@@ -2028,7 +2146,7 @@ reset_set_operating_mode_reset_ready (QmiClientDms *client,
     if (!output || !qmi_message_dms_set_operating_mode_output_get_result (output, &error)) {
         g_task_return_error (task, error);
     } else {
-        mm_obj_info (self, "rebooting now");
+        mm_obj_msg (self, "rebooting now");
         g_task_return_boolean (task, TRUE);
     }
 
@@ -2519,8 +2637,8 @@ find_requested_carrier_config (GTask *task)
         g_assert (config_fallback_i >= 0);
 
         config = &g_array_index (priv->config_list, ConfigInfo, config_fallback_i);
-        mm_obj_info (self, "using fallback carrier configuration '%s' (version 0x%08x, size %u bytes)",
-                     config->description, config->version, config->total_size);
+        mm_obj_dbg (self, "using fallback carrier configuration '%s' (version 0x%08x, size %u bytes)",
+                    config->description, config->version, config->total_size);
 
         g_free (ctx->config_requested);
         ctx->config_requested = config_fallback;
@@ -2566,7 +2684,7 @@ setup_carrier_config_step (GTask *task)
         g_assert (ctx->config_requested_i >= 0);
         g_assert (priv->config_active_i >= 0 || priv->config_active_default);
         if (ctx->config_requested_i == priv->config_active_i) {
-            mm_obj_info (self, "carrier config switching not needed: already using '%s'", ctx->config_requested);
+            mm_obj_msg (self, "carrier config switching not needed: already using '%s'", ctx->config_requested);
             ctx->step = SETUP_CARRIER_CONFIG_STEP_LAST;
             setup_carrier_config_step (task);
             return;
@@ -2576,21 +2694,17 @@ setup_carrier_config_step (GTask *task)
         /* fall-through */
 
     case SETUP_CARRIER_CONFIG_STEP_UPDATE_CURRENT: {
-        QmiMessagePdcSetSelectedConfigInput *input;
-        ConfigInfo                          *requested_config;
-        ConfigInfo                          *active_config;
-        QmiConfigTypeAndId                   type_and_id;
+        g_autoptr(QmiMessagePdcSetSelectedConfigInput)  input = NULL;
+        ConfigInfo                                     *requested_config;
+        ConfigInfo                                     *active_config;
 
         requested_config = &g_array_index (priv->config_list, ConfigInfo, ctx->config_requested_i);
         active_config = (priv->config_active_default ? NULL : &g_array_index (priv->config_list, ConfigInfo, priv->config_active_i));
         mm_obj_warn (self, "carrier config switching needed: '%s' -> '%s'",
                      active_config ? active_config->description : DEFAULT_CONFIG_DESCRIPTION, requested_config->description);
 
-        type_and_id.config_type = requested_config->config_type;;
-        type_and_id.id = requested_config->id;
-
         input = qmi_message_pdc_set_selected_config_input_new ();
-        qmi_message_pdc_set_selected_config_input_set_type_with_id (input, &type_and_id, NULL);
+        qmi_message_pdc_set_selected_config_input_set_type_with_id_v2 (input, requested_config->config_type, requested_config->id, NULL);
         qmi_message_pdc_set_selected_config_input_set_token (input, ctx->token++, NULL);
         qmi_client_pdc_set_selected_config (ctx->client,
                                             input,
@@ -2598,13 +2712,12 @@ setup_carrier_config_step (GTask *task)
                                             NULL,
                                             (GAsyncReadyCallback)set_selected_config_ready,
                                             task);
-        qmi_message_pdc_set_selected_config_input_unref (input);
         return;
     }
 
     case SETUP_CARRIER_CONFIG_STEP_ACTIVATE_CURRENT: {
-        QmiMessagePdcActivateConfigInput *input;
-        ConfigInfo                       *requested_config;
+        g_autoptr(QmiMessagePdcActivateConfigInput)  input = NULL;
+        ConfigInfo                                  *requested_config;
 
         requested_config = &g_array_index (priv->config_list, ConfigInfo, ctx->config_requested_i);
 
@@ -2617,7 +2730,6 @@ setup_carrier_config_step (GTask *task)
                                         NULL,
                                         (GAsyncReadyCallback) activate_config_ready,
                                         task);
-        qmi_message_pdc_activate_config_input_unref (input);
         return;
     }
 
@@ -2675,7 +2787,7 @@ mm_shared_qmi_setup_carrier_config (MMIfaceModem        *self,
         g_object_unref (task);
         return;
     }
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_PDC (g_object_ref (client));
 
     setup_carrier_config_step (task);
 }
@@ -3017,8 +3129,7 @@ list_configs_indication (QmiClientPdc                      *client,
     for (i = 0; i < configs->len; i++) {
         ConfigInfo                                      *current_info;
         QmiIndicationPdcListConfigsOutputConfigsElement *element;
-        QmiConfigTypeAndId                               type_with_id;
-        QmiMessagePdcGetConfigInfoInput                 *input;
+        g_autoptr(QmiMessagePdcGetConfigInfoInput)       input = NULL;
 
         element = &g_array_index (configs, QmiIndicationPdcListConfigsOutputConfigsElement, i);
 
@@ -3028,12 +3139,9 @@ list_configs_indication (QmiClientPdc                      *client,
         current_info->config_type = element->config_type;
 
         input = qmi_message_pdc_get_config_info_input_new ();
-        type_with_id.config_type = element->config_type;
-        type_with_id.id = current_info->id;
-        qmi_message_pdc_get_config_info_input_set_type_with_id (input, &type_with_id, NULL);
+        qmi_message_pdc_get_config_info_input_set_type_with_id_v2 (input, element->config_type, current_info->id, NULL);
         qmi_message_pdc_get_config_info_input_set_token (input, current_info->token, NULL);
         qmi_client_pdc_get_config_info (ctx->client, input, 10, NULL, NULL, NULL); /* ignore response! */
-        qmi_message_pdc_get_config_info_input_unref (input);
     }
 }
 
@@ -3157,9 +3265,1183 @@ mm_shared_qmi_load_carrier_config (MMIfaceModem        *self,
         g_object_unref (task);
         return;
     }
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_PDC (g_object_ref (client));
 
     load_carrier_config_step (task);
+}
+
+/*****************************************************************************/
+/* Load SIM slots (modem interface) */
+
+typedef struct {
+    QmiClientUim *client_uim;
+    GPtrArray    *sim_slots;
+    guint         active_slot_number;
+    guint         active_logical_id;
+} LoadSimSlotsContext;
+
+static void
+load_sim_slots_context_free (LoadSimSlotsContext *ctx)
+{
+    g_clear_pointer (&ctx->sim_slots, g_ptr_array_unref);
+    g_clear_object (&ctx->client_uim);
+    g_slice_free (LoadSimSlotsContext, ctx);
+}
+
+static void
+sim_slot_free (MMBaseSim *sim)
+{
+    if (sim)
+        g_object_unref (sim);
+}
+
+gboolean
+mm_shared_qmi_load_sim_slots_finish (MMIfaceModem  *self,
+                                     GAsyncResult  *res,
+                                     GPtrArray    **sim_slots,
+                                     guint         *primary_sim_slot,
+                                     GError       **error)
+{
+    LoadSimSlotsContext *ctx;
+
+    if (!g_task_propagate_boolean (G_TASK (res), error))
+        return FALSE;
+
+    ctx = g_task_get_task_data (G_TASK (res));
+
+    if (sim_slots)
+        *sim_slots = g_steal_pointer (&ctx->sim_slots);
+    if (primary_sim_slot)
+        *primary_sim_slot = ctx->active_slot_number;
+    return TRUE;
+}
+
+static void
+uim_get_slot_status_ready (QmiClientUim *client,
+                           GAsyncResult *res,
+                           GTask        *task)
+{
+    g_autoptr(QmiMessageUimGetSlotStatusOutput) output = NULL;
+    LoadSimSlotsContext *ctx;
+    MMIfaceModem        *self;
+    Private             *priv;
+    g_autoptr(GError)    error = NULL;
+    GArray              *physical_slots = NULL;
+    GArray              *ext_information = NULL;
+    GArray              *slot_eids = NULL;
+    guint                i;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+    priv = get_private (MM_SHARED_QMI (self));
+
+    output = qmi_client_uim_get_slot_status_finish (client, res, &error);
+    if (!output ||
+        !qmi_message_uim_get_slot_status_output_get_result (output, &error) ||
+        !qmi_message_uim_get_slot_status_output_get_physical_slot_status (output, &physical_slots, &error)) {
+        if (g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_DEVICE_UNSUPPORTED) ||
+            g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_INVALID_QMI_COMMAND) ||
+            g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_NOT_SUPPORTED))
+            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                     "QMI SIM slot switch operation not supported");
+        else
+            g_task_return_error (task, g_steal_pointer (&error));
+        g_object_unref (task);
+        return;
+    }
+
+    /* Store the slot status before loading all sim slots.
+     * We will use this to check if a hotswap requires a reprobe. */
+    if (priv->slots_status)
+        g_array_unref (priv->slots_status);
+    priv->slots_status = g_array_ref (physical_slots);
+
+    /* It's fine if we don't have EID information, but it should be well-formed if present. If it's malformed,
+     * there is probably a modem firmware bug. */
+    if (qmi_message_uim_get_slot_status_output_get_physical_slot_information (output, &ext_information, NULL) &&
+        qmi_message_uim_get_slot_status_output_get_slot_eid (output, &slot_eids, NULL) &&
+        (ext_information->len != physical_slots->len || slot_eids->len != physical_slots->len)) {
+        g_task_return_new_error (task,
+                                 MM_CORE_ERROR,
+                                 MM_CORE_ERROR_FAILED,
+                                 "UIM Get Slot Status returned malformed response");
+        g_object_unref (task);
+        return;
+    }
+
+    ctx->sim_slots = g_ptr_array_new_full (physical_slots->len, (GDestroyNotify) sim_slot_free);
+
+    for (i = 0; i < physical_slots->len; i++) {
+        QmiPhysicalSlotStatusSlot      *slot_status;
+        QmiPhysicalSlotInformationSlot *slot_info;
+        MMBaseSim                      *sim;
+        g_autofree gchar               *raw_iccid = NULL;
+        g_autofree gchar               *iccid = NULL;
+        g_autofree gchar               *eid = NULL;
+        g_autoptr(GError)               inner_error = NULL;
+        gboolean                        sim_active = FALSE;
+
+        /* Store active slot info */
+        slot_status = &g_array_index (physical_slots, QmiPhysicalSlotStatusSlot, i);
+        if (slot_status->physical_slot_status == QMI_UIM_SLOT_STATE_ACTIVE) {
+            sim_active = TRUE;
+            ctx->active_logical_id = slot_status->logical_slot;
+            ctx->active_slot_number = i + 1;
+        }
+
+        if (!slot_status->iccid->len) {
+            mm_obj_dbg (self, "not creating SIM object: no SIM in slot %u", i + 1);
+            g_ptr_array_add (ctx->sim_slots, NULL);
+            continue;
+        }
+
+        /* This is supposed to be BCD, but some carriers have non-spec-compliant ICCIDs that use
+         * A-F characters as part of the operator-specific part of the ICCID. Parse it as hex and
+         * let mm_3gpp_parse_iccid take care of handling the A-F characters properly. */
+        raw_iccid = mm_utils_bin2hexstr ((const guint8 *)slot_status->iccid->data, slot_status->iccid->len);
+        if (!raw_iccid) {
+            mm_obj_warn (self, "not creating SIM object: failed to convert ICCID from BCD");
+            g_ptr_array_add (ctx->sim_slots, NULL);
+            continue;
+        }
+
+        iccid = mm_3gpp_parse_iccid (raw_iccid, &inner_error);
+        if (!iccid) {
+            mm_obj_warn (self, "not creating SIM object: couldn't parse SIM iccid: %s", inner_error->message);
+            g_ptr_array_add (ctx->sim_slots, NULL);
+            continue;
+        }
+
+        if (ext_information && slot_eids) {
+            slot_info = &g_array_index (ext_information, QmiPhysicalSlotInformationSlot, i);
+            if (slot_info->is_euicc) {
+                QmiSlotEidElement *slot_eid_element;
+
+                slot_eid_element = &g_array_index (slot_eids, QmiSlotEidElement, i);
+                if (slot_eid_element->eid->len)
+                    eid = mm_decode_eid (slot_eid_element->eid->data, slot_eid_element->eid->len);
+                if (!eid)
+                    mm_obj_dbg (self, "SIM in slot %d is marked as eUICC, but has malformed EID", i + 1);
+            }
+        }
+
+        sim = mm_sim_qmi_new_initialized (MM_BASE_MODEM (self),
+                                          TRUE, /* consider DMS UIM deprecated if we're creating SIM slots */
+                                          i + 1, /* slot number is the array index starting at 1 */
+                                          sim_active,
+                                          iccid,
+                                          NULL,  /* imsi unknown */
+                                          eid,   /* may be NULL, which is fine */
+                                          NULL,  /* operator id unknown */
+                                          NULL,  /* operator name unknown */
+                                          NULL); /* emergency numbers unknown */
+        g_ptr_array_add (ctx->sim_slots, sim);
+    }
+    g_assert_cmpuint (ctx->sim_slots->len, ==, physical_slots->len);
+
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+void
+mm_shared_qmi_load_sim_slots (MMIfaceModem        *self,
+                              GAsyncReadyCallback  callback,
+                              gpointer             user_data)
+{
+    LoadSimSlotsContext *ctx;
+    GTask               *task;
+    QmiClient           *client = NULL;
+
+    if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                      QMI_SERVICE_UIM, &client,
+                                      callback, user_data))
+        return;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    ctx = g_slice_new0 (LoadSimSlotsContext);
+    ctx->client_uim = QMI_CLIENT_UIM (g_object_ref (client));
+    g_task_set_task_data (task, ctx, (GDestroyNotify) load_sim_slots_context_free);
+
+    qmi_client_uim_get_slot_status (ctx->client_uim,
+                                    NULL,
+                                    10,
+                                    NULL,
+                                    (GAsyncReadyCallback) uim_get_slot_status_ready,
+                                    task);
+}
+
+/*****************************************************************************/
+/* Set Primary SIM slot (modem interface) */
+
+gboolean
+mm_shared_qmi_set_primary_sim_slot_finish (MMIfaceModem  *self,
+                                           GAsyncResult  *res,
+                                           GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+uim_switch_slot_ready (QmiClientUim *client,
+                       GAsyncResult *res,
+                       GTask        *task)
+{
+    g_autoptr(QmiMessageUimSwitchSlotOutput)  output = NULL;
+    g_autoptr(GError)                         error = NULL;
+    MMIfaceModem                             *self;
+
+    self = g_task_get_source_object (task);
+
+    output = qmi_client_uim_switch_slot_finish (client, res, &error);
+    if (!output || !qmi_message_uim_switch_slot_output_get_result (output, &error)) {
+        if (g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_NO_EFFECT))
+            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_EXISTS,
+                                     "SIM slot switch operation not needed");
+        else
+            g_task_return_error (task, g_steal_pointer (&error));
+    } else {
+        mm_obj_msg (self, "SIM slot switch operation request successful");
+        g_task_return_boolean (task, TRUE);
+    }
+    g_object_unref (task);
+}
+
+static void
+uim_switch_get_slot_status_ready (QmiClientUim *client,
+                                  GAsyncResult *res,
+                                  GTask        *task)
+{
+    g_autoptr(QmiMessageUimGetSlotStatusOutput) output = NULL;
+    g_autoptr(QmiMessageUimSwitchSlotInput)     input = NULL;
+    MMIfaceModem      *self;
+    g_autoptr(GError)  error = NULL;
+    GArray            *physical_slots = NULL;
+    guint              i;
+    guint              active_logical_id = 0;
+    guint              active_slot_number;
+    guint              slot_number;
+
+    self = g_task_get_source_object (task);
+    slot_number = GPOINTER_TO_UINT (g_task_get_task_data (task));
+
+    output = qmi_client_uim_get_slot_status_finish (client, res, &error);
+    if (!output ||
+        !qmi_message_uim_get_slot_status_output_get_result (output, &error) ||
+        !qmi_message_uim_get_slot_status_output_get_physical_slot_status (output, &physical_slots, &error)) {
+        if (g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_DEVICE_UNSUPPORTED) ||
+            g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_INVALID_QMI_COMMAND) ||
+            g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_NOT_SUPPORTED))
+            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                     "QMI SIM slot switch operation not supported");
+        else
+            g_task_return_error (task, g_steal_pointer (&error));
+        g_object_unref (task);
+        return;
+    }
+
+    for (i = 0; i < physical_slots->len; i++) {
+        QmiPhysicalSlotStatusSlot *slot_status;
+
+        /* We look for the currently ACTIVE SIM card only! */
+        slot_status = &g_array_index (physical_slots, QmiPhysicalSlotStatusSlot, i);
+        if (slot_status->physical_slot_status != QMI_UIM_SLOT_STATE_ACTIVE)
+            continue;
+
+        active_logical_id = slot_status->logical_slot;
+        active_slot_number = i + 1;
+    }
+
+    if (!active_logical_id) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                 "couldn't find active slot logical ID");
+        g_object_unref (task);
+        return;
+    }
+
+    if (active_slot_number == slot_number) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_EXISTS,
+                                 "SIM slot switch operation not needed");
+        g_object_unref (task);
+        return;
+    }
+
+    mm_obj_dbg (self, "requesting active logical id %d switch to SIM slot %u", active_logical_id, slot_number);
+
+    input = qmi_message_uim_switch_slot_input_new ();
+    qmi_message_uim_switch_slot_input_set_logical_slot (input, (guint8) active_logical_id, NULL);
+    qmi_message_uim_switch_slot_input_set_physical_slot (input, slot_number, NULL);
+    qmi_client_uim_switch_slot (client,
+                                input,
+                                10,
+                                NULL,
+                                (GAsyncReadyCallback) uim_switch_slot_ready,
+                                task);
+}
+
+void
+mm_shared_qmi_set_primary_sim_slot (MMIfaceModem        *self,
+                                    guint                sim_slot,
+                                    GAsyncReadyCallback  callback,
+                                    gpointer             user_data)
+{
+    GTask     *task;
+    QmiClient *client = NULL;
+
+    if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                      QMI_SERVICE_UIM, &client,
+                                      callback, user_data))
+        return;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    g_task_set_task_data (task, GUINT_TO_POINTER (sim_slot), NULL);
+
+    qmi_client_uim_get_slot_status (QMI_CLIENT_UIM (client),
+                                    NULL,
+                                    10,
+                                    NULL,
+                                    (GAsyncReadyCallback) uim_switch_get_slot_status_ready,
+                                    task);
+}
+
+/*****************************************************************************/
+/* UIM refresh indication handling */
+
+#define REFRESH_START_TIMEOUT_SECS  3
+
+static void
+uim_refresh_complete (QmiClientUim      *client,
+                      QmiUimSessionType  session_type)
+{
+    g_autoptr(QmiMessageUimRefreshCompleteInput)  refresh_complete_input = NULL;
+    GArray                                       *placeholder_aid;
+
+    placeholder_aid = g_array_new (FALSE, FALSE, sizeof (guint8));
+
+    refresh_complete_input = qmi_message_uim_refresh_complete_input_new ();
+    qmi_message_uim_refresh_complete_input_set_session (
+        refresh_complete_input,
+        session_type,
+        placeholder_aid, /* ignored */
+        NULL);
+    qmi_message_uim_refresh_complete_input_set_info (
+        refresh_complete_input,
+        TRUE,
+        NULL);
+
+    qmi_client_uim_refresh_complete (
+        client,
+        refresh_complete_input,
+        10,
+        NULL,
+        NULL,
+        NULL);
+    g_array_unref (placeholder_aid);
+}
+
+static gboolean
+uim_start_refresh_timeout (MMSharedQmi *self)
+{
+    Private *priv;
+
+    priv = get_private (self);
+    priv->uim_refresh_start_timeout_id = 0;
+
+    mm_obj_dbg (self, "refresh start timed out; trigger SIM change check");
+
+    mm_iface_modem_check_for_sim_swap (MM_IFACE_MODEM (self), NULL, NULL, NULL, NULL);
+
+    return G_SOURCE_REMOVE;
+}
+
+static void
+uim_refresh_indication_cb (QmiClientUim                  *client,
+                           QmiIndicationUimRefreshOutput *output,
+                           MMSharedQmi                   *self)
+{
+    QmiUimRefreshStage  stage;
+    QmiUimRefreshMode   mode;
+    QmiUimSessionType   session_type;
+    Private            *priv;
+    g_autoptr(GError)   error = NULL;
+
+    priv = get_private (self);
+
+    if (!qmi_indication_uim_refresh_output_get_event (output,
+                                                      &stage,
+                                                      &mode,
+                                                      &session_type,
+                                                      NULL,
+                                                      NULL,
+                                                      &error)) {
+        mm_obj_warn (self, "couldn't process UIM refresh indication: %s", error->message);
+        return;
+    }
+
+    mm_obj_dbg (self, "refresh indication received: session type '%s', stage '%s', mode '%s'",
+                qmi_uim_session_type_get_string (session_type),
+                qmi_uim_refresh_stage_get_string (stage),
+                qmi_uim_refresh_mode_get_string (mode));
+
+    /* Support only the first slot for now. Primary GW provisioning is used in old modems. */
+    if (session_type != QMI_UIM_SESSION_TYPE_CARD_SLOT_1 &&
+        session_type != QMI_UIM_SESSION_TYPE_PRIMARY_GW_PROVISIONING) {
+        mm_obj_warn (self, "refresh session type not supported: %s", qmi_uim_session_type_get_string (session_type));
+        return;
+    }
+
+    /* Currently we handle UICC Reset type refresh, which can be used
+     * in profile switch scenarios, and Init Full FCN type refresh for
+     * SIM IMSI switch scenarios. In other cases we just trigger 'refresh
+     * complete' during start phase. Signal to notify about potential SIM
+     * profile switch is triggered when the refresh is ending. If it were
+     * triggered in start phase, reading SIM files seems to fail with
+     * an internal error.
+     *
+     * It's possible that 'end-with-success' stage never appears. For that,
+     * we start a timer at 'start' stage and if it expires, the SIM change
+     * check is triggered anyway. */
+    if (stage == QMI_UIM_REFRESH_STAGE_START) {
+        if (mode == QMI_UIM_REFRESH_MODE_RESET || mode == QMI_UIM_REFRESH_MODE_INIT_FULL_FCN) {
+            if (!priv->uim_refresh_start_timeout_id)
+                priv->uim_refresh_start_timeout_id = g_timeout_add_seconds (REFRESH_START_TIMEOUT_SECS,
+                                                                            (GSourceFunc)uim_start_refresh_timeout,
+                                                                            self);
+        } else
+            uim_refresh_complete (client, session_type);
+    } else if (stage == QMI_UIM_REFRESH_STAGE_END_WITH_SUCCESS) {
+        if (mode == QMI_UIM_REFRESH_MODE_RESET || mode == QMI_UIM_REFRESH_MODE_INIT_FULL_FCN) {
+            if (priv->uim_refresh_start_timeout_id) {
+                g_source_remove (priv->uim_refresh_start_timeout_id);
+                priv->uim_refresh_start_timeout_id = 0;
+            }
+            mm_iface_modem_check_for_sim_swap (MM_IFACE_MODEM (self), NULL, NULL, NULL, NULL);
+        }
+    }
+}
+
+/*****************************************************************************/
+/* UIM slot status indication handling */
+
+/* Modifies the sim at slot == index+1, based on the content of slot_status.
+ * Primarily used when a hotswap occurs on the inactive slot */
+static void
+update_sim_from_slot_status (MMSharedQmi               *self,
+                             QmiPhysicalSlotStatusSlot *slot_status,
+                             guint                      slot_index)
+{
+    g_autoptr(MMBaseSim)  sim = NULL;
+    g_autofree gchar     *raw_iccid = NULL;
+    g_autofree gchar     *iccid = NULL;
+    g_autoptr(GError)     inner_error = NULL;
+
+    mm_obj_dbg (self, "Updating sim at slot %d", slot_index + 1);
+    /* If sim is not present, ask mm_iface_modem to clear the sim object */
+    if (slot_status->physical_card_status != QMI_UIM_PHYSICAL_CARD_STATE_PRESENT) {
+        mm_iface_modem_modify_sim (MM_IFACE_MODEM (self), slot_index, NULL);
+        return;
+    }
+
+    raw_iccid = mm_utils_bin2hexstr ((const guint8 *)slot_status->iccid->data, slot_status->iccid->len);
+    if (!raw_iccid) {
+        mm_obj_warn (self, "not creating SIM object: failed to convert ICCID from BCD");
+        return;
+    }
+    iccid = mm_3gpp_parse_iccid (raw_iccid, &inner_error);
+    if (!iccid) {
+        mm_obj_warn (self, "not creating SIM object: couldn't parse SIM iccid: %s", inner_error->message);
+        return;
+    }
+    sim = mm_sim_qmi_new_initialized (MM_BASE_MODEM (self),
+                                      TRUE,                              /* consider DMS UIM deprecated if we're creating SIM slots */
+                                      slot_index + 1,                    /* slot number is the array index starting at 1 */
+                                      slot_status->physical_slot_status, /* is_active */
+                                      iccid,
+                                      NULL,  /* imsi unknown */
+                                      NULL,  /* eid unknown */
+                                      NULL,  /* operator id unknown */
+                                      NULL,  /* operator name unknown */
+                                      NULL); /* emergency numbers unknown */
+
+    mm_iface_modem_modify_sim (MM_IFACE_MODEM (self), slot_index, sim);
+}
+
+/* Checks for equality of two slots. */
+static gboolean
+slot_status_equal (QmiPhysicalSlotStatusSlot *slot_a,
+                   QmiPhysicalSlotStatusSlot *slot_b)
+{
+    guint j;
+
+    if (slot_a->physical_slot_status != slot_b->physical_slot_status)
+        return FALSE;
+    if (slot_a->physical_card_status != slot_b->physical_card_status)
+        return FALSE;
+    if (slot_a->iccid->len != slot_b->iccid->len)
+        return FALSE;
+    for (j = 0; j < slot_a->iccid->len; j++) {
+        if (g_array_index (slot_a->iccid, guint8, j) != g_array_index (slot_b->iccid, guint8, j))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* Checks for equality of QmiPhysicalSlotStatusSlot arrays.
+ * The number of elements in each array is expected to be the number of sim slots in the modem.*/
+static gboolean
+slot_array_status_equal (GArray   *slots_status1,
+                         GArray   *slots_status2,
+                         gboolean  check_active_slots_only)
+{
+    guint i;
+
+    if (!slots_status1 && !slots_status2)
+        return TRUE;
+    if (!slots_status1 || !slots_status2 || slots_status1->len != slots_status2->len)
+        return FALSE;
+    for (i = 0; i < slots_status1->len; i++) {
+        /* Compare slot at index i from slots_status1 and slots_status2 */
+        QmiPhysicalSlotStatusSlot *slot_a;
+        QmiPhysicalSlotStatusSlot *slot_b;
+
+        slot_a = &g_array_index (slots_status1, QmiPhysicalSlotStatusSlot, i);
+        slot_b = &g_array_index (slots_status2, QmiPhysicalSlotStatusSlot, i);
+
+        /* Check that slot_a and slot_b have the same slot status (i.e. active or inactive) */
+        if (slot_a->physical_slot_status != slot_b->physical_slot_status)
+            return FALSE;
+        /* Once slot_a and slot_b are confirmed to have the same physical slot status,
+         * we will ignore inactive slots if check_active_slots_only is set. */
+        if (check_active_slots_only && slot_a->physical_slot_status != QMI_UIM_SLOT_STATE_ACTIVE) {
+            g_assert (slot_a->physical_slot_status == slot_b->physical_slot_status);
+            continue;
+        }
+        if (!slot_status_equal (slot_a, slot_b))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static void
+uim_slot_status_indication_cb (QmiClientUim                     *client,
+                               QmiIndicationUimSlotStatusOutput *output,
+                               MMSharedQmi                      *self)
+{
+    GArray            *new_slots_status = NULL;
+    Private           *priv;
+    guint              i;
+    g_autoptr(GError)  error = NULL;
+
+    priv = get_private (self);
+    mm_obj_dbg (self, "received slot status indication");
+
+    if (!priv->slots_status) {
+        mm_obj_dbg (self, "initial slot status is not loaded yet");
+        return;
+    }
+
+    if (!qmi_indication_uim_slot_status_output_get_physical_slot_status (output,
+                                                                         &new_slots_status,
+                                                                         &error)) {
+        mm_obj_warn (self, "could not process slot status indication: %s", error->message);
+        return;
+    }
+
+    /* A slot status indication means that
+     * 1) The physical slot to logical slot mapping has changed as a
+     * result of switching the slot. or,
+     * 2) A card has been removed from, or inserted to, the physical slot. or,
+     * 3) A physical slot is powered up or down. */
+
+    /* Reprobe if the active slot changed or the information in an
+     * active slot's status changed */
+    if (!slot_array_status_equal (priv->slots_status, new_slots_status, TRUE)) {
+        mm_obj_dbg (self, "An active slot had a status change, will reprobe the modem");
+        mm_iface_modem_process_sim_event (MM_IFACE_MODEM (self));
+        return;
+    }
+
+    /* An inactive slot changed, we won't be reprobing the modem.
+     * Instead, we will ask mm_iface_modem to update the sim object.
+     * Iterate over each slot to identify the slots that changed state.*/
+    for (i = 0; i < priv->slots_status->len; i++) {
+        QmiPhysicalSlotStatusSlot *old_slot;
+        QmiPhysicalSlotStatusSlot *new_slot;
+
+        old_slot = &g_array_index (priv->slots_status, QmiPhysicalSlotStatusSlot, i);
+        new_slot = &g_array_index (new_slots_status, QmiPhysicalSlotStatusSlot, i);
+
+        if (!slot_status_equal (old_slot, new_slot)) {
+            mm_obj_dbg (self, "Slot %d (inactive) had a status change. Will update sims, but not reprobe", i + 1);
+            update_sim_from_slot_status (self, new_slot, i);
+        }
+    }
+
+    g_clear_pointer (&priv->slots_status, g_array_unref);
+    priv->slots_status = g_array_ref (new_slots_status);
+}
+
+/*****************************************************************************/
+/* SIM hot swap setup */
+
+typedef enum {
+    SETUP_SIM_HOT_SWAP_STEP_FIRST,
+    SETUP_SIM_HOT_SWAP_STEP_UIM_REGISTER_SLOT_STATUS,
+    SETUP_SIM_HOT_SWAP_STEP_UIM_CHECK_SLOT_STATUS,
+    SETUP_SIM_HOT_SWAP_STEP_UIM_SLOT_STATUS_INDICATION,
+    SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_REGISTER_ALL,
+    SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_REGISTER_ICCID,
+    SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_REGISTER_IMSI,
+    SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_INDICATION,
+    SETUP_SIM_HOT_SWAP_STEP_LAST,
+} SetupSimHotSwapStep;
+
+typedef struct {
+    SetupSimHotSwapStep step;
+    gboolean            register_slot_status_supported;
+    gboolean            get_slot_status_supported;
+    gboolean            refresh_all_supported;
+    gboolean            refresh_file_supported;
+    QmiClient          *uim_client;
+    gulong              uim_slot_status_indication_id;
+    gulong              uim_refresh_indication_id;
+} SetupSimHotSwapContext;
+
+static void setup_sim_hot_swap_step (GTask *task);
+
+static void
+setup_sim_hot_swap_context_free (SetupSimHotSwapContext *ctx)
+{
+    if (ctx->uim_client && ctx->uim_slot_status_indication_id)
+        g_signal_handler_disconnect (ctx->uim_client, ctx->uim_slot_status_indication_id);
+    if (ctx->uim_client && ctx->uim_refresh_indication_id)
+        g_signal_handler_disconnect (ctx->uim_client, ctx->uim_refresh_indication_id);
+    g_clear_object (&ctx->uim_client);
+    g_slice_free (SetupSimHotSwapContext, ctx);
+}
+
+gboolean
+mm_shared_qmi_setup_sim_hot_swap_finish (MMIfaceModem  *self,
+                                         GAsyncResult  *res,
+                                         GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+uim_refresh_register_file_ready (QmiClientUim *client,
+                                 GAsyncResult *res,
+                                 GTask        *task)
+{
+    MMSharedQmi                                   *self;
+    g_autoptr(QmiMessageUimRefreshRegisterOutput)  output = NULL;
+    g_autoptr(GError)                              error = NULL;
+    SetupSimHotSwapContext                        *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    output = qmi_client_uim_refresh_register_finish (client, res, &error);
+    if (!output || !qmi_message_uim_refresh_register_output_get_result (output, &error))
+        mm_obj_dbg (self, "file refresh registration using 'refresh register' failed: %s", error->message);
+    else {
+        mm_obj_dbg (self, "file refresh registered using 'refresh register'");
+        ctx->refresh_file_supported = TRUE;
+    }
+
+    /* Go on to next step */
+    ctx->step++;
+    setup_sim_hot_swap_step (task);
+}
+
+static void
+uim_refresh_register_file (GTask         *task,
+                           guint16        file_id,
+                           const guint16 *file_path,
+                           gsize          file_path_len)
+{
+    MMSharedQmi                                       *self;
+    SetupSimHotSwapContext                            *ctx;
+    QmiMessageUimRefreshRegisterInputInfoFilesElement  file_element;
+    guint8                                             val;
+    gsize                                              i;
+    g_autoptr(QmiMessageUimRefreshRegisterInput)       refresh_register_input = NULL;
+    g_autoptr(GArray)                                  placeholder_aid = NULL;
+    g_autoptr(GArray)                                  file = NULL;
+    g_autoptr(GArray)                                  file_element_path = NULL;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    /* This is the last resort if 'refresh register all' does not work. It works
+     * on some older modems. Those modems may not also support QMI_UIM_SESSION_TYPE_CARD_SLOT_1
+     * so we'll use QMI_UIM_SESSION_TYPE_PRIMARY_GW_PROVISIONING */
+
+    mm_obj_dbg (self, "register for refresh file indication");
+
+    placeholder_aid = g_array_new (FALSE, FALSE, sizeof (guint8));
+
+    file = g_array_sized_new (FALSE, FALSE, sizeof (QmiMessageUimRefreshRegisterInputInfoFilesElement), 1);
+
+    file_element_path = g_array_sized_new (FALSE, FALSE, sizeof (guint8), file_path_len * 2);
+    for (i = 0; i < file_path_len; ++i) {
+        val = file_path[i] & 0xFF;
+        g_array_append_val (file_element_path, val);
+        val = (file_path[i] >> 8) & 0xFF;
+        g_array_append_val (file_element_path, val);
+    }
+
+
+    memset (&file_element, 0, sizeof (file_element));
+    file_element.file_id = file_id;
+    file_element.path = file_element_path;
+    g_array_append_val (file, file_element);
+
+    refresh_register_input = qmi_message_uim_refresh_register_input_new ();
+    qmi_message_uim_refresh_register_input_set_info (refresh_register_input,
+                                                     TRUE,
+                                                     FALSE,
+                                                     file,
+                                                     NULL);
+    qmi_message_uim_refresh_register_input_set_session (refresh_register_input,
+                                                        QMI_UIM_SESSION_TYPE_PRIMARY_GW_PROVISIONING,
+                                                        placeholder_aid,
+                                                        NULL);
+
+    qmi_client_uim_refresh_register (QMI_CLIENT_UIM (ctx->uim_client),
+                                     refresh_register_input,
+                                     10,
+                                     NULL,
+                                     (GAsyncReadyCallback) uim_refresh_register_file_ready,
+                                     task);
+}
+
+/* Refresh registration and event handling.
+ * This is used for detecting ICCID and IMSI change.
+ */
+
+static void
+uim_refresh_register_all_ready (QmiClientUim *client,
+                                GAsyncResult *res,
+                                GTask        *task)
+{
+    g_autoptr(QmiMessageUimRefreshRegisterAllOutput)  output = NULL;
+    g_autoptr(GError)                                 error = NULL;
+    MMIfaceModem                                     *self;
+    SetupSimHotSwapContext                           *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    output = qmi_client_uim_refresh_register_all_finish (client, res, &error);
+    if (!output || !qmi_message_uim_refresh_register_all_output_get_result (output, &error)) {
+        mm_obj_dbg (self, "refresh register all operation failed: %s", error->message);
+    } else {
+        /* Jump to setup refresh indication signal */
+        mm_obj_dbg (self, "registered for all SIM refresh events");
+        ctx->refresh_all_supported = TRUE;
+    }
+
+    ctx->step++;
+    setup_sim_hot_swap_step (task);
+}
+
+static void
+uim_check_get_slot_status_ready (QmiClientUim *client,
+                                 GAsyncResult *res,
+                                 GTask        *task)
+{
+    g_autoptr(QmiMessageUimGetSlotStatusOutput)  output = NULL;
+    g_autoptr(GError)                            error = NULL;
+    MMIfaceModem                                *self;
+    SetupSimHotSwapContext                      *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    output = qmi_client_uim_get_slot_status_finish (client, res, &error);
+    if (!output || !qmi_message_uim_get_slot_status_output_get_result (output, &error)) {
+        mm_obj_dbg (self, "slot status retrieval failed: %s", error->message);
+    } else {
+        /* Go on to next step */
+        mm_obj_dbg (self, "slot status retrieval succeeded");
+        ctx->get_slot_status_supported = TRUE;
+    }
+
+    ctx->step++;
+    setup_sim_hot_swap_step (task);
+}
+
+static void
+uim_register_events_ready (QmiClientUim *client,
+                           GAsyncResult *res,
+                           GTask        *task)
+{
+    g_autoptr(QmiMessageUimRegisterEventsOutput)  output = NULL;
+    g_autoptr(GError)                             error = NULL;
+    MMIfaceModem                                 *self;
+    SetupSimHotSwapContext                       *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    /* If event registration fails, go on with initialization. In that case
+     * we cannot use slot status indications to detect eUICC profile switches. */
+    output = qmi_client_uim_register_events_finish (client, res, &error);
+    if (!output || !qmi_message_uim_register_events_output_get_result (output, &error)) {
+        mm_obj_dbg (self, "not registered for slot status indications: %s", error->message);
+    } else {
+        mm_obj_dbg (self, "registered for slot status indications");
+        ctx->register_slot_status_supported = TRUE;
+    }
+
+    /* Go on to next step */
+    ctx->step++;
+    setup_sim_hot_swap_step (task);
+}
+
+static void
+setup_sim_hot_swap_step (GTask *task)
+{
+    MMSharedQmi            *self;
+    Private                *priv;
+    SetupSimHotSwapContext *ctx;
+
+    self = g_task_get_source_object (task);
+    priv = get_private (MM_SHARED_QMI (self));
+    ctx  = g_task_get_task_data (task);
+
+    switch (ctx->step) {
+    case SETUP_SIM_HOT_SWAP_STEP_FIRST:
+        ctx->step++;
+        /* fall-through */
+
+    case SETUP_SIM_HOT_SWAP_STEP_UIM_REGISTER_SLOT_STATUS: {
+        g_autoptr(QmiMessageUimRegisterEventsInput) register_events_input = NULL;
+
+        mm_obj_dbg (self, "setup SIM hot swap (%u/%u): registering for slot status indications...",
+                    ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+        register_events_input = qmi_message_uim_register_events_input_new ();
+        qmi_message_uim_register_events_input_set_event_registration_mask (register_events_input,
+                                                                           QMI_UIM_EVENT_REGISTRATION_FLAG_PHYSICAL_SLOT_STATUS,
+                                                                           NULL);
+        qmi_client_uim_register_events (QMI_CLIENT_UIM (ctx->uim_client),
+                                        register_events_input,
+                                        10,
+                                        NULL,
+                                        (GAsyncReadyCallback) uim_register_events_ready,
+                                        task);
+        return;
+    }
+
+    case SETUP_SIM_HOT_SWAP_STEP_UIM_CHECK_SLOT_STATUS:
+        if (ctx->register_slot_status_supported) {
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): checking slot status support...",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+            /* Successful registration does not mean that the modem actually sends
+             * physical slot status indications; invoke Get Slot Status to find out if
+             * the modem really supports slot status. */
+            qmi_client_uim_get_slot_status (QMI_CLIENT_UIM (ctx->uim_client),
+                                            NULL,
+                                            10,
+                                            NULL,
+                                            (GAsyncReadyCallback) uim_check_get_slot_status_ready,
+                                            task);
+            return;
+        }
+        mm_obj_dbg (self, "setup SIM hot swap (%u/%u): no need to check for slot status support...",
+                    ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+        ctx->step++;
+        /* fall-through */
+
+    case SETUP_SIM_HOT_SWAP_STEP_UIM_SLOT_STATUS_INDICATION:
+        if (ctx->register_slot_status_supported && ctx->get_slot_status_supported) {
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): monitoring slot status indications...",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+            ctx->uim_slot_status_indication_id = g_signal_connect (ctx->uim_client,
+                                                                   "slot-status",
+                                                                   G_CALLBACK (uim_slot_status_indication_cb),
+                                                                   self);
+        } else
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): no need to monitor for slot status indications...",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+        ctx->step++;
+        /* fall-through */
+
+    case SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_REGISTER_ALL: {
+        g_autoptr(QmiMessageUimRefreshRegisterAllInput) refresh_register_all_input = NULL;
+        g_autoptr(GArray)                               placeholder_aid = NULL;
+
+        mm_obj_dbg (self, "setup SIM hot swap (%u/%u): registering for all refresh events...",
+                    ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+        placeholder_aid = g_array_new (FALSE, FALSE, sizeof (guint8));
+        refresh_register_all_input = qmi_message_uim_refresh_register_all_input_new ();
+
+        qmi_message_uim_refresh_register_all_input_set_info (refresh_register_all_input,
+                                                             TRUE,
+                                                             NULL);
+        qmi_message_uim_refresh_register_all_input_set_session (refresh_register_all_input,
+                                                                QMI_UIM_SESSION_TYPE_PRIMARY_GW_PROVISIONING,
+                                                                placeholder_aid,
+                                                                NULL);
+
+        qmi_client_uim_refresh_register_all (QMI_CLIENT_UIM (ctx->uim_client),
+                                             refresh_register_all_input,
+                                             10,
+                                             NULL,
+                                             (GAsyncReadyCallback) uim_refresh_register_all_ready,
+                                             task);
+        return;
+    }
+
+    case SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_REGISTER_ICCID:
+        /* If refresh all not supported, register for a single file refresh notification */
+        if (!ctx->refresh_all_supported) {
+            const guint16 file_path[] = { 0x3F00 };
+
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): registering for SIM ICCID refresh events...",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+            uim_refresh_register_file (task, 0x2FE2, file_path, G_N_ELEMENTS (file_path));
+            return;
+        }
+        mm_obj_dbg (self, "setup SIM hot swap (%u/%u): no need to register for SIM ICCID refresh events",
+                    ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+        ctx->step++;
+        /* fall-through */
+
+    case SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_REGISTER_IMSI:
+        /* If refresh all not supported, register for a single file refresh notification */
+        if (!ctx->refresh_all_supported) {
+            const guint16 file_path[] = { 0x3F00, 0x7FFF };
+
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): registering for SIM IMSI refresh events...",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+            uim_refresh_register_file (task, 0x6F07, file_path, G_N_ELEMENTS (file_path));
+            return;
+        }
+        mm_obj_dbg (self, "setup SIM hot swap (%u/%u): no need to register for SIM IMSI refresh events...",
+                    ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+        ctx->step++;
+        /* fall-through */
+
+    case SETUP_SIM_HOT_SWAP_STEP_UIM_REFRESH_INDICATION:
+        if (ctx->refresh_all_supported || ctx->refresh_file_supported) {
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): monitoring refresh indications...",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+            ctx->uim_refresh_indication_id =
+                g_signal_connect (ctx->uim_client,
+                                  "refresh",
+                                  G_CALLBACK (uim_refresh_indication_cb),
+                                  self);
+        } else
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): no need to monitor for refresh indications...",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+
+        ctx->step++;
+        /* fall-through */
+
+    case SETUP_SIM_HOT_SWAP_STEP_LAST:
+        if (ctx->refresh_all_supported  ||
+            ctx->refresh_file_supported ||
+            (ctx->register_slot_status_supported && ctx->get_slot_status_supported)) {
+            /* at least one method was supported, transfer state to the private
+             * info and return success */
+            g_assert (!priv->uim_client);
+            priv->uim_client = g_steal_pointer (&ctx->uim_client);
+            if (ctx->uim_slot_status_indication_id) {
+                g_assert (!priv->uim_slot_status_indication_id);
+                priv->uim_slot_status_indication_id = ctx->uim_slot_status_indication_id;
+                ctx->uim_slot_status_indication_id = 0;
+            }
+            if (ctx->uim_refresh_indication_id) {
+                g_assert (!priv->uim_refresh_indication_id);
+                priv->uim_refresh_indication_id = ctx->uim_refresh_indication_id;
+                ctx->uim_refresh_indication_id = 0;
+            }
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): successfully finished",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+            g_task_return_boolean (task, TRUE);
+        } else {
+            mm_obj_dbg (self, "setup SIM hot swap (%u/%u): failed",
+                        ctx->step, SETUP_SIM_HOT_SWAP_STEP_LAST);
+            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                     "Couldn't setup SIM hot swap");
+        }
+        g_object_unref (task);
+        return;
+
+    default:
+        g_assert_not_reached ();
+    }
+}
+
+void
+mm_shared_qmi_setup_sim_hot_swap (MMIfaceModem        *self,
+                                  GAsyncReadyCallback  callback,
+                                  gpointer             user_data)
+{
+    GTask                  *task;
+    QmiClient              *client = NULL;
+    SetupSimHotSwapContext *ctx;
+
+    if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                      QMI_SERVICE_UIM, &client,
+                                      callback, user_data))
+        return;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    ctx = g_slice_new0 (SetupSimHotSwapContext);
+    ctx->step = SETUP_SIM_HOT_SWAP_STEP_FIRST;
+    ctx->uim_client = g_object_ref (client);
+    g_task_set_task_data (task, ctx, (GDestroyNotify)setup_sim_hot_swap_context_free);
+
+    setup_sim_hot_swap_step (task);
+}
+
+/*****************************************************************************/
+/* Set packet service state (3GPP interface)  */
+
+typedef struct {
+    QmiClientNas                  *client;
+    MMModem3gppPacketServiceState  packet_service_state;
+} SetPacketServiceStateContext;
+
+static void
+set_packet_service_state_context_free (SetPacketServiceStateContext *ctx)
+{
+    g_object_unref (ctx->client);
+    g_slice_free (SetPacketServiceStateContext, ctx);
+}
+
+gboolean
+mm_shared_qmi_set_packet_service_state_finish (MMIfaceModem3gpp  *self,
+                                               GAsyncResult      *res,
+                                               GError           **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+set_packet_service_state_ia_ready (QmiClientNas *client,
+                                   GAsyncResult *res,
+                                   GTask        *task)
+{
+    g_autoptr(GError)                          error = NULL;
+    g_autoptr(QmiMessageNasAttachDetachOutput) output = NULL;
+
+    output = qmi_client_nas_attach_detach_finish (client, res, &error);
+    if ((!output || !qmi_message_nas_attach_detach_output_get_result (output, &error)) &&
+        !g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_NO_EFFECT)) {
+        g_prefix_error (&error, "Couldn't set packet service state: ");
+        g_task_return_error (task, g_steal_pointer (&error));
+    } else
+        g_task_return_boolean (task, TRUE);
+
+    g_object_unref (task);
+}
+
+static void
+set_packet_service_state_ia (GTask *task)
+{
+    g_autoptr(QmiMessageNasAttachDetachInput)  input = NULL;
+    SetPacketServiceStateContext              *ctx;
+
+    input = qmi_message_nas_attach_detach_input_new ();
+    ctx = g_task_get_task_data (task);
+
+    if (ctx->packet_service_state == MM_MODEM_3GPP_PACKET_SERVICE_STATE_ATTACHED)
+        qmi_message_nas_attach_detach_input_set_action (input, QMI_NAS_PS_ATTACH_ACTION_ATTACH, NULL);
+    else if (ctx->packet_service_state == MM_MODEM_3GPP_PACKET_SERVICE_STATE_DETACHED)
+        qmi_message_nas_attach_detach_input_set_action (input, QMI_NAS_PS_ATTACH_ACTION_DETACH, NULL);
+    else
+        g_assert_not_reached ();
+
+    qmi_client_nas_attach_detach (
+        ctx->client,
+        input,
+        5,
+        NULL,
+        (GAsyncReadyCallback)set_packet_service_state_ia_ready,
+        task);
+}
+
+static void
+set_packet_service_state_sssp_ready (QmiClientNas *client,
+                                     GAsyncResult *res,
+                                     GTask        *task)
+{
+    g_autoptr(GError)                                          error = NULL;
+    g_autoptr(QmiMessageNasSetSystemSelectionPreferenceOutput) output = NULL;
+
+    output = qmi_client_nas_set_system_selection_preference_finish (client, res, &error);
+    if ((!output || !qmi_message_nas_set_system_selection_preference_output_get_result (output, &error)) &&
+        !g_error_matches (error, QMI_PROTOCOL_ERROR, QMI_PROTOCOL_ERROR_NO_EFFECT)) {
+        g_prefix_error (&error, "Couldn't set packet service state: ");
+        g_task_return_error (task, g_steal_pointer (&error));
+    } else
+        g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+set_packet_service_state_sssp (GTask *task)
+{
+    g_autoptr(QmiMessageNasSetSystemSelectionPreferenceInput)  input = NULL;
+    SetPacketServiceStateContext                              *ctx;
+
+    input = qmi_message_nas_set_system_selection_preference_input_new ();
+    ctx = g_task_get_task_data (task);
+
+    if (ctx->packet_service_state == MM_MODEM_3GPP_PACKET_SERVICE_STATE_ATTACHED)
+        qmi_message_nas_set_system_selection_preference_input_set_service_domain_preference (
+            input, QMI_NAS_SERVICE_DOMAIN_PREFERENCE_PS_ATTACH, NULL);
+    else if (ctx->packet_service_state == MM_MODEM_3GPP_PACKET_SERVICE_STATE_DETACHED)
+        qmi_message_nas_set_system_selection_preference_input_set_service_domain_preference (
+            input, QMI_NAS_SERVICE_DOMAIN_PREFERENCE_PS_DETACH, NULL);
+    else
+        g_assert_not_reached ();
+
+    qmi_client_nas_set_system_selection_preference (
+        ctx->client,
+        input,
+        5,
+        NULL,
+        (GAsyncReadyCallback)set_packet_service_state_sssp_ready,
+        task);
+}
+
+void
+mm_shared_qmi_set_packet_service_state (MMIfaceModem3gpp              *self,
+                                        MMModem3gppPacketServiceState  packet_service_state,
+                                        GAsyncReadyCallback            callback,
+                                        gpointer                       user_data)
+{
+    GTask                        *task;
+    SetPacketServiceStateContext *ctx;
+    QmiClient                    *client = NULL;
+    Private                      *priv = NULL;
+
+    g_assert ((packet_service_state == MM_MODEM_3GPP_PACKET_SERVICE_STATE_ATTACHED) ||
+              (packet_service_state == MM_MODEM_3GPP_PACKET_SERVICE_STATE_DETACHED));
+
+    /* Get NAS client */
+    if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                      QMI_SERVICE_NAS, &client,
+                                      callback, user_data))
+        return;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    ctx = g_slice_new0 (SetPacketServiceStateContext);
+    ctx->client = QMI_CLIENT_NAS (g_object_ref (client));
+    ctx->packet_service_state = packet_service_state;
+    g_task_set_task_data (task, ctx, (GDestroyNotify)set_packet_service_state_context_free);
+
+    priv = get_private (MM_SHARED_QMI (self));
+    if (priv->feature_nas_ssp == FEATURE_SUPPORTED)
+        set_packet_service_state_sssp (task);
+    else
+        set_packet_service_state_ia (task);
 }
 
 /*****************************************************************************/
@@ -3182,6 +4464,7 @@ set_supl_server_context_free (SetSuplServerContext *ctx)
             g_signal_handler_disconnect (ctx->client, ctx->indication_id);
         g_object_unref (ctx->client);
     }
+    g_free (ctx->supl);
     g_slice_free (SetSuplServerContext, ctx);
 }
 
@@ -4144,7 +5427,7 @@ setup_required_nmea_traces (MMSharedQmi         *self,
         SetupRequiredNmeaTracesContext *ctx;
 
         ctx = g_slice_new0 (SetupRequiredNmeaTracesContext);
-        ctx->client = g_object_ref (client);
+        ctx->client = QMI_CLIENT_LOC (g_object_ref (client));
         g_task_set_task_data (task, ctx, (GDestroyNotify)setup_required_nmea_traces_context_free);
 
         qmi_client_loc_get_nmea_types (ctx->client,
@@ -4205,7 +5488,7 @@ pds_ser_location_ready (QmiClientPds *client,
 
     g_assert (!priv->pds_client);
     g_assert (priv->pds_location_event_report_indication_id == 0);
-    priv->pds_client = g_object_ref (client);
+    priv->pds_client = QMI_CLIENT (g_object_ref (client));
     priv->pds_location_event_report_indication_id =
         g_signal_connect (priv->pds_client,
                           "event-report",
@@ -4335,7 +5618,7 @@ loc_register_events_ready (QmiClientLoc *client,
 
     g_assert (!priv->loc_client);
     g_assert (!priv->loc_location_nmea_indication_id);
-    priv->loc_client = g_object_ref (client);
+    priv->loc_client = QMI_CLIENT (g_object_ref (client));
     priv->loc_location_nmea_indication_id =
         g_signal_connect (client,
                           "nmea",
@@ -5448,7 +6731,7 @@ mm_shared_qmi_location_load_supported_assistance_data (MMIfaceModemLocation  *se
     }
 
     ctx = g_slice_new0 (LoadSupportedAssistanceDataContext);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_LOC (g_object_ref (client));
     g_task_set_task_data (task, ctx, (GDestroyNotify)load_supported_assistance_data_context_free);
 
     qmi_client_loc_get_predicted_orbits_data_source (ctx->client,
@@ -5626,8 +6909,8 @@ inject_xtra_data_next (GTask *task)
 
     ctx->i += count;
 
-    mm_obj_info (self, "injecting xtra data: %" G_GSIZE_FORMAT " bytes (%u/%u)",
-                 count, (guint) ctx->n_part, (guint) ctx->total_parts);
+    mm_obj_dbg (self, "injecting xtra data: %" G_GSIZE_FORMAT " bytes (%u/%u)",
+                count, (guint) ctx->n_part, (guint) ctx->total_parts);
     qmi_client_loc_inject_xtra_data (ctx->client,
                                      input,
                                      10,
@@ -5779,8 +7062,8 @@ inject_assistance_data_next (GTask *task)
 
     ctx->i += count;
 
-    mm_obj_info (self, "injecting predicted orbits data: %" G_GSIZE_FORMAT " bytes (%u/%u)",
-                 count, (guint) ctx->n_part, (guint) ctx->total_parts);
+    mm_obj_dbg (self, "injecting predicted orbits data: %" G_GSIZE_FORMAT " bytes (%u/%u)",
+                count, (guint) ctx->n_part, (guint) ctx->total_parts);
     qmi_client_loc_inject_predicted_orbits_data (ctx->client,
                                                  input,
                                                  10,
@@ -5812,7 +7095,7 @@ mm_shared_qmi_location_inject_assistance_data (MMIfaceModemLocation *self,
 
     task = g_task_new (self, NULL, callback, user_data);
     ctx = g_slice_new0 (InjectAssistanceDataContext);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_LOC (g_object_ref (client));
     ctx->data = g_memdup (data, data_size);
     ctx->data_size = data_size;
     ctx->part_size = ((priv->loc_assistance_data_max_part_size > 0) ? priv->loc_assistance_data_max_part_size : MAX_BYTES_PER_REQUEST);

@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -47,6 +47,7 @@ G_BEGIN_DECLS
 
 typedef struct _MMModemLocation MMModemLocation;
 typedef struct _MMModemLocationClass MMModemLocationClass;
+typedef struct _MMModemLocationPrivate MMModemLocationPrivate;
 
 /**
  * MMModemLocation:
@@ -56,8 +57,8 @@ typedef struct _MMModemLocationClass MMModemLocationClass;
  */
 struct _MMModemLocation {
     /*< private >*/
-    MmGdbusModemLocationProxy parent;
-    gpointer unused;
+    MmGdbusModemLocationProxy  parent;
+    MMModemLocationPrivate    *priv;
 };
 
 struct _MMModemLocationClass {
@@ -205,6 +206,15 @@ gboolean mm_modem_location_get_full_sync   (MMModemLocation *self,
                                             MMLocationCdmaBs **location_cdma_bs,
                                             GCancellable *cancellable,
                                             GError **error);
+
+MMLocation3gpp    *mm_modem_location_peek_signaled_3gpp     (MMModemLocation *self);
+MMLocation3gpp    *mm_modem_location_get_signaled_3gpp      (MMModemLocation *self);
+MMLocationGpsNmea *mm_modem_location_peek_signaled_gps_nmea (MMModemLocation *self);
+MMLocationGpsNmea *mm_modem_location_get_signaled_gps_nmea  (MMModemLocation *self);
+MMLocationGpsRaw  *mm_modem_location_peek_signaled_gps_raw  (MMModemLocation *self);
+MMLocationGpsRaw  *mm_modem_location_get_signaled_gps_raw   (MMModemLocation *self);
+MMLocationCdmaBs  *mm_modem_location_peek_signaled_cdma_bs  (MMModemLocation *self);
+MMLocationCdmaBs  *mm_modem_location_get_signaled_cdma_bs   (MMModemLocation *self);
 
 G_END_DECLS
 

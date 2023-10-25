@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -34,6 +34,7 @@
 #include "mm-unlock-retries.h"
 #include "mm-sim.h"
 #include "mm-bearer.h"
+#include "mm-cell-info.h"
 #include "mm-helper-types.h"
 
 G_BEGIN_DECLS
@@ -75,6 +76,11 @@ gchar       *mm_modem_dup_path (MMModem *self);
 const gchar       *mm_modem_get_sim_path             (MMModem *self);
 gchar             *mm_modem_dup_sim_path             (MMModem *self);
 
+const gchar * const *mm_modem_get_sim_slot_paths (MMModem *self);
+gchar              **mm_modem_dup_sim_slot_paths (MMModem *self);
+
+guint              mm_modem_get_primary_sim_slot (MMModem *self);
+
 gboolean           mm_modem_peek_supported_capabilities (MMModem *self,
                                                          const MMModemCapability **capabilities,
                                                          guint *n_capabilities);
@@ -84,9 +90,8 @@ gboolean           mm_modem_get_supported_capabilities (MMModem *self,
 
 MMModemCapability  mm_modem_get_current_capabilities (MMModem *self);
 
-guint              mm_modem_get_max_bearers          (MMModem *self);
-
-guint              mm_modem_get_max_active_bearers   (MMModem *self);
+guint              mm_modem_get_max_active_bearers             (MMModem *self);
+guint              mm_modem_get_max_active_multiplexed_bearers (MMModem *self);
 
 const gchar * const *mm_modem_get_bearer_paths       (MMModem *self);
 gchar              **mm_modem_dup_bearer_paths       (MMModem *self);
@@ -113,6 +118,9 @@ gchar             *mm_modem_dup_device_identifier    (MMModem *self);
 
 const gchar       *mm_modem_get_device               (MMModem *self);
 gchar             *mm_modem_dup_device               (MMModem *self);
+
+const gchar       *mm_modem_get_physdev              (MMModem *self);
+gchar             *mm_modem_dup_physdev              (MMModem *self);
 
 const gchar * const  *mm_modem_get_drivers           (MMModem *self);
 gchar               **mm_modem_dup_drivers           (MMModem *self);
@@ -343,6 +351,41 @@ MMSim *mm_modem_get_sim_finish (MMModem *self,
 MMSim *mm_modem_get_sim_sync   (MMModem *self,
                                 GCancellable *cancellable,
                                 GError **error);
+
+void       mm_modem_list_sim_slots        (MMModem              *self,
+                                           GCancellable         *cancellable,
+                                           GAsyncReadyCallback   callback,
+                                           gpointer              user_data);
+GPtrArray *mm_modem_list_sim_slots_finish (MMModem              *self,
+                                           GAsyncResult         *res,
+                                           GError              **error);
+GPtrArray *mm_modem_list_sim_slots_sync   (MMModem              *self,
+                                           GCancellable         *cancellable,
+                                           GError              **error);
+
+void     mm_modem_set_primary_sim_slot        (MMModem              *self,
+                                               guint                 sim_slot,
+                                               GCancellable         *cancellable,
+                                               GAsyncReadyCallback   callback,
+                                               gpointer              user_data);
+gboolean mm_modem_set_primary_sim_slot_finish (MMModem              *self,
+                                               GAsyncResult         *res,
+                                               GError              **error);
+gboolean mm_modem_set_primary_sim_slot_sync   (MMModem              *self,
+                                               guint                 sim_slot,
+                                               GCancellable         *cancellable,
+                                               GError              **error);
+
+void   mm_modem_get_cell_info        (MMModem              *self,
+                                      GCancellable         *cancellable,
+                                      GAsyncReadyCallback   callback,
+                                      gpointer              user_data);
+GList *mm_modem_get_cell_info_finish (MMModem              *self,
+                                      GAsyncResult         *res,
+                                      GError              **error);
+GList *mm_modem_get_cell_info_sync   (MMModem              *self,
+                                      GCancellable         *cancellable,
+                                      GError              **error);
 
 G_END_DECLS
 

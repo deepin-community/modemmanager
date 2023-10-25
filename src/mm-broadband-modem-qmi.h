@@ -34,17 +34,34 @@ struct _MMBroadbandModemQmi {
     MMBroadbandModemQmiPrivate *priv;
 };
 
-struct _MMBroadbandModemQmiClass{
+struct _MMBroadbandModemQmiClass {
     MMBroadbandModemClass parent;
+
+    MMPortQmi * (* peek_port_qmi_for_data) (MMBroadbandModemQmi  *self,
+                                            MMPort               *data,
+                                            MMQmiDataEndpoint    *out_endpoint,
+                                            GError              **error);
 };
 
 GType mm_broadband_modem_qmi_get_type (void);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMBroadbandModemQmi, g_object_unref)
 
-MMBroadbandModemQmi *mm_broadband_modem_qmi_new (const gchar *device,
+MMBroadbandModemQmi *mm_broadband_modem_qmi_new (const gchar  *device,
+                                                 const gchar  *physdev,
                                                  const gchar **drivers,
-                                                 const gchar *plugin,
-                                                 guint16 vendor_id,
-                                                 guint16 product_id);
+                                                 const gchar  *plugin,
+                                                 guint16       vendor_id,
+                                                 guint16       product_id);
+
+MMPortQmi *mm_broadband_modem_qmi_peek_port_qmi          (MMBroadbandModemQmi  *self);
+MMPortQmi *mm_broadband_modem_qmi_peek_port_qmi_for_data (MMBroadbandModemQmi  *self,
+                                                          MMPort               *data,
+                                                          MMQmiDataEndpoint    *out_endpoint,
+                                                          GError              **error);
+MMPortQmi *mm_broadband_modem_qmi_get_port_qmi           (MMBroadbandModemQmi  *self);
+MMPortQmi *mm_broadband_modem_qmi_get_port_qmi_for_data  (MMBroadbandModemQmi  *self,
+                                                          MMPort               *data,
+                                                          MMQmiDataEndpoint    *out_endpoint,
+                                                          GError              **error);
 
 #endif /* MM_BROADBAND_MODEM_QMI_H */

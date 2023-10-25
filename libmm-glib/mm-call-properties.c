@@ -1,14 +1,21 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * libmm-glib -- Access modem status & information from glib applications
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details:
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA 02110-1301 USA.
  *
  * Copyright (C) 2015 Riccardo Vangelisti <riccardo.vangelisti@sadel.it>
  */
@@ -19,6 +26,7 @@
 
 #include "mm-errors-types.h"
 #include "mm-enums-types.h"
+#include "mm-flags-types.h"
 #include "mm-common-helpers.h"
 #include "mm-call-properties.h"
 
@@ -81,133 +89,6 @@ mm_call_properties_get_number (MMCallProperties *self)
 
     return self->priv->number;
 }
-
-/*****************************************************************************/
-
-#ifndef MM_DISABLE_DEPRECATED
-
-/**
- * mm_call_properties_set_direction:
- * @self: A #MMCallProperties.
- * @direction: the call direction
- *
- * Sets the call direction.
- *
- * Since: 1.6
- * Deprecated: 1.12: the user should not specify the direction of the call, as
- * it is implicit (outgoing always). Anyway, this parameter has always been
- * ignored during the new call creation processing.
- */
-void
-mm_call_properties_set_direction (MMCallProperties *self,
-                                  MMCallDirection direction)
-{
-    /* NO-OP */
-}
-
-/**
- * mm_call_properties_get_direction:
- * @self: A #MMCallProperties.
- *
- * Gets the call direction.
- *
- * Returns: the call direction.
- *
- * Since: 1.6
- * Deprecated: 1.12: the user should not specify the direction of the call, as
- * it is implicit (outgoing always). This parameter has always been ignored
- * during the new call creation processing.
- */
-MMCallDirection
-mm_call_properties_get_direction (MMCallProperties *self)
-{
-    /* NO-OP */
-    return MM_CALL_DIRECTION_UNKNOWN;
-}
-
-/*****************************************************************************/
-
-/**
- * mm_call_properties_set_state:
- * @self: A #MMCallProperties.
- * @state: the call state
- *
- * Sets the call state
- *
- * Since: 1.6
- * Deprecated: 1.12: the user should not specify the state of the call before
- * the call is created. This parameter has always been ignored during the new
- * call creation processing.
- */
-void
-mm_call_properties_set_state (MMCallProperties *self,
-                              MMCallState state)
-{
-    /* NO-OP */
-}
-
-/**
- * mm_call_properties_get_state:
- * @self: A #MMCallProperties.
- *
- * Gets the call state.
- *
- * Returns: the call state.
- *
- * Since: 1.6
- * Deprecated: 1.12: the user should not specify the state of the call before
- * the call is created. This parameter has always been ignored during the new
- * call creation processing.
- */
-MMCallState
-mm_call_properties_get_state (MMCallProperties *self)
-{
-    /* NO-OP */
-    return MM_CALL_STATE_UNKNOWN;
-}
-
-/*****************************************************************************/
-
-/**
- * mm_call_properties_set_state_reason:
- * @self: A #MMCallProperties.
- * @state_reason: the call state reason.
- *
- * Sets the call state reason.
- *
- * Since: 1.6
- * Deprecated: 1.12: the user should not specify the state reason of the call
- * before the call is created. This parameter has always been ignored during the
- * new call creation processing.
- */
-void
-mm_call_properties_set_state_reason (MMCallProperties *self,
-                                     MMCallStateReason state_reason)
-{
-    /* NO-OP */
-}
-
-/**
- * mm_call_properties_get_state_reason:
- * @self: A #MMCallProperties.
- *
- * Gets the call state reason.
- *
- * Returns: the call state reason.
- *
- * Since: 1.6
- * Deprecated: 1.12: the user should not specify the state reason of the call
- * before the call is created. This parameter has always been ignored during the
- * new call creation processing.
- */
-MMCallStateReason
-mm_call_properties_get_state_reason (MMCallProperties *self)
-{
-    /* NO-OP */
-    return MM_CALL_STATE_REASON_UNKNOWN;
-}
-
-#endif /* MM_DISABLE_DEPRECATED */
 
 /*****************************************************************************/
 

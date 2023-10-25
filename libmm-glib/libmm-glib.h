@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -40,6 +40,7 @@
 # include <mm-bearer.h>
 # include <mm-modem.h>
 # include <mm-modem-3gpp.h>
+# include <mm-modem-3gpp-profile-manager.h>
 # include <mm-modem-3gpp-ussd.h>
 # include <mm-modem-cdma.h>
 # include <mm-modem-simple.h>
@@ -50,6 +51,7 @@
 # include <mm-modem-firmware.h>
 # include <mm-modem-signal.h>
 # include <mm-modem-oma.h>
+# include <mm-modem-sar.h>
 #endif
 
 #if defined (_LIBMM_INSIDE_MM) ||    \
@@ -80,10 +82,23 @@
 #include <mm-signal.h>
 #include <mm-kernel-event-properties.h>
 #include <mm-pco.h>
+#include <mm-sim-preferred-network.h>
+#include <mm-3gpp-profile.h>
+#include <mm-signal-threshold-properties.h>
+#include <mm-nr5g-registration-settings.h>
+#include <mm-cell-info.h>
+#include <mm-cell-info-cdma.h>
+#include <mm-cell-info-gsm.h>
+#include <mm-cell-info-umts.h>
+#include <mm-cell-info-tdscdma.h>
+#include <mm-cell-info-lte.h>
+#include <mm-cell-info-nr5g.h>
+#include <mm-compat.h>
 
 /* generated */
 #include <mm-errors-types.h>
 #include <mm-enums-types.h>
+#include <mm-flags-types.h>
 #include <mm-gdbus-manager.h>
 #include <mm-gdbus-modem.h>
 #include <mm-gdbus-bearer.h>

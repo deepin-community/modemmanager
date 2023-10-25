@@ -29,6 +29,9 @@ typedef struct _MMBroadbandModemMbim MMBroadbandModemMbim;
 typedef struct _MMBroadbandModemMbimClass MMBroadbandModemMbimClass;
 typedef struct _MMBroadbandModemMbimPrivate MMBroadbandModemMbimPrivate;
 
+#define MM_BROADBAND_MODEM_MBIM_QMI_UNSUPPORTED "broadband-modem-mbim-qmi-unsupported"
+#define MM_BROADBAND_MODEM_MBIM_INTEL_FIRMWARE_UPDATE_UNSUPPORTED "broadband-modem-mbim-intel-firmware-update-unsupported"
+
 struct _MMBroadbandModemMbim {
     MMBroadbandModem parent;
     MMBroadbandModemMbimPrivate *priv;
@@ -36,15 +39,39 @@ struct _MMBroadbandModemMbim {
 
 struct _MMBroadbandModemMbimClass{
     MMBroadbandModemClass parent;
+
+    MMPortMbim * (* peek_port_mbim_for_data) (MMBroadbandModemMbim  *self,
+                                              MMPort                *data,
+                                              GError               **error);
 };
 
 GType mm_broadband_modem_mbim_get_type (void);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMBroadbandModemMbim, g_object_unref)
 
-MMBroadbandModemMbim *mm_broadband_modem_mbim_new (const gchar *device,
+MMBroadbandModemMbim *mm_broadband_modem_mbim_new (const gchar  *device,
+                                                   const gchar  *physdev,
                                                    const gchar **drivers,
-                                                   const gchar *plugin,
-                                                   guint16 vendor_id,
-                                                   guint16 product_id);
+                                                   const gchar  *plugin,
+                                                   guint16       vendor_id,
+                                                   guint16       product_id);
+
+MMPortMbim *mm_broadband_modem_mbim_peek_port_mbim          (MMBroadbandModemMbim  *self);
+MMPortMbim *mm_broadband_modem_mbim_peek_port_mbim_for_data (MMBroadbandModemMbim  *self,
+                                                             MMPort                *data,
+                                                             GError               **error);
+MMPortMbim *mm_broadband_modem_mbim_get_port_mbim           (MMBroadbandModemMbim  *self);
+MMPortMbim *mm_broadband_modem_mbim_get_port_mbim_for_data  (MMBroadbandModemMbim  *self,
+                                                             MMPort                *data,
+                                                             GError               **error);
+
+void mm_broadband_modem_mbim_set_unlock_retries (MMBroadbandModemMbim *self,
+                                                 MMModemLock           lock_type,
+                                                 guint32               remaining_attempts);
+
+void mm_broadband_modem_mbim_get_speeds (MMBroadbandModemMbim *self,
+                                         guint64              *uplink_speed,
+                                         guint64              *downlink_speed);
+
+gboolean mm_broadband_modem_mbim_is_context_type_ext_supported (MMBroadbandModemMbim *self);
 
 #endif /* MM_BROADBAND_MODEM_MBIM_H */

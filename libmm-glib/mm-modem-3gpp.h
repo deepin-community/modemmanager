@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -31,6 +31,7 @@
 #include <ModemManager.h>
 
 #include "mm-bearer.h"
+#include "mm-nr5g-registration-settings.h"
 #include "mm-gdbus-modem.h"
 
 G_BEGIN_DECLS
@@ -91,6 +92,11 @@ gchar       *mm_modem_3gpp_dup_initial_eps_bearer_path (MMModem3gpp *self);
 
 MMBearerProperties *mm_modem_3gpp_get_initial_eps_bearer_settings  (MMModem3gpp *self);
 MMBearerProperties *mm_modem_3gpp_peek_initial_eps_bearer_settings (MMModem3gpp *self);
+
+MMModem3gppPacketServiceState mm_modem_3gpp_get_packet_service_state (MMModem3gpp *self);
+
+MMNr5gRegistrationSettings *mm_modem_3gpp_get_nr5g_registration_settings  (MMModem3gpp *self);
+MMNr5gRegistrationSettings *mm_modem_3gpp_peek_nr5g_registration_settings (MMModem3gpp *self);
 
 void     mm_modem_3gpp_register        (MMModem3gpp *self,
                                         const gchar *network_id,
@@ -172,12 +178,61 @@ gboolean mm_modem_3gpp_set_initial_eps_bearer_settings_sync   (MMModem3gpp      
                                                                GCancellable         *cancellable,
                                                                GError              **error);
 
-#ifndef MM_DISABLE_DEPRECATED
+void     mm_modem_3gpp_disable_facility_lock        (MMModem3gpp          *self,
+                                                     MMModem3gppFacility   facility,
+                                                     const gchar          *control_key,
+                                                     GCancellable         *cancellable,
+                                                     GAsyncReadyCallback   callback,
+                                                     gpointer              user_data);
+gboolean mm_modem_3gpp_disable_facility_lock_finish (MMModem3gpp          *self,
+                                                     GAsyncResult         *res,
+                                                     GError              **error);
+gboolean mm_modem_3gpp_disable_facility_lock_sync   (MMModem3gpp          *self,
+                                                     MMModem3gppFacility   facility,
+                                                     const gchar          *control_key,
+                                                     GCancellable         *cancellable,
+                                                     GError              **error);
 
-G_DEPRECATED
-MMModem3gppSubscriptionState mm_modem_3gpp_get_subscription_state (MMModem3gpp *self);
+void     mm_modem_3gpp_set_packet_service_state        (MMModem3gpp                    *self,
+                                                        MMModem3gppPacketServiceState   state,
+                                                        GCancellable                   *cancellable,
+                                                        GAsyncReadyCallback             callback,
+                                                        gpointer                        user_data);
+gboolean mm_modem_3gpp_set_packet_service_state_finish (MMModem3gpp                    *self,
+                                                        GAsyncResult                   *res,
+                                                        GError                        **error);
+gboolean mm_modem_3gpp_set_packet_service_state_sync   (MMModem3gpp                    *self,
+                                                        MMModem3gppPacketServiceState   state,
+                                                        GCancellable                   *cancellable,
+                                                        GError                        **error);
 
-#endif
+void     mm_modem_3gpp_set_nr5g_registration_settings        (MMModem3gpp                    *self,
+                                                              MMNr5gRegistrationSettings     *settings,
+                                                              GCancellable                   *cancellable,
+                                                              GAsyncReadyCallback             callback,
+                                                              gpointer                        user_data);
+gboolean mm_modem_3gpp_set_nr5g_registration_settings_finish (MMModem3gpp                    *self,
+                                                              GAsyncResult                   *res,
+                                                              GError                        **error);
+gboolean mm_modem_3gpp_set_nr5g_registration_settings_sync   (MMModem3gpp                    *self,
+                                                              MMNr5gRegistrationSettings     *settings,
+                                                              GCancellable                   *cancellable,
+                                                              GError                        **error);
+
+gboolean mm_modem_3gpp_set_carrier_lock_finish (MMModem3gpp          *self,
+                                                GAsyncResult         *res,
+                                                GError              **error);
+void     mm_modem_3gpp_set_carrier_lock        (MMModem3gpp          *self,
+                                                const guint8         *data,
+                                                gsize                 data_size,
+                                                GCancellable         *cancellable,
+                                                GAsyncReadyCallback   callback,
+                                                gpointer              user_data);
+gboolean mm_modem_3gpp_set_carrier_lock_sync   (MMModem3gpp          *self,
+                                                const guint8         *data,
+                                                gsize                 data_size,
+                                                GCancellable         *cancellable,
+                                                GError              **error);
 
 G_END_DECLS
 

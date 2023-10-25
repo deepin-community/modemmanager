@@ -1,22 +1,31 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * libmm-glib -- Access modem status & information from glib applications
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details:
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- * Copyright (C) 2011 Aleksander Morgado <aleksander@gnu.org>
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA 02110-1301 USA.
+ *
+ * Copyright (C) 2011-2022 Aleksander Morgado <aleksander@aleksander.es>
+ * Copyright (C) 2022 Google, Inc.
  */
 
 #include <string.h>
 
 #include "mm-errors-types.h"
 #include "mm-common-helpers.h"
+#include "mm-3gpp-profile.h"
 #include "mm-simple-connect-properties.h"
 
 /**
@@ -327,6 +336,82 @@ mm_simple_connect_properties_get_ip_type (MMSimpleConnectProperties *self)
 /*****************************************************************************/
 
 /**
+ * mm_simple_connect_properties_set_apn_type:
+ * @self: a #MMSimpleConnectProperties.
+ * @apn_type: a mask of #MMBearerApnType values.
+ *
+ * Sets the APN types to use.
+ *
+ * Since: 1.18
+ */
+void
+mm_simple_connect_properties_set_apn_type (MMSimpleConnectProperties *self,
+                                           MMBearerApnType            apn_type)
+{
+    g_return_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self));
+
+    mm_bearer_properties_set_apn_type (self->priv->bearer_properties, apn_type);
+}
+
+/**
+ * mm_simple_connect_properties_get_apn_type:
+ * @self: a #MMSimpleConnectProperties.
+ *
+ * Gets the APN types to use.
+ *
+ * Returns: a mask of #MMBearerApnType values.
+ *
+ * Since: 1.18
+ */
+MMBearerApnType
+mm_simple_connect_properties_get_apn_type (MMSimpleConnectProperties *self)
+{
+    g_return_val_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self), MM_BEARER_APN_TYPE_NONE);
+
+    return mm_bearer_properties_get_apn_type (self->priv->bearer_properties);
+}
+
+/*****************************************************************************/
+
+/**
+ * mm_simple_connect_properties_set_profile_id:
+ * @self: a #MMSimpleConnectProperties.
+ * @profile_id: a profile id.
+ *
+ * Sets the profile ID to use.
+ *
+ * Since: 1.18
+ */
+void
+mm_simple_connect_properties_set_profile_id (MMSimpleConnectProperties *self,
+                                             gint                       profile_id)
+{
+    g_return_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self));
+
+    mm_bearer_properties_set_profile_id (self->priv->bearer_properties, profile_id);
+}
+
+/**
+ * mm_simple_connect_properties_get_profile_id:
+ * @self: a #MMSimpleConnectProperties.
+ *
+ * Gets the profile ID to use.
+ *
+ * Returns: the profile id.
+ *
+ * Since: 1.18
+ */
+gint
+mm_simple_connect_properties_get_profile_id (MMSimpleConnectProperties *self)
+{
+    g_return_val_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self), MM_3GPP_PROFILE_ID_UNKNOWN);
+
+    return mm_bearer_properties_get_profile_id (self->priv->bearer_properties);
+}
+
+/*****************************************************************************/
+
+/**
  * mm_simple_connect_properties_set_allow_roaming:
  * @self: a #MMSimpleConnectProperties.
  * @allow_roaming: boolean value.
@@ -364,54 +449,81 @@ mm_simple_connect_properties_get_allow_roaming (MMSimpleConnectProperties *self)
     return mm_bearer_properties_get_allow_roaming (self->priv->bearer_properties);
 }
 
-
 /*****************************************************************************/
 
-#ifndef MM_DISABLE_DEPRECATED
-
 /**
- * mm_simple_connect_properties_set_number:
+ * mm_simple_connect_properties_set_rm_protocol:
  * @self: a #MMSimpleConnectProperties.
- * @number: the number.
+ * @protocol: a #MMModemCdmaRmProtocol.
  *
- * Sets the number to use when performing the connection.
+ * Sets the RM protocol requested by the user.
  *
- * Since: 1.0
- * Deprecated: 1.10.0. The number setting is not used anywhere, and therefore
- * it doesn't make sense to expose it in the ModemManager interface.
+ * Since: 1.16
  */
 void
-mm_simple_connect_properties_set_number (MMSimpleConnectProperties *self,
-                                         const gchar *number)
+mm_simple_connect_properties_set_rm_protocol (MMSimpleConnectProperties *self,
+                                              MMModemCdmaRmProtocol      protocol)
 {
     g_return_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self));
 
-    /* NO-OP */
+    mm_bearer_properties_set_rm_protocol (self->priv->bearer_properties, protocol);
 }
 
 /**
- * mm_simple_connect_properties_get_number:
+ * mm_simple_connect_properties_get_rm_protocol:
  * @self: a #MMSimpleConnectProperties.
  *
- * Gets the number to use when performing the connection.
+ * Get the RM protocol requested by the user.
  *
- * Returns: (transfer none): the number, or #NULL if not set. Do not free the
- * returned value, it is owned by @self.
+ * Returns: a #MMModemCdmaRmProtocol.
  *
- * Since: 1.0
- * Deprecated: 1.10.0. The number setting is not used anywhere, and therefore
- * it doesn't make sense to expose it in the ModemManager interface.
+ * Since: 1.16
  */
-const gchar *
-mm_simple_connect_properties_get_number (MMSimpleConnectProperties *self)
+MMModemCdmaRmProtocol
+mm_simple_connect_properties_get_rm_protocol (MMSimpleConnectProperties *self)
 {
-    g_return_val_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self), NULL);
+    g_return_val_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self), MM_MODEM_CDMA_RM_PROTOCOL_UNKNOWN);
 
-    /* NO-OP */
-    return NULL;
+    return mm_bearer_properties_get_rm_protocol (self->priv->bearer_properties);
 }
 
-#endif /* MM_DISABLE_DEPRECATED */
+/*****************************************************************************/
+
+/**
+ * mm_simple_connect_properties_set_multiplex:
+ * @self: a #MMSimpleConnectProperties.
+ * @multiplex: a #MMBearerMultiplexSupport.
+ *
+ * Sets the multiplex support requested by the user.
+ *
+ * Since: 1.18
+ */
+void
+mm_simple_connect_properties_set_multiplex (MMSimpleConnectProperties *self,
+                                            MMBearerMultiplexSupport   multiplex)
+{
+    g_return_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self));
+
+    mm_bearer_properties_set_multiplex (self->priv->bearer_properties, multiplex);
+}
+
+/**
+ * mm_simple_connect_properties_get_multiplex:
+ * @self: a #MMSimpleConnectProperties.
+ *
+ * Get the multiplex support requested by the user.
+ *
+ * Returns: a #MMBearerMultiplexSupport.
+ *
+ * Since: 1.18
+ */
+MMBearerMultiplexSupport
+mm_simple_connect_properties_get_multiplex (MMSimpleConnectProperties *self)
+{
+    g_return_val_if_fail (MM_IS_SIMPLE_CONNECT_PROPERTIES (self), MM_BEARER_MULTIPLEX_SUPPORT_UNKNOWN);
+
+    return mm_bearer_properties_get_multiplex (self->priv->bearer_properties);
+}
 
 /*****************************************************************************/
 
@@ -615,6 +727,26 @@ mm_simple_connect_properties_new_from_dictionary (GVariant *dictionary,
     }
 
     return self;
+}
+
+/*****************************************************************************/
+
+/**
+ * mm_simple_connect_properties_print: (skip)
+ */
+GPtrArray *
+mm_simple_connect_properties_print (MMSimpleConnectProperties *self,
+                                    gboolean                   show_personal_info)
+{
+    GPtrArray *array;
+
+    array = mm_bearer_properties_print (self->priv->bearer_properties, show_personal_info);
+    if (self->priv->pin)
+        g_ptr_array_add (array, g_strdup_printf (PROPERTY_PIN ": %s", mm_common_str_personal_info (self->priv->pin, show_personal_info)));
+    if (self->priv->operator_id)
+        g_ptr_array_add (array, g_strdup_printf (PROPERTY_OPERATOR_ID ": %s", self->priv->operator_id));
+
+    return array;
 }
 
 /*****************************************************************************/

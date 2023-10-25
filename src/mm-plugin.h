@@ -18,6 +18,7 @@
 #ifndef MM_PLUGIN_H
 #define MM_PLUGIN_H
 
+#include <config.h>
 #include <glib.h>
 #include <glib-object.h>
 
@@ -27,17 +28,11 @@
 #include "mm-device.h"
 #include "mm-kernel-device.h"
 
-#define MM_PLUGIN_MAJOR_VERSION 4
+#define MM_PLUGIN_MAJOR_VERSION 5
 #define MM_PLUGIN_MINOR_VERSION 0
 
-#if defined (G_HAVE_GNUC_VISIBILITY)
-#define VISIBILITY __attribute__((visibility("protected")))
-#else
-#define VISIBILITY
-#endif
-
-#define MM_PLUGIN_DEFINE_MAJOR_VERSION VISIBILITY int mm_plugin_major_version = MM_PLUGIN_MAJOR_VERSION;
-#define MM_PLUGIN_DEFINE_MINOR_VERSION VISIBILITY int mm_plugin_minor_version = MM_PLUGIN_MINOR_VERSION;
+#define MM_SHARED_MAJOR_VERSION 1
+#define MM_SHARED_MINOR_VERSION 0
 
 #define MM_TYPE_PLUGIN            (mm_plugin_get_type ())
 #define MM_PLUGIN(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_PLUGIN, MMPlugin))
@@ -46,34 +41,36 @@
 #define MM_IS_PLUGIN_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_PLUGIN))
 #define MM_PLUGIN_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_PLUGIN, MMPluginClass))
 
-#define MM_PLUGIN_NAME                      "name"
-#define MM_PLUGIN_IS_GENERIC                "is-generic"
-#define MM_PLUGIN_ALLOWED_SUBSYSTEMS        "allowed-subsystems"
-#define MM_PLUGIN_ALLOWED_DRIVERS           "allowed-drivers"
-#define MM_PLUGIN_FORBIDDEN_DRIVERS         "forbidden-drivers"
-#define MM_PLUGIN_ALLOWED_VENDOR_IDS        "allowed-vendor-ids"
-#define MM_PLUGIN_ALLOWED_PRODUCT_IDS       "allowed-product-ids"
-#define MM_PLUGIN_FORBIDDEN_PRODUCT_IDS     "forbidden-product-ids"
-#define MM_PLUGIN_ALLOWED_VENDOR_STRINGS    "allowed-vendor-strings"
-#define MM_PLUGIN_ALLOWED_PRODUCT_STRINGS   "allowed-product-strings"
-#define MM_PLUGIN_FORBIDDEN_PRODUCT_STRINGS "forbidden-product-strings"
-#define MM_PLUGIN_ALLOWED_UDEV_TAGS         "allowed-udev-tags"
-#define MM_PLUGIN_ALLOWED_AT                "allowed-at"
-#define MM_PLUGIN_ALLOWED_SINGLE_AT         "allowed-single-at"
-#define MM_PLUGIN_ALLOWED_QCDM              "allowed-qcdm"
-#define MM_PLUGIN_ALLOWED_QMI               "allowed-qmi"
-#define MM_PLUGIN_ALLOWED_MBIM              "allowed-mbim"
-#define MM_PLUGIN_ICERA_PROBE               "icera-probe"
-#define MM_PLUGIN_ALLOWED_ICERA             "allowed-icera"
-#define MM_PLUGIN_FORBIDDEN_ICERA           "forbidden-icera"
-#define MM_PLUGIN_XMM_PROBE                 "xmm-probe"
-#define MM_PLUGIN_ALLOWED_XMM               "allowed-xmm"
-#define MM_PLUGIN_FORBIDDEN_XMM             "forbidden-xmm"
-#define MM_PLUGIN_CUSTOM_INIT               "custom-init"
-#define MM_PLUGIN_CUSTOM_AT_PROBE           "custom-at-probe"
-#define MM_PLUGIN_SEND_DELAY                "send-delay"
-#define MM_PLUGIN_REMOVE_ECHO               "remove-echo"
-#define MM_PLUGIN_SEND_LF                   "send-lf"
+#define MM_PLUGIN_NAME                         "name"
+#define MM_PLUGIN_IS_GENERIC                   "is-generic"
+#define MM_PLUGIN_ALLOWED_SUBSYSTEMS           "allowed-subsystems"
+#define MM_PLUGIN_ALLOWED_DRIVERS              "allowed-drivers"
+#define MM_PLUGIN_FORBIDDEN_DRIVERS            "forbidden-drivers"
+#define MM_PLUGIN_ALLOWED_VENDOR_IDS           "allowed-vendor-ids"
+#define MM_PLUGIN_ALLOWED_PRODUCT_IDS          "allowed-product-ids"
+#define MM_PLUGIN_ALLOWED_SUBSYSTEM_VENDOR_IDS "allowed-subsystem-vendor-ids"
+#define MM_PLUGIN_FORBIDDEN_PRODUCT_IDS        "forbidden-product-ids"
+#define MM_PLUGIN_ALLOWED_VENDOR_STRINGS       "allowed-vendor-strings"
+#define MM_PLUGIN_ALLOWED_PRODUCT_STRINGS      "allowed-product-strings"
+#define MM_PLUGIN_FORBIDDEN_PRODUCT_STRINGS    "forbidden-product-strings"
+#define MM_PLUGIN_ALLOWED_UDEV_TAGS            "allowed-udev-tags"
+#define MM_PLUGIN_ALLOWED_AT                   "allowed-at"
+#define MM_PLUGIN_ALLOWED_SINGLE_AT            "allowed-single-at"
+#define MM_PLUGIN_ALLOWED_QCDM                 "allowed-qcdm"
+#define MM_PLUGIN_REQUIRED_QCDM                "required-qcdm"
+#define MM_PLUGIN_ALLOWED_QMI                  "allowed-qmi"
+#define MM_PLUGIN_ALLOWED_MBIM                 "allowed-mbim"
+#define MM_PLUGIN_ICERA_PROBE                  "icera-probe"
+#define MM_PLUGIN_ALLOWED_ICERA                "allowed-icera"
+#define MM_PLUGIN_FORBIDDEN_ICERA              "forbidden-icera"
+#define MM_PLUGIN_XMM_PROBE                    "xmm-probe"
+#define MM_PLUGIN_ALLOWED_XMM                  "allowed-xmm"
+#define MM_PLUGIN_FORBIDDEN_XMM                "forbidden-xmm"
+#define MM_PLUGIN_CUSTOM_INIT                  "custom-init"
+#define MM_PLUGIN_CUSTOM_AT_PROBE              "custom-at-probe"
+#define MM_PLUGIN_SEND_DELAY                   "send-delay"
+#define MM_PLUGIN_REMOVE_ECHO                  "remove-echo"
+#define MM_PLUGIN_SEND_LF                      "send-lf"
 
 typedef enum {
     MM_PLUGIN_SUPPORTS_PORT_UNKNOWN = -1,
@@ -108,9 +105,11 @@ struct _MMPluginClass {
      * a list of port probes (Mandatory) */
     MMBaseModem *(*create_modem) (MMPlugin *self,
                                   const gchar *uid,
+                                  const gchar *physdev,
                                   const gchar **drivers,
                                   guint16 vendor,
                                   guint16 product,
+                                  guint16 subsystem_vendor,
                                   GList *probes,
                                   GError **error);
 
@@ -125,11 +124,13 @@ struct _MMPluginClass {
 GType mm_plugin_get_type (void);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMPlugin, g_object_unref)
 
-const gchar           *mm_plugin_get_name                (MMPlugin *self);
-const gchar          **mm_plugin_get_allowed_udev_tags   (MMPlugin *self);
-const guint16         *mm_plugin_get_allowed_vendor_ids  (MMPlugin *self);
-const mm_uint16_pair  *mm_plugin_get_allowed_product_ids (MMPlugin *self);
-gboolean               mm_plugin_is_generic              (MMPlugin *self);
+const gchar           *mm_plugin_get_name                         (MMPlugin *self);
+const gchar          **mm_plugin_get_allowed_subsystems           (MMPlugin *self);
+const gchar          **mm_plugin_get_allowed_udev_tags            (MMPlugin *self);
+const guint16         *mm_plugin_get_allowed_vendor_ids           (MMPlugin *self);
+const mm_uint16_pair  *mm_plugin_get_allowed_product_ids          (MMPlugin *self);
+const mm_uint16_pair  *mm_plugin_get_allowed_subsystem_vendor_ids (MMPlugin *self);
+gboolean               mm_plugin_is_generic                       (MMPlugin *self);
 
 /* This method will run all pre-probing filters, to see if we can discard this
  * plugin from the probing logic as soon as possible. */

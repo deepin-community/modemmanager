@@ -26,10 +26,12 @@ typedef enum { /*< underscore_name=mm_port_subsys >*/
     MM_PORT_SUBSYS_UNKNOWN = 0x0,
     MM_PORT_SUBSYS_TTY,
     MM_PORT_SUBSYS_NET,
-    MM_PORT_SUBSYS_USB,
+    MM_PORT_SUBSYS_USBMISC,
     MM_PORT_SUBSYS_UNIX,
-
-    MM_PORT_SUBSYS_LAST = MM_PORT_SUBSYS_UNIX /*< skip >*/
+    MM_PORT_SUBSYS_QRTR,
+    MM_PORT_SUBSYS_RPMSG,
+    MM_PORT_SUBSYS_WWAN,
+    MM_PORT_SUBSYS_LAST = MM_PORT_SUBSYS_WWAN /*< skip >*/
 } MMPortSubsys;
 
 typedef enum { /*< underscore_name=mm_port_type >*/
@@ -58,6 +60,9 @@ typedef enum { /*< underscore_name=mm_port_type >*/
 #define MM_PORT_CONNECTED     "connected"
 #define MM_PORT_KERNEL_DEVICE "kernel-device"
 
+#define MM_PORT_SIGNAL_TIMED_OUT "timed-out"
+#define MM_PORT_SIGNAL_REMOVED   "removed"
+
 typedef struct _MMPort MMPort;
 typedef struct _MMPortClass MMPortClass;
 typedef struct _MMPortPrivate MMPortPrivate;
@@ -69,6 +74,10 @@ struct _MMPort {
 
 struct _MMPortClass {
     GObjectClass parent;
+
+    /* signals */
+    void (* timed_out) (MMPort *port, guint n_consecutive_replies);
+    void (* removed)   (MMPort *port);
 };
 
 GType mm_port_get_type (void);

@@ -12,6 +12,8 @@
  *
  * Singleton support imported from NetworkManager.
  *     (C) Copyright 2014 Red Hat, Inc.
+ *
+ * GPtrArray lookup with GEqualFunc imported from GLib 2.48
  */
 
 #ifndef MM_UTILS_H

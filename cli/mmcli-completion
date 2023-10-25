@@ -70,6 +70,10 @@ _mmcli()
             COMPREPLY=( $(compgen -W "[response]" -- $cur) )
             return 0
             ;;
+        '--3gpp-disable-facility-lock')
+            COMPREPLY=( $(compgen -W "[FACILITY,CONTROL_KEY]" -- $cur) )
+            return 0
+            ;;
         '--cdma-activate')
             COMPREPLY=( $(compgen -W "[CARRIER]" -- $cur) )
             return 0
@@ -95,6 +99,10 @@ _mmcli()
             return 0
             ;;
         '--messaging-create-sms-with-data')
+            _filedir
+            return 0
+            ;;
+        '--messaging-create-sms-with-text')
             _filedir
             return 0
             ;;

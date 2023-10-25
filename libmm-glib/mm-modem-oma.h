@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -124,12 +124,12 @@ MMOmaFeature      mm_modem_oma_get_features      (MMModemOma *self);
 MMOmaSessionType  mm_modem_oma_get_session_type  (MMModemOma *self);
 MMOmaSessionState mm_modem_oma_get_session_state (MMModemOma *self);
 
-gboolean mm_modem_peek_pending_network_initiated_sessions (MMModemOma *self,
-                                                           const MMOmaPendingNetworkInitiatedSession **sessions,
-                                                           guint *n_sessions);
-gboolean mm_modem_get_pending_network_initiated_sessions  (MMModemOma *self,
-                                                           MMOmaPendingNetworkInitiatedSession **sessions,
-                                                           guint *n_sessions);
+gboolean mm_modem_oma_peek_pending_network_initiated_sessions (MMModemOma                                 *self,
+                                                               const MMOmaPendingNetworkInitiatedSession **sessions,
+                                                               guint                                      *n_sessions);
+gboolean mm_modem_oma_get_pending_network_initiated_sessions  (MMModemOma                                 *self,
+                                                               MMOmaPendingNetworkInitiatedSession       **sessions,
+                                                               guint                                      *n_sessions);
 
 G_END_DECLS
 

@@ -63,6 +63,8 @@ static gchar *set_current_capabilities_str;
 static gchar *set_allowed_modes_str;
 static gchar *set_preferred_mode_str;
 static gchar *set_current_bands_str;
+static gint set_primary_sim_slot_int;
+static gboolean get_cell_info_flag;
 static gboolean inhibit_flag;
 
 static GOptionEntry entries[] = {
@@ -126,6 +128,14 @@ static GOptionEntry entries[] = {
       "Set bands to be used by a given modem.",
       "[BAND1|BAND2...]"
     },
+    { "set-primary-sim-slot", 0, 0, G_OPTION_ARG_INT, &set_primary_sim_slot_int,
+      "Switch to the selected SIM slot",
+      "[SLOT NUMBER]"
+    },
+    { "get-cell-info", 0, 0, G_OPTION_ARG_NONE, &get_cell_info_flag,
+      "Get cell info",
+      NULL
+    },
     { "inhibit", 0, 0, G_OPTION_ARG_NONE, &inhibit_flag,
       "Inhibit the modem",
       NULL
@@ -173,6 +183,8 @@ mmcli_modem_options_enabled (void)
                  !!set_allowed_modes_str +
                  !!set_preferred_mode_str +
                  !!set_current_bands_str +
+                 (set_primary_sim_slot_int > 0) +
+                 get_cell_info_flag +
                  inhibit_flag);
 
     if (n_actions == 0 && mmcli_get_common_modem_string ()) {
@@ -359,6 +371,7 @@ print_modem_info (void)
     mmcli_output_string           (MMC_F_HARDWARE_EQUIPMENT_ID,           mm_modem_get_equipment_identifier (ctx->modem));
 
     mmcli_output_string           (MMC_F_SYSTEM_DEVICE,                   mm_modem_get_device (ctx->modem));
+    mmcli_output_string           (MMC_F_SYSTEM_PHYSDEV,                  mm_modem_get_physdev (ctx->modem));
     mmcli_output_string_array     (MMC_F_SYSTEM_DRIVERS,                  (const gchar **) mm_modem_get_drivers (ctx->modem), FALSE);
     mmcli_output_string           (MMC_F_SYSTEM_PLUGIN,                   mm_modem_get_plugin (ctx->modem));
     mmcli_output_string           (MMC_F_SYSTEM_PRIMARY_PORT,             mm_modem_get_primary_port (ctx->modem));
@@ -371,7 +384,7 @@ print_modem_info (void)
     mmcli_output_state            (mm_modem_get_state (ctx->modem), mm_modem_get_state_failed_reason (ctx->modem));
     mmcli_output_string           (MMC_F_STATUS_POWER_STATE,              mm_modem_power_state_get_string (mm_modem_get_power_state (ctx->modem)));
     mmcli_output_string_list      (MMC_F_STATUS_ACCESS_TECH,              access_technologies_string);
-    mmcli_output_signal_quality   (signal_quality, signal_quality_recent);
+    mmcli_output_signal_quality   (mm_modem_get_state (ctx->modem), signal_quality, signal_quality_recent);
 
     mmcli_output_string_multiline (MMC_F_MODES_SUPPORTED,                 supported_modes_string);
     mmcli_output_string_take      (MMC_F_MODES_CURRENT,                   g_strdup_printf ("allowed: %s; preferred: %s",
@@ -389,6 +402,7 @@ print_modem_info (void)
         const gchar *operator_code = NULL;
         const gchar *operator_name = NULL;
         const gchar *registration = NULL;
+        const gchar *packet_service_state = NULL;
         const gchar *eps_ue_mode = NULL;
         GList       *pco_list = NULL;
         const gchar *initial_eps_bearer_path = NULL;
@@ -396,6 +410,8 @@ print_modem_info (void)
         gchar       *initial_eps_bearer_ip_family_str = NULL;
         const gchar *initial_eps_bearer_user = NULL;
         const gchar *initial_eps_bearer_password = NULL;
+        const gchar *nr5g_registration_settings_mico_mode_str = NULL;
+        const gchar *nr5g_registration_settings_drx_cycle_str = NULL;
 
         if (ctx->modem_3gpp) {
             imei = mm_modem_3gpp_get_imei (ctx->modem_3gpp);
@@ -403,6 +419,7 @@ print_modem_info (void)
             operator_code = mm_modem_3gpp_get_operator_code (ctx->modem_3gpp);
             operator_name = mm_modem_3gpp_get_operator_name (ctx->modem_3gpp);
             registration = mm_modem_3gpp_registration_state_get_string (mm_modem_3gpp_get_registration_state (ctx->modem_3gpp));
+            packet_service_state = mm_modem_3gpp_packet_service_state_get_string (mm_modem_3gpp_get_packet_service_state (ctx->modem_3gpp));
             eps_ue_mode = mm_modem_3gpp_eps_ue_mode_operation_get_string (mm_modem_3gpp_get_eps_ue_mode_operation (ctx->modem_3gpp));
             pco_list = mm_modem_3gpp_get_pco (ctx->modem_3gpp);
             initial_eps_bearer_path = mm_modem_3gpp_get_initial_eps_bearer_path (ctx->modem_3gpp);
@@ -418,19 +435,32 @@ print_modem_info (void)
                     initial_eps_bearer_password      = mm_bearer_properties_get_password (initial_eps_bearer_properties);
                 }
             }
+
+            if (mm_modem_get_current_capabilities (ctx->modem) & (MM_MODEM_CAPABILITY_5GNR)) {
+                MMNr5gRegistrationSettings *nr5g_registration_settings;
+
+                nr5g_registration_settings = mm_modem_3gpp_peek_nr5g_registration_settings (ctx->modem_3gpp);
+                if (nr5g_registration_settings) {
+                    nr5g_registration_settings_mico_mode_str = mm_modem_3gpp_mico_mode_get_string (mm_nr5g_registration_settings_get_mico_mode (nr5g_registration_settings));
+                    nr5g_registration_settings_drx_cycle_str = mm_modem_3gpp_drx_cycle_get_string (mm_nr5g_registration_settings_get_drx_cycle (nr5g_registration_settings));
+                }
+            }
         }
 
-        mmcli_output_string      (MMC_F_3GPP_IMEI,          imei);
-        mmcli_output_string_list (MMC_F_3GPP_ENABLED_LOCKS, facility_locks);
-        mmcli_output_string      (MMC_F_3GPP_OPERATOR_ID,   operator_code);
-        mmcli_output_string      (MMC_F_3GPP_OPERATOR_NAME, operator_name);
-        mmcli_output_string      (MMC_F_3GPP_REGISTRATION,  registration);
-        mmcli_output_string      (MMC_F_3GPP_EPS_UE_MODE,   eps_ue_mode);
+        mmcli_output_string      (MMC_F_3GPP_IMEI,                         imei);
+        mmcli_output_string_list (MMC_F_3GPP_ENABLED_LOCKS,                facility_locks);
+        mmcli_output_string      (MMC_F_3GPP_OPERATOR_ID,                  operator_code);
+        mmcli_output_string      (MMC_F_3GPP_OPERATOR_NAME,                operator_name);
+        mmcli_output_string      (MMC_F_3GPP_REGISTRATION,                 registration);
+        mmcli_output_string      (MMC_F_3GPP_PACKET_SERVICE_STATE,         packet_service_state);
+        mmcli_output_string      (MMC_F_3GPP_EPS_UE_MODE,                  eps_ue_mode);
         mmcli_output_string      (MMC_F_3GPP_EPS_INITIAL_BEARER_PATH,      g_strcmp0 (initial_eps_bearer_path, "/") != 0 ? initial_eps_bearer_path : NULL);
         mmcli_output_string      (MMC_F_3GPP_EPS_BEARER_SETTINGS_APN,      initial_eps_bearer_apn);
         mmcli_output_string_take (MMC_F_3GPP_EPS_BEARER_SETTINGS_IP_TYPE,  initial_eps_bearer_ip_family_str);
         mmcli_output_string      (MMC_F_3GPP_EPS_BEARER_SETTINGS_USER,     initial_eps_bearer_user);
         mmcli_output_string      (MMC_F_3GPP_EPS_BEARER_SETTINGS_PASSWORD, initial_eps_bearer_password);
+        mmcli_output_string      (MMC_F_3GPP_5GNR_REGISTRATION_MICO_MODE,  nr5g_registration_settings_mico_mode_str);
+        mmcli_output_string      (MMC_F_3GPP_5GNR_REGISTRATION_DRX_CYCLE,  nr5g_registration_settings_drx_cycle_str);
         mmcli_output_pco_list    (pco_list);
 
         g_free (facility_locks);
@@ -475,6 +505,8 @@ print_modem_info (void)
 
     sim_path = mm_modem_get_sim_path (ctx->modem);
     mmcli_output_string (MMC_F_SIM_PATH, g_strcmp0 (sim_path, "/") != 0 ? sim_path : NULL);
+    mmcli_output_sim_slots (mm_modem_dup_sim_slot_paths (ctx->modem),
+                            mm_modem_get_primary_sim_slot (ctx->modem));
 
     bearer_paths = (const gchar **) mm_modem_get_bearer_paths (ctx->modem);
     mmcli_output_string_array (MMC_F_BEARER_PATHS, (bearer_paths && bearer_paths[0]) ? bearer_paths : NULL, TRUE);
@@ -889,6 +921,61 @@ parse_current_bands (MMModemBand **bands,
 }
 
 static void
+set_primary_sim_slot_process_reply (gboolean      result,
+                                    const GError *error)
+{
+    if (!result) {
+        g_printerr ("error: couldn't request primary SIM switch: '%s'\n",
+                    error ? error->message : "unknown error");
+        exit (EXIT_FAILURE);
+    }
+
+    g_print ("successfully requested primary SIM switch in modem\n");
+}
+
+static void
+set_primary_sim_slot_ready (MMModem      *modem,
+                            GAsyncResult *result)
+{
+    gboolean          operation_result;
+    g_autoptr(GError) error = NULL;
+
+    operation_result = mm_modem_set_primary_sim_slot_finish (modem, result, &error);
+    set_primary_sim_slot_process_reply (operation_result, error);
+
+    mmcli_async_operation_done ();
+}
+
+static void
+get_cell_info_process_reply (GList        *list,
+                             const GError *error)
+{
+    if (!list) {
+        g_printerr ("error: couldn't get cell info in the modem: '%s'\n",
+                    error ? error->message : "unknown error");
+        exit (EXIT_FAILURE);
+    }
+
+    mmcli_output_cell_info (list);
+    mmcli_output_dump ();
+
+    g_list_free_full (list, (GDestroyNotify) g_object_unref);
+}
+
+static void
+get_cell_info_ready (MMModem      *modem,
+                     GAsyncResult *result)
+{
+    GList             *list;
+    g_autoptr(GError)  error = NULL;
+
+    list = mm_modem_get_cell_info_finish (modem, result, &error);
+    get_cell_info_process_reply (list, error);
+
+    mmcli_async_operation_done ();
+}
+
+static void
 state_changed (MMModem                  *modem,
                MMModemState              old_state,
                MMModemState              new_state,
@@ -1127,6 +1214,25 @@ get_modem_ready (GObject      *source,
                                     (GAsyncReadyCallback)set_current_bands_ready,
                                     NULL);
         g_free (current_bands);
+        return;
+    }
+
+    /* Request to switch SIM? */
+    if (set_primary_sim_slot_int > 0) {
+        mm_modem_set_primary_sim_slot (ctx->modem,
+                                       set_primary_sim_slot_int,
+                                       ctx->cancellable,
+                                       (GAsyncReadyCallback)set_primary_sim_slot_ready,
+                                       NULL);
+        return;
+    }
+
+    /* Request to get cell info? */
+    if (get_cell_info_flag) {
+        mm_modem_get_cell_info (ctx->modem,
+                                ctx->cancellable,
+                                (GAsyncReadyCallback)get_cell_info_ready,
+                                NULL);
         return;
     }
 
@@ -1386,6 +1492,24 @@ mmcli_modem_run_synchronous (GDBusConnection *connection)
                                                   &error);
         g_free (current_bands);
         set_current_bands_process_reply (result, error);
+        return;
+    }
+
+    /* Request to switch current SIM? */
+    if (set_primary_sim_slot_int > 0) {
+        gboolean result;
+
+        result = mm_modem_set_primary_sim_slot_sync (ctx->modem, set_primary_sim_slot_int, NULL, &error);
+        set_primary_sim_slot_process_reply (result, error);
+        return;
+    }
+
+    /* Request to get cell info? */
+    if (get_cell_info_flag) {
+        GList *list;
+
+        list = mm_modem_get_cell_info_sync (ctx->modem, NULL, &error);
+        get_cell_info_process_reply (list, error);
         return;
     }
 

@@ -38,10 +38,13 @@ typedef enum {
     MMC_S_MODEM_MODES,
     MMC_S_MODEM_BANDS,
     MMC_S_MODEM_IP,
+    MMC_S_MODEM_CELL_INFO,
     MMC_S_MODEM_3GPP,
     MMC_S_MODEM_3GPP_EPS,
+    MMC_S_MODEM_3GPP_5GNR,
     MMC_S_MODEM_3GPP_SCAN,
     MMC_S_MODEM_3GPP_USSD,
+    MMC_S_MODEM_3GPP_PROFILE_MANAGER,
     MMC_S_MODEM_CDMA,
     MMC_S_MODEM_SIM,
     MMC_S_MODEM_BEARER,
@@ -54,6 +57,7 @@ typedef enum {
     MMC_S_MODEM_SIGNAL_GSM,
     MMC_S_MODEM_SIGNAL_UMTS,
     MMC_S_MODEM_SIGNAL_LTE,
+    MMC_S_MODEM_SIGNAL_5G,
     MMC_S_MODEM_OMA,
     MMC_S_MODEM_OMA_CURRENT,
     MMC_S_MODEM_OMA_PENDING,
@@ -64,6 +68,7 @@ typedef enum {
     MMC_S_MODEM_FIRMWARE,
     MMC_S_MODEM_FIRMWARE_FASTBOOT,
     MMC_S_MODEM_VOICE,
+    MMC_S_MODEM_SAR,
     MMC_S_BEARER_GENERAL,
     MMC_S_BEARER_STATUS,
     MMC_S_BEARER_PROPERTIES,
@@ -100,6 +105,7 @@ typedef enum {
     MMC_F_HARDWARE_EQUIPMENT_ID,
     /* System section */
     MMC_F_SYSTEM_DEVICE,
+    MMC_F_SYSTEM_PHYSDEV,
     MMC_F_SYSTEM_DRIVERS,
     MMC_F_SYSTEM_PLUGIN,
     MMC_F_SYSTEM_PRIMARY_PORT,
@@ -123,12 +129,15 @@ typedef enum {
     MMC_F_BANDS_CURRENT,
     /* IP section */
     MMC_F_IP_SUPPORTED,
+    /* Cell info section */
+    MMC_F_CELL_INFO,
     /* 3GPP section */
     MMC_F_3GPP_IMEI,
     MMC_F_3GPP_ENABLED_LOCKS,
     MMC_F_3GPP_OPERATOR_ID,
     MMC_F_3GPP_OPERATOR_NAME,
     MMC_F_3GPP_REGISTRATION,
+    MMC_F_3GPP_PACKET_SERVICE_STATE,
     MMC_F_3GPP_PCO,
     /* 3GPP EPS section */
     MMC_F_3GPP_EPS_UE_MODE,
@@ -137,8 +146,14 @@ typedef enum {
     MMC_F_3GPP_EPS_BEARER_SETTINGS_IP_TYPE,
     MMC_F_3GPP_EPS_BEARER_SETTINGS_USER,
     MMC_F_3GPP_EPS_BEARER_SETTINGS_PASSWORD,
+    MMC_F_3GPP_5GNR_REGISTRATION_MICO_MODE,
+    MMC_F_3GPP_5GNR_REGISTRATION_DRX_CYCLE,
     /* 3GPP scan section */
     MMC_F_3GPP_SCAN_NETWORKS,
+    /* 3GPP profile management section */
+    MMC_F_3GPP_PROFILE_MANAGER_INDEX_FIELD,
+    MMC_F_3GPP_PROFILE_MANAGER_LIST,
+    MMC_F_3GPP_PROFILE_MANAGER_SET,
     /* USSD section */
     MMC_F_3GPP_USSD_STATUS,
     MMC_F_3GPP_USSD_NETWORK_REQUEST,
@@ -153,6 +168,8 @@ typedef enum {
     MMC_F_CDMA_ACTIVATION,
     /* SIM section */
     MMC_F_SIM_PATH,
+    MMC_F_SIM_PRIMARY_SLOT,
+    MMC_F_SIM_SLOT_PATHS,
     /* Bearer section */
     MMC_F_BEARER_PATHS,
     /* Time section */
@@ -163,22 +180,34 @@ typedef enum {
     /* Messaging section */
     MMC_F_MESSAGING_SUPPORTED_STORAGES,
     MMC_F_MESSAGING_DEFAULT_STORAGES,
+    MMC_F_MESSAGING_CREATED_SMS,
     /* Signal section */
     MMC_F_SIGNAL_REFRESH_RATE,
+    MMC_F_SIGNAL_RSSI_THRESHOLD,
+    MMC_F_SIGNAL_ERROR_RATE_THRESHOLD,
     MMC_F_SIGNAL_CDMA1X_RSSI,
     MMC_F_SIGNAL_CDMA1X_ECIO,
+    MMC_F_SIGNAL_CDMA1X_ERROR_RATE,
     MMC_F_SIGNAL_EVDO_RSSI,
     MMC_F_SIGNAL_EVDO_ECIO,
     MMC_F_SIGNAL_EVDO_SINR,
     MMC_F_SIGNAL_EVDO_IO,
+    MMC_F_SIGNAL_EVDO_ERROR_RATE,
     MMC_F_SIGNAL_GSM_RSSI,
+    MMC_F_SIGNAL_GSM_ERROR_RATE,
     MMC_F_SIGNAL_UMTS_RSSI,
     MMC_F_SIGNAL_UMTS_RSCP,
     MMC_F_SIGNAL_UMTS_ECIO,
+    MMC_F_SIGNAL_UMTS_ERROR_RATE,
     MMC_F_SIGNAL_LTE_RSSI,
     MMC_F_SIGNAL_LTE_RSRQ,
     MMC_F_SIGNAL_LTE_RSRP,
     MMC_F_SIGNAL_LTE_SNR,
+    MMC_F_SIGNAL_LTE_ERROR_RATE,
+    MMC_F_SIGNAL_5G_RSRQ,
+    MMC_F_SIGNAL_5G_RSRP,
+    MMC_F_SIGNAL_5G_SNR,
+    MMC_F_SIGNAL_5G_ERROR_RATE,
     /* OMA section */
     MMC_F_OMA_FEATURES,
     MMC_F_OMA_CURRENT_TYPE,
@@ -217,18 +246,26 @@ typedef enum {
     MMC_F_BEARER_GENERAL_TYPE,
     /* Bearer status section */
     MMC_F_BEARER_STATUS_CONNECTED,
+    MMC_F_BEARER_STATUS_CONNECTION_ERROR_NAME,
+    MMC_F_BEARER_STATUS_CONNECTION_ERROR_MESSAGE,
     MMC_F_BEARER_STATUS_SUSPENDED,
+    MMC_F_BEARER_STATUS_MULTIPLEXED,
     MMC_F_BEARER_STATUS_INTERFACE,
     MMC_F_BEARER_STATUS_IP_TIMEOUT,
+    MMC_F_BEARER_STATUS_PROFILE_ID,
     /* Bearer properties section */
     MMC_F_BEARER_PROPERTIES_APN,
+    MMC_F_BEARER_PROPERTIES_APN_TYPE,
     MMC_F_BEARER_PROPERTIES_ROAMING,
     MMC_F_BEARER_PROPERTIES_IP_TYPE,
     MMC_F_BEARER_PROPERTIES_ALLOWED_AUTH,
     MMC_F_BEARER_PROPERTIES_USER,
     MMC_F_BEARER_PROPERTIES_PASSWORD,
+    MMC_F_BEARER_PROPERTIES_PROFILE_ID,
     MMC_F_BEARER_PROPERTIES_NUMBER,
     MMC_F_BEARER_PROPERTIES_RM_PROTOCOL,
+    MMC_F_BEARER_PROPERTIES_ACCESS_TYPE_PREFERENCE,
+    MMC_F_BEARER_PROPERTIES_ROAMING_ALLOWANCE,
     MMC_F_BEARER_IPV4_CONFIG_METHOD,
     MMC_F_BEARER_IPV4_CONFIG_ADDRESS,
     MMC_F_BEARER_IPV4_CONFIG_PREFIX,
@@ -241,7 +278,10 @@ typedef enum {
     MMC_F_BEARER_IPV6_CONFIG_GATEWAY,
     MMC_F_BEARER_IPV6_CONFIG_DNS,
     MMC_F_BEARER_IPV6_CONFIG_MTU,
+    MMC_F_BEARER_STATS_START_DATE,
     MMC_F_BEARER_STATS_DURATION,
+    MMC_F_BEARER_STATS_UPLINK_SPEED,
+    MMC_F_BEARER_STATS_DOWNLINK_SPEED,
     MMC_F_BEARER_STATS_BYTES_RX,
     MMC_F_BEARER_STATS_BYTES_TX,
     MMC_F_BEARER_STATS_ATTEMPTS,
@@ -277,11 +317,21 @@ typedef enum {
     MMC_F_SMS_PROPERTIES_DELIVERY_STATE,
     MMC_F_SMS_PROPERTIES_DISCH_TIMESTAMP,
     MMC_F_SIM_GENERAL_DBUS_PATH,
+    MMC_F_SIM_PROPERTIES_ACTIVE,
     MMC_F_SIM_PROPERTIES_IMSI,
     MMC_F_SIM_PROPERTIES_ICCID,
+    MMC_F_SIM_PROPERTIES_EID,
     MMC_F_SIM_PROPERTIES_OPERATOR_ID,
     MMC_F_SIM_PROPERTIES_OPERATOR_NAME,
     MMC_F_SIM_PROPERTIES_EMERGENCY_NUMBERS,
+    MMC_F_SIM_PROPERTIES_PREFERRED_NETWORKS,
+    MMC_F_SIM_PROPERTIES_GID1,
+    MMC_F_SIM_PROPERTIES_GID2,
+    MMC_F_SIM_PROPERTIES_SIM_TYPE,
+    MMC_F_SIM_PROPERTIES_ESIM_STATUS,
+    MMC_F_SIM_PROPERTIES_REMOVABILITY,
+    MMC_F_SAR_STATE,
+    MMC_F_SAR_POWER_LEVEL,
     /* Lists */
     MMC_F_MODEM_LIST_DBUS_PATH,
     MMC_F_SMS_LIST_DBUS_PATH,
@@ -322,6 +372,8 @@ void mmcli_output_string_array          (MmcF            field,
 void mmcli_output_string_array_take     (MmcF           field,
                                          gchar        **strv,
                                          gboolean       multiline);
+void mmcli_output_string_array_multiline_take (MmcF       field,
+                                               gchar    **strv);
 void mmcli_output_string_take_typed     (MmcF           field,
                                          gchar         *value,
                                          const gchar   *type);
@@ -333,14 +385,22 @@ void mmcli_output_listitem              (MmcF           field,
 /******************************************************************************/
 /* Custom output management */
 
-void mmcli_output_signal_quality   (guint                     value,
-                                    gboolean                  recent);
-void mmcli_output_state            (MMModemState              state,
-                                    MMModemStateFailedReason  reason);
-void mmcli_output_scan_networks    (GList                    *network_list);
-void mmcli_output_firmware_list    (GList                    *firmware_list,
-                                    MMFirmwareProperties     *selected);
-void mmcli_output_pco_list         (GList                    *pco_list);
+void mmcli_output_signal_quality     (MMModemState               state,
+                                      guint                      value,
+                                      gboolean                   recent);
+void mmcli_output_start_date         (guint64                    value);
+void mmcli_output_state              (MMModemState               state,
+                                      MMModemStateFailedReason   reason);
+void mmcli_output_sim_slots          (gchar                    **sim_slot_paths,
+                                      guint                      primary_sim_slot);
+void mmcli_output_scan_networks      (GList                     *network_list);
+void mmcli_output_firmware_list      (GList                     *firmware_list,
+                                      MMFirmwareProperties      *selected);
+void mmcli_output_pco_list           (GList                     *pco_list);
+void mmcli_output_preferred_networks (GList                     *preferred_nets_list);
+void mmcli_output_profile_list       (GList                     *profile_list);
+void mmcli_output_profile_set        (MM3gppProfile             *profile);
+void mmcli_output_cell_info          (GList                     *cell_info_list);
 
 /******************************************************************************/
 /* Dump output */

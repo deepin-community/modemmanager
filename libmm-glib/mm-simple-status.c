@@ -1,14 +1,21 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * libmm-glib -- Access modem status & information from glib applications
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details:
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA 02110-1301 USA.
  *
  * Copyright (C) 2011 Google, Inc.
  */
@@ -16,6 +23,7 @@
 #include <string.h>
 
 #include "mm-enums-types.h"
+#include "mm-flags-types.h"
 #include "mm-errors-types.h"
 #include "mm-common-helpers.h"
 #include "mm-simple-status.h"
@@ -253,31 +261,6 @@ mm_simple_status_get_3gpp_operator_name (MMSimpleStatus *self)
 
 /*****************************************************************************/
 
-#ifndef MM_DISABLE_DEPRECATED
-
-/**
- * mm_simple_status_get_3gpp_subscription_state:
- * @self: a #MMSimpleStatus.
- *
- * Gets the current subscription status of the account.
- *
- * Returns: a #MMModem3gppSubscriptionState.
- *
- * Since: 1.0
- * Deprecated: 1.12.0. The value of this property can only be obtained with
- * operator specific logic (e.g. processing specific PCO info), and therefore
- * it doesn't make sense to expose it in the ModemManager interface.
- */
-MMModem3gppSubscriptionState
-mm_simple_status_get_3gpp_subscription_state (MMSimpleStatus *self)
-{
-    return MM_MODEM_3GPP_SUBSCRIPTION_STATE_UNKNOWN;
-}
-
-#endif /* MM_DISABLE_DEPRECATED */
-
-/*****************************************************************************/
-
 /**
  * mm_simple_status_get_cdma_cdma1x_registration_state:
  * @self: a #MMSimpleStatus.
@@ -444,15 +427,16 @@ MMSimpleStatus *
 mm_simple_status_new_from_dictionary (GVariant *dictionary,
                                       GError **error)
 {
-    GError *inner_error = NULL;
-    GVariantIter iter;
-    gchar *key;
-    GVariant *value;
-    MMSimpleStatus *properties;
+    GError                    *inner_error = NULL;
+    GVariantIter               iter;
+    gchar                     *key;
+    GVariant                  *value;
+    g_autoptr(MMSimpleStatus)  props = NULL;
 
-    properties = mm_simple_status_new ();
+    props = mm_simple_status_new ();
+
     if (!dictionary)
-        return properties;
+        return g_steal_pointer (&props);
 
     if (!g_variant_is_of_type (dictionary, G_VARIANT_TYPE ("a{sv}"))) {
         g_set_error (error,
@@ -460,13 +444,11 @@ mm_simple_status_new_from_dictionary (GVariant *dictionary,
                      MM_CORE_ERROR_INVALID_ARGS,
                      "Cannot create Simple status from dictionary: "
                      "invalid variant type received");
-        g_object_unref (properties);
         return NULL;
     }
 
     g_variant_iter_init (&iter, dictionary);
-    while (!inner_error &&
-           g_variant_iter_next (&iter, "{sv}", &key, &value)) {
+    while (!inner_error && g_variant_iter_next (&iter, "{sv}", &key, &value)) {
         /* Note: we could do a more efficient matching by checking the variant type
          * and just g_object_set()-ing they specific 'key' and value, but we do want
          * to check which input keys we receive, in order to propagate the error.
@@ -479,19 +461,19 @@ mm_simple_status_new_from_dictionary (GVariant *dictionary,
             g_str_equal (key, MM_SIMPLE_PROPERTY_CDMA_SID) ||
             g_str_equal (key, MM_SIMPLE_PROPERTY_CDMA_NID)) {
             /* uint properties */
-            g_object_set (properties,
+            g_object_set (props,
                           key, g_variant_get_uint32 (value),
                           NULL);
         } else if (g_str_equal (key, MM_SIMPLE_PROPERTY_3GPP_OPERATOR_CODE) ||
                    g_str_equal (key, MM_SIMPLE_PROPERTY_3GPP_OPERATOR_NAME)) {
             /* string properties */
-            g_object_set (properties,
+            g_object_set (props,
                           key, g_variant_get_string (value, NULL),
                           NULL);
         } else if (g_str_equal (key, MM_SIMPLE_PROPERTY_CURRENT_BANDS) ||
                    g_str_equal (key, MM_SIMPLE_PROPERTY_SIGNAL_QUALITY)) {
             /* remaining complex types, as variant */
-            g_object_set (properties,
+            g_object_set (props,
                           key, value,
                           NULL);
         } else {
@@ -509,11 +491,10 @@ mm_simple_status_new_from_dictionary (GVariant *dictionary,
     /* If error, destroy the object */
     if (inner_error) {
         g_propagate_error (error, inner_error);
-        g_object_unref (properties);
-        properties = NULL;
+        return NULL;
     }
 
-    return properties;
+    return g_steal_pointer (&props);
 }
 
 /*****************************************************************************/

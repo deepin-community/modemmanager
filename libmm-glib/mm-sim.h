@@ -1,6 +1,6 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * libmm -- Access modem status & information from glib applications
+ * libmm-glib -- Access modem status & information from glib applications
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -67,11 +67,16 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMSim, g_object_unref)
 const gchar *mm_sim_get_path                (MMSim *self);
 gchar       *mm_sim_dup_path                (MMSim *self);
 
+gboolean     mm_sim_get_active              (MMSim *self);
+
 const gchar *mm_sim_get_identifier          (MMSim *self);
 gchar       *mm_sim_dup_identifier          (MMSim *self);
 
 const gchar *mm_sim_get_imsi                (MMSim *self);
 gchar       *mm_sim_dup_imsi                (MMSim *self);
+
+const gchar *mm_sim_get_eid                 (MMSim *self);
+gchar       *mm_sim_dup_eid                 (MMSim *self);
 
 const gchar *mm_sim_get_operator_identifier (MMSim *self);
 gchar       *mm_sim_dup_operator_identifier (MMSim *self);
@@ -81,6 +86,21 @@ gchar       *mm_sim_dup_operator_name       (MMSim *self);
 
 const gchar * const  *mm_sim_get_emergency_numbers (MMSim *self);
 gchar               **mm_sim_dup_emergency_numbers (MMSim *self);
+
+GList*       mm_sim_get_preferred_networks  (MMSim *self);
+
+const guint8 *mm_sim_get_gid1 (MMSim *self,
+                               gsize *data_len);
+guint8       *mm_sim_dup_gid1 (MMSim *self,
+                               gsize *data_len);
+const guint8 *mm_sim_get_gid2 (MMSim *self,
+                               gsize *data_len);
+guint8       *mm_sim_dup_gid2 (MMSim *self,
+                               gsize *data_len);
+
+MMSimType         mm_sim_get_sim_type     (MMSim *self);
+MMSimEsimStatus   mm_sim_get_esim_status  (MMSim *self);
+MMSimRemovability mm_sim_get_removability (MMSim *self);
 
 void     mm_sim_send_pin        (MMSim *self,
                                  const gchar *pin,
@@ -151,6 +171,19 @@ gboolean mm_sim_change_pin_sync   (MMSim *self,
                                    const gchar *new_pin,
                                    GCancellable *cancellable,
                                    GError **error);
+
+void     mm_sim_set_preferred_networks        (MMSim *self,
+                                               const GList *preferred_networks,
+                                               GCancellable *cancellable,
+                                               GAsyncReadyCallback callback,
+                                               gpointer user_data);
+gboolean mm_sim_set_preferred_networks_finish (MMSim *self,
+                                               GAsyncResult *res,
+                                               GError **error);
+gboolean mm_sim_set_preferred_networks_sync   (MMSim *self,
+                                               const GList *preferred_networks,
+                                               GCancellable *cancellable,
+                                               GError **error);
 
 G_END_DECLS
 

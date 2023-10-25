@@ -35,6 +35,7 @@ G_DEFINE_TYPE_EXTENDED (MMDevice, mm_device, G_TYPE_OBJECT, 0,
 enum {
     PROP_0,
     PROP_UID,
+    PROP_PHYSDEV,
     PROP_OBJECT_MANAGER,
     PROP_PLUGIN,
     PROP_MODEM,
@@ -60,12 +61,17 @@ struct _MMDevicePrivate {
     /* Unique id */
     gchar *uid;
 
+    /* Physdev path */
+    gchar *physdev;
+
     /* The object manager */
     GDBusObjectManagerServer *object_manager;
 
     /* If USB, device vid/pid */
     guint16 vendor;
     guint16 product;
+    /* Subsystem vendor ID for PCI devices */
+    guint16 subsystem_vendor;
 
     /* Kernel drivers managing this device */
     gchar **drivers;
@@ -97,30 +103,54 @@ struct _MMDevicePrivate {
 /*****************************************************************************/
 
 static MMPortProbe *
+probe_list_lookup_by_device (GList          *port_probes,
+                             MMKernelDevice *kernel_port)
+{
+    GList *l;
+
+    for (l = port_probes; l; l = g_list_next (l)) {
+        MMPortProbe *probe = MM_PORT_PROBE (l->data);
+
+        if (mm_kernel_device_cmp (mm_port_probe_peek_port (probe), kernel_port))
+            return probe;
+    }
+    return NULL;
+}
+
+static MMPortProbe *
+probe_list_lookup_by_name (GList       *port_probes,
+                           const gchar *subsystem,
+                           const gchar *name)
+{
+    GList *l;
+
+    for (l = port_probes; l; l = g_list_next (l)) {
+        MMPortProbe    *probe = MM_PORT_PROBE (l->data);
+        MMKernelDevice *probe_device;
+
+        probe_device = mm_port_probe_peek_port (probe);
+        if ((g_strcmp0 (subsystem, mm_kernel_device_get_subsystem (probe_device)) == 0) &&
+            (g_strcmp0 (name,      mm_kernel_device_get_name      (probe_device)) == 0))
+            return probe;
+    }
+    return NULL;
+}
+
+static MMPortProbe *
 device_find_probe_with_device (MMDevice       *self,
                                MMKernelDevice *kernel_port,
                                gboolean        lookup_ignored)
 {
-    GList *l;
+    MMPortProbe *probe;
 
-    for (l = self->priv->port_probes; l; l = g_list_next (l)) {
-        MMPortProbe *probe = MM_PORT_PROBE (l->data);
-
-        if (mm_kernel_device_cmp (mm_port_probe_peek_port (probe), kernel_port))
-            return probe;
-    }
+    probe = probe_list_lookup_by_device (self->priv->port_probes, kernel_port);
+    if (probe)
+        return probe;
 
     if (!lookup_ignored)
         return NULL;
 
-    for (l = self->priv->ignored_port_probes; l; l = g_list_next (l)) {
-        MMPortProbe *probe = MM_PORT_PROBE (l->data);
-
-        if (mm_kernel_device_cmp (mm_port_probe_peek_port (probe), kernel_port))
-            return probe;
-    }
-
-    return NULL;
+    return probe_list_lookup_by_device (self->priv->ignored_port_probes, kernel_port);
 }
 
 gboolean
@@ -128,6 +158,28 @@ mm_device_owns_port (MMDevice       *self,
                      MMKernelDevice *kernel_port)
 {
     return !!device_find_probe_with_device (self, kernel_port, TRUE);
+}
+
+static MMPortProbe *
+device_find_probe_with_name (MMDevice    *self,
+                             const gchar *subsystem,
+                             const gchar *name)
+{
+    MMPortProbe *probe;
+
+    probe = probe_list_lookup_by_name (self->priv->port_probes, subsystem, name);
+    if (probe)
+        return probe;
+
+    return probe_list_lookup_by_name (self->priv->ignored_port_probes, subsystem, name);
+}
+
+gboolean
+mm_device_owns_port_name (MMDevice    *self,
+                          const gchar *subsystem,
+                          const gchar *name)
+{
+    return !!device_find_probe_with_name (self, subsystem, name);
 }
 
 static void
@@ -165,10 +217,48 @@ void
 mm_device_grab_port (MMDevice       *self,
                      MMKernelDevice *kernel_port)
 {
-    MMPortProbe *probe;
+    MMPortProbe    *probe;
+    MMKernelDevice *lower_port;
 
     if (mm_device_owns_port (self, kernel_port))
         return;
+
+    lower_port = mm_kernel_device_peek_lower_device (kernel_port);
+    if (lower_port) {
+        g_autoptr(GError) error = NULL;
+
+        /* No port probing done, at this point this is not something we require
+         * as all the virtual instantiated ports are net devices. We also avoid
+         * emitting the PORT_GRABBED signal in the MMDevice, because that is
+         * exclusively linked to a port being added to the list of probes, which
+         * we don't do here. */
+        if (self->priv->modem && !mm_base_modem_grab_link_port (self->priv->modem, kernel_port, &error))
+            mm_obj_dbg (self, "fully ignoring link port %s from now on: %s",
+                        mm_kernel_device_get_name (kernel_port),
+                        error->message);
+        return;
+    }
+    if (!g_strcmp0 ("net", mm_kernel_device_get_subsystem (kernel_port)) &&
+        mm_kernel_device_get_wwandev_sysfs_path (kernel_port)) {
+        /* This is a wwan netdevice, possibly a multiplexed one.
+         * Multiplexed wwan netdevices do not have a lower device, so they won't fall in the
+         * previous check verified for virtual ports, but require the same management.
+         * However, we need to make sure that the arrived netdevice is not the default one that
+         * instead requires the standard flow: for doing this we check that the name of the
+         * arrived netdevice is not the default one, found in the wwandev_sysfs_path */
+        if (!g_strstr_len (mm_kernel_device_get_wwandev_sysfs_path (kernel_port),
+                           -1,
+                           mm_kernel_device_get_name (kernel_port))) {
+            g_autoptr(GError) error = NULL;
+
+            mm_obj_dbg (self, "grabbing wwan multiplexed device %s", mm_kernel_device_get_name (kernel_port));
+            if (self->priv->modem && !mm_base_modem_grab_link_port (self->priv->modem, kernel_port, &error))
+                mm_obj_dbg (self, "fully ignoring link port %s from now on: %s",
+                            mm_kernel_device_get_name (kernel_port),
+                            error->message);
+            return;
+        }
+    }
 
     /* Get the vendor/product IDs out of the first one that gives us
      * some valid value (it seems we may get NULL reported for VID in QMI
@@ -177,6 +267,9 @@ mm_device_grab_port (MMDevice       *self,
         self->priv->vendor  = mm_kernel_device_get_physdev_vid (kernel_port);
         self->priv->product = mm_kernel_device_get_physdev_pid (kernel_port);
     }
+
+    if (!self->priv->subsystem_vendor)
+        self->priv->subsystem_vendor  = mm_kernel_device_get_physdev_subsystem_vid (kernel_port);
 
     /* Add new port driver */
     add_port_driver (self, kernel_port);
@@ -190,12 +283,19 @@ mm_device_grab_port (MMDevice       *self,
 }
 
 void
-mm_device_release_port (MMDevice       *self,
-                        MMKernelDevice *kernel_port)
+mm_device_release_port_name (MMDevice    *self,
+                             const gchar *subsystem,
+                             const gchar *name)
 {
     MMPortProbe *probe;
 
-    probe = device_find_probe_with_device (self, kernel_port, TRUE);
+    /* If modem exists, try to remove it as a link port. We also avoid emitting
+     * the PORT_RELEASED signal in this case, as the link ports are not associated
+     * to the port probe list */
+    if (self->priv->modem && mm_base_modem_release_link_port (self->priv->modem, subsystem, name, NULL))
+        return;
+
+    probe = device_find_probe_with_name (self, subsystem, name);
     if (probe) {
         /* Found, remove from lists and destroy probe */
         if (g_list_find (self->priv->port_probes, probe))
@@ -293,6 +393,9 @@ export_modem (MMDevice *self)
     mm_obj_dbg (self, "    vid:pid: 0x%04X:0x%04X",
                 (mm_base_modem_get_vendor_id (self->priv->modem) & 0xFFFF),
                 (mm_base_modem_get_product_id (self->priv->modem) & 0xFFFF));
+    if (mm_base_modem_get_subsystem_vendor_id (self->priv->modem))
+        mm_obj_dbg (self, "    subsystem vid: 0x%04X",
+                    (mm_base_modem_get_subsystem_vendor_id (self->priv->modem) & 0xFFFF));
     if (self->priv->virtual)
         mm_obj_dbg (self, "    virtual");
 
@@ -336,6 +439,9 @@ reprobe (MMDevice *self)
 {
     GError *error = NULL;
 
+    self->priv->reprobe_id = 0;
+
+    mm_obj_dbg (self, "Reprobing modem...");
     if (!mm_device_create_modem (self, &error)) {
         mm_obj_warn (self, "could not recreate modem: %s", error->message);
         g_error_free (error);
@@ -388,9 +494,9 @@ mm_device_create_modem (MMDevice  *self,
             return FALSE;
         }
 
-        mm_obj_info (self, "creating modem with plugin '%s' and '%u' ports",
-                     mm_plugin_get_name (self->priv->plugin),
-                     g_list_length (self->priv->port_probes));
+        mm_obj_msg (self, "creating modem with plugin '%s' and '%u' ports",
+                    mm_plugin_get_name (self->priv->plugin),
+                    g_list_length (self->priv->port_probes));
     } else {
         if (!self->priv->virtual_ports) {
             g_set_error (error,
@@ -400,9 +506,9 @@ mm_device_create_modem (MMDevice  *self,
             return FALSE;
         }
 
-        mm_obj_info (self, "creating virtual modem with plugin '%s' and '%u' ports",
-                     mm_plugin_get_name (self->priv->plugin),
-                     g_strv_length (self->priv->virtual_ports));
+        mm_obj_msg (self, "creating virtual modem with plugin '%s' and '%u' ports",
+                    mm_plugin_get_name (self->priv->plugin),
+                    g_strv_length (self->priv->virtual_ports));
     }
 
     self->priv->modem = mm_plugin_create_modem (self->priv->plugin, self, error);
@@ -424,6 +530,12 @@ mm_device_get_uid (MMDevice *self)
     return self->priv->uid;
 }
 
+const gchar *
+mm_device_get_physdev (MMDevice *self)
+{
+    return self->priv->physdev;
+}
+
 const gchar **
 mm_device_get_drivers (MMDevice *self)
 {
@@ -440,6 +552,12 @@ guint16
 mm_device_get_product (MMDevice *self)
 {
     return self->priv->product;
+}
+
+guint16
+mm_device_get_subsystem_vendor (MMDevice *self)
+{
+    return self->priv->subsystem_vendor;
 }
 
 void
@@ -463,7 +581,7 @@ GObject *
 mm_device_get_plugin (MMDevice *self)
 {
     return (self->priv->plugin ?
-            g_object_ref (self->priv->plugin) :
+            G_OBJECT (g_object_ref (self->priv->plugin)) :
             NULL);
 }
 
@@ -500,7 +618,7 @@ mm_device_get_port_probe (MMDevice       *self,
     MMPortProbe *probe;
 
     probe = device_find_probe_with_device (self, kernel_port, FALSE);
-    return (probe ? g_object_ref (probe) : NULL);
+    return (probe ? G_OBJECT (g_object_ref (probe)) : NULL);
 }
 
 GList *
@@ -648,6 +766,7 @@ log_object_build_id (MMLogObject *_self)
 
 MMDevice *
 mm_device_new (const gchar              *uid,
+               const gchar              *physdev,
                gboolean                  hotplugged,
                gboolean                  virtual,
                GDBusObjectManagerServer *object_manager)
@@ -656,6 +775,7 @@ mm_device_new (const gchar              *uid,
 
     return MM_DEVICE (g_object_new (MM_TYPE_DEVICE,
                                     MM_DEVICE_UID,            uid,
+                                    MM_DEVICE_PHYSDEV,        physdev,
                                     MM_DEVICE_HOTPLUGGED,     hotplugged,
                                     MM_DEVICE_VIRTUAL,        virtual,
                                     MM_DEVICE_OBJECT_MANAGER, object_manager,
@@ -681,6 +801,10 @@ set_property (GObject *object,
     case PROP_UID:
         /* construct only */
         self->priv->uid = g_value_dup_string (value);
+        break;
+    case PROP_PHYSDEV:
+        /* construct only */
+        self->priv->physdev = g_value_dup_string (value);
         break;
     case PROP_OBJECT_MANAGER:
         /* construct only */
@@ -720,6 +844,9 @@ get_property (GObject *object,
     switch (prop_id) {
     case PROP_UID:
         g_value_set_string (value, self->priv->uid);
+        break;
+    case PROP_PHYSDEV:
+        g_value_set_object (value, self->priv->physdev);
         break;
     case PROP_OBJECT_MANAGER:
         g_value_set_object (value, self->priv->object_manager);
@@ -771,6 +898,7 @@ finalize (GObject *object)
 {
     MMDevice *self = MM_DEVICE (object);
 
+    g_free (self->priv->physdev);
     g_free (self->priv->uid);
     g_strfreev (self->priv->drivers);
     g_strfreev (self->priv->virtual_ports);
@@ -804,6 +932,14 @@ mm_device_class_init (MMDeviceClass *klass)
                              NULL,
                              G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
     g_object_class_install_property (object_class, PROP_UID, properties[PROP_UID]);
+
+    properties[PROP_PHYSDEV] =
+        g_param_spec_string (MM_DEVICE_PHYSDEV,
+                             "Physdev",
+                             "Physical device path",
+                             NULL,
+                             G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
+    g_object_class_install_property (object_class, PROP_PHYSDEV, properties[PROP_PHYSDEV]);
 
     properties[PROP_OBJECT_MANAGER] =
         g_param_spec_object (MM_DEVICE_OBJECT_MANAGER,

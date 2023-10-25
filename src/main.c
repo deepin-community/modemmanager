@@ -31,7 +31,7 @@
 #include "mm-base-manager.h"
 #include "mm-context.h"
 
-#if defined WITH_SYSTEMD_SUSPEND_RESUME
+#if defined WITH_SUSPEND_RESUME
 # include "mm-sleep-monitor.h"
 #endif
 
@@ -44,7 +44,7 @@ static MMBaseManager *manager;
 static gboolean
 quit_cb (gpointer user_data)
 {
-    mm_info ("caught signal, shutting down...");
+    mm_msg ("caught signal, shutting down...");
 
     if (manager)
         g_object_set (manager, MM_BASE_MANAGER_CONNECTION, NULL, NULL);
@@ -56,7 +56,7 @@ quit_cb (gpointer user_data)
     return FALSE;
 }
 
-#if defined WITH_SYSTEMD_SUSPEND_RESUME
+#if defined WITH_SUSPEND_RESUME
 
 static void
 sleeping_cb (MMSleepMonitor *sleep_monitor)
@@ -70,6 +70,13 @@ resuming_cb (MMSleepMonitor *sleep_monitor)
 {
     mm_dbg ("re-scanning (resuming)");
     mm_base_manager_start (manager, FALSE);
+}
+
+static void
+resuming_quick_cb (MMSleepMonitor *sleep_monitor)
+{
+    mm_dbg ("syncing modem state (quick resuming)");
+    mm_base_manager_sync (manager);
 }
 
 #endif
@@ -86,11 +93,15 @@ bus_acquired_cb (GDBusConnection *connection,
     /* Create Manager object */
     g_assert (!manager);
     manager = mm_base_manager_new (connection,
+#if !defined WITH_BUILTIN_PLUGINS
                                    mm_context_get_test_plugin_dir (),
+#endif
                                    !mm_context_get_no_auto_scan (),
                                    mm_context_get_filter_policy (),
                                    mm_context_get_initial_kernel_events (),
+#if defined WITH_TESTS
                                    mm_context_get_test_enable (),
+#endif
                                    &error);
     if (!manager) {
         mm_warn ("could not create manager: %s", error->message);
@@ -133,23 +144,14 @@ name_lost_cb (GDBusConnection *connection,
 static void
 register_dbus_errors (void)
 {
-  static volatile guint32 aux = 0;
+    /* This method will always return success once during runtime */
+    if (!mm_common_register_errors ())
+        return;
 
-  if (aux)
-      return;
-
-  /* Register all known own errors */
-  aux |= MM_CORE_ERROR;
-  aux |= MM_MOBILE_EQUIPMENT_ERROR;
-  aux |= MM_CONNECTION_ERROR;
-  aux |= MM_SERIAL_ERROR;
-  aux |= MM_MESSAGE_ERROR;
-  aux |= MM_CDMA_ACTIVATION_ERROR;
-
-  /* We no longer use MM_CORE_ERROR_CANCELLED in the daemon, we rely on
-   * G_IO_ERROR_CANCELLED internally */
-  g_dbus_error_unregister_error (MM_CORE_ERROR, MM_CORE_ERROR_CANCELLED, MM_CORE_ERROR_DBUS_PREFIX ".Cancelled");
-  g_dbus_error_register_error   (G_IO_ERROR,    G_IO_ERROR_CANCELLED,    MM_CORE_ERROR_DBUS_PREFIX ".Cancelled");
+    /* We no longer use MM_CORE_ERROR_CANCELLED in the daemon, we rely on
+     * G_IO_ERROR_CANCELLED internally */
+    g_dbus_error_unregister_error (MM_CORE_ERROR, MM_CORE_ERROR_CANCELLED, MM_CORE_ERROR_DBUS_PREFIX ".Cancelled");
+    g_dbus_error_register_error   (G_IO_ERROR,    G_IO_ERROR_CANCELLED,    MM_CORE_ERROR_DBUS_PREFIX ".Cancelled");
 }
 
 int
@@ -167,8 +169,9 @@ main (int argc, char *argv[])
                        mm_context_get_log_journal (),
                        mm_context_get_log_timestamps (),
                        mm_context_get_log_relative_timestamps (),
+                       mm_context_get_log_personal_info (),
                        &error)) {
-        g_warning ("failed to set up logging: %s", error->message);
+        g_printerr ("error: failed to set up logging: %s\n", error->message);
         g_error_free (error);
         exit (1);
     }
@@ -179,8 +182,11 @@ main (int argc, char *argv[])
     /* Early register all known errors */
     register_dbus_errors ();
 
-    mm_info ("ModemManager (version " MM_DIST_VERSION ") starting in %s bus...",
-             mm_context_get_test_session () ? "session" : "system");
+    mm_msg ("ModemManager (version " MM_DIST_VERSION ") starting in %s bus...",
+            mm_context_get_test_session () ? "session" : "system");
+
+    /* Detect runtime charset conversion support */
+    mm_modem_charsets_init ();
 
     /* Acquire name, don't allow replacement */
     name_id = g_bus_own_name (mm_context_get_test_session () ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM,
@@ -191,13 +197,22 @@ main (int argc, char *argv[])
                               name_lost_cb,
                               NULL,
                               NULL);
-#if defined WITH_SYSTEMD_SUSPEND_RESUME
+#if defined WITH_SUSPEND_RESUME
     {
         MMSleepMonitor *sleep_monitor;
 
-        sleep_monitor = mm_sleep_monitor_get ();
-        g_signal_connect (sleep_monitor, MM_SLEEP_MONITOR_SLEEPING, G_CALLBACK (sleeping_cb), NULL);
-        g_signal_connect (sleep_monitor, MM_SLEEP_MONITOR_RESUMING, G_CALLBACK (resuming_cb), NULL);
+        if (mm_context_get_test_no_suspend_resume())
+            mm_dbg ("Suspend/resume support disabled at runtime");
+        else if (mm_context_get_test_quick_suspend_resume()) {
+            mm_dbg ("Quick suspend/resume hooks enabled");
+            sleep_monitor = mm_sleep_monitor_get ();
+            g_signal_connect (sleep_monitor, MM_SLEEP_MONITOR_RESUMING, G_CALLBACK (resuming_quick_cb), NULL);
+        } else {
+            mm_dbg ("Full suspend/resume hooks enabled");
+            sleep_monitor = mm_sleep_monitor_get ();
+            g_signal_connect (sleep_monitor, MM_SLEEP_MONITOR_SLEEPING, G_CALLBACK (sleeping_cb), NULL);
+            g_signal_connect (sleep_monitor, MM_SLEEP_MONITOR_RESUMING, G_CALLBACK (resuming_cb), NULL);
+        }
     }
 #endif
 
@@ -239,7 +254,7 @@ main (int argc, char *argv[])
 
     g_bus_unown_name (name_id);
 
-    mm_info ("ModemManager is shut down");
+    mm_msg ("ModemManager is shut down");
 
     mm_log_shutdown ();
 

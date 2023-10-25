@@ -37,7 +37,9 @@
 #include "mm-base-modem.h"
 #include "mm-log-object.h"
 #include "mm-modem-helpers.h"
+#include "mm-error-helpers.h"
 #include "mm-bearer-stats.h"
+#include "mm-dispatcher-connection.h"
 
 /* We require up to 20s to get a proper IP when using PPP */
 #define BEARER_IP_TIMEOUT_DEFAULT 20
@@ -70,7 +72,6 @@ enum {
     PROP_MODEM,
     PROP_STATUS,
     PROP_CONFIG,
-    PROP_DEFAULT_IP_FAMILY,
     PROP_LAST
 };
 
@@ -92,8 +93,6 @@ struct _MMBaseBearerPrivate {
     gboolean ignore_disconnection_reports;
     /* Configuration of the bearer */
     MMBearerProperties *config;
-    /* Default IP family of this bearer */
-    MMBearerIpFamily default_ip_family;
 
     /* Cancellable for connect() */
     GCancellable *connect_cancellable;
@@ -127,7 +126,7 @@ struct _MMBaseBearerPrivate {
     /* Timer to measure the duration of the connection */
     GTimer *duration_timer;
     /* Flag to specify whether reloading stats is supported or not */
-    gboolean reload_stats_unsupported;
+    gboolean reload_stats_supported;
 };
 
 /*****************************************************************************/
@@ -246,6 +245,63 @@ connection_monitor_start (MMBaseBearer *self)
 /*****************************************************************************/
 
 static void
+bearer_update_connection_error (MMBaseBearer *self,
+                                const GError *connection_error)
+{
+    g_autoptr(GVariant) tuple = NULL;
+
+    if (connection_error) {
+        /* Never overwrite a connection error if it's already set */
+        tuple = mm_gdbus_bearer_dup_connection_error (MM_GDBUS_BEARER (self));
+        if (tuple)
+            return;
+
+        /*
+         * Limit the type of errors we can expose in the interface;
+         * e.g. we don't want QMI or MBIM specific errors reported.
+         *
+         * G_IO_ERROR_CANCELLED is an exception, because we map it to
+         * MM_CORE_ERROR_CANCELLED implicitly when building the DBus error name.
+         */
+        if ((connection_error->domain != MM_CORE_ERROR) &&
+            (connection_error->domain != MM_MOBILE_EQUIPMENT_ERROR) &&
+            (connection_error->domain != MM_CONNECTION_ERROR) &&
+            (connection_error->domain != MM_SERIAL_ERROR) &&
+            (connection_error->domain != MM_CDMA_ACTIVATION_ERROR) &&
+            (!g_error_matches (connection_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))) {
+            g_autoptr(GError) default_connection_error = NULL;
+
+#if defined WITH_QMI
+            if (connection_error->domain == QMI_CORE_ERROR)
+                mm_obj_dbg (self, "cannot set QMI core error as connection error: %s", connection_error->message);
+            else if (connection_error->domain == QMI_PROTOCOL_ERROR)
+                mm_obj_dbg (self, "cannot set QMI protocol error as connection error: %s", connection_error->message);
+            else
+#endif
+#if defined WITH_MBIM
+            if (connection_error->domain == MBIM_CORE_ERROR)
+                mm_obj_dbg (self, "cannot set MBIM core error as connection error: %s", connection_error->message);
+            else if (connection_error->domain == MBIM_PROTOCOL_ERROR)
+                mm_obj_dbg (self, "cannot set MBIM protocol error as connection error: %s", connection_error->message);
+            else if (connection_error->domain == MBIM_STATUS_ERROR)
+                mm_obj_dbg (self, "cannot set MBIM status error as connection error: %s", connection_error->message);
+            else
+#endif
+                mm_obj_dbg (self, "cannot set unhandled domain error as connection error: %s", connection_error->message);
+
+            default_connection_error = g_error_new (MM_MOBILE_EQUIPMENT_ERROR,
+                                                    MM_MOBILE_EQUIPMENT_ERROR_UNKNOWN,
+                                                    "%s", connection_error->message);
+            tuple = mm_common_error_to_tuple (default_connection_error);
+        } else
+            tuple = mm_common_error_to_tuple (connection_error);
+    }
+    mm_gdbus_bearer_set_connection_error (MM_GDBUS_BEARER (self), tuple);
+}
+
+/*****************************************************************************/
+
+static void
 bearer_update_interface_stats (MMBaseBearer *self)
 {
     mm_gdbus_bearer_set_stats (
@@ -259,6 +315,9 @@ bearer_reset_ongoing_interface_stats (MMBaseBearer *self)
     mm_bearer_stats_set_duration (self->priv->stats, 0);
     mm_bearer_stats_set_tx_bytes (self->priv->stats, 0);
     mm_bearer_stats_set_rx_bytes (self->priv->stats, 0);
+    mm_bearer_stats_set_start_date (self->priv->stats, 0);
+    mm_bearer_stats_set_uplink_speed (self->priv->stats, 0);
+    mm_bearer_stats_set_downlink_speed (self->priv->stats, 0);
     bearer_update_interface_stats (self);
 }
 
@@ -340,20 +399,9 @@ reload_stats_ready (MMBaseBearer *self,
     guint64  tx_bytes = 0;
 
     if (!MM_BASE_BEARER_GET_CLASS (self)->reload_stats_finish (self, &rx_bytes, &tx_bytes, res, &error)) {
-        /* If reloading stats fails, warn about it and don't update anything */
-        if (!g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED)) {
-            mm_obj_warn (self, "reloading stats failed: %s", error->message);
-            g_error_free (error);
-            return;
-        }
-
-        /* If we're being told that reloading stats is unsupported, just ignore
-         * the error and update oly the duration timer. */
-        mm_obj_dbg (self, "reloading stats is unsupported by the device");
-        self->priv->reload_stats_unsupported = TRUE;
-        rx_bytes = 0;
-        tx_bytes = 0;
+        mm_obj_warn (self, "reloading stats failed: %s", error->message);
         g_error_free (error);
+        return;
     }
 
     /* We only update stats if they were retrieved properly */
@@ -371,9 +419,7 @@ stats_update_cb (MMBaseBearer *self)
         return G_SOURCE_CONTINUE;
 
     /* If the implementation knows how to update stat values, run it */
-    if (!self->priv->reload_stats_unsupported &&
-        MM_BASE_BEARER_GET_CLASS (self)->reload_stats &&
-        MM_BASE_BEARER_GET_CLASS (self)->reload_stats_finish) {
+    if (self->priv->reload_stats_supported) {
         MM_BASE_BEARER_GET_CLASS (self)->reload_stats (
             self,
             (GAsyncReadyCallback)reload_stats_ready,
@@ -390,7 +436,9 @@ stats_update_cb (MMBaseBearer *self)
 }
 
 static void
-bearer_stats_start (MMBaseBearer *self)
+bearer_stats_start (MMBaseBearer *self,
+                    guint64       uplink_speed,
+                    guint64       downlink_speed)
 {
     /* Start duration timer */
     g_assert (!self->priv->duration_timer);
@@ -401,8 +449,66 @@ bearer_stats_start (MMBaseBearer *self)
     self->priv->stats_update_id = g_timeout_add_seconds (BEARER_STATS_UPDATE_TIMEOUT,
                                                          (GSourceFunc) stats_update_cb,
                                                          self);
+
+    mm_bearer_stats_set_start_date (self->priv->stats, (guint64)(g_get_real_time() / G_USEC_PER_SEC));
+    mm_bearer_stats_set_uplink_speed (self->priv->stats, uplink_speed);
+    mm_bearer_stats_set_downlink_speed (self->priv->stats, downlink_speed);
+    bearer_update_interface_stats (self);
+
     /* Load initial values */
     stats_update_cb (self);
+}
+
+/*****************************************************************************/
+
+void
+mm_base_bearer_report_speeds (MMBaseBearer *self,
+                              guint64       uplink_speed,
+                              guint64       downlink_speed)
+{
+    /* Ignore speeds update if we're not connected */
+    if (self->priv->status != MM_BEARER_STATUS_CONNECTED)
+        return;
+    mm_bearer_stats_set_uplink_speed (self->priv->stats, uplink_speed);
+    mm_bearer_stats_set_downlink_speed (self->priv->stats, downlink_speed);
+    bearer_update_interface_stats (self);
+}
+
+/*****************************************************************************/
+
+static void
+dispatcher_connection_run_ready (MMDispatcherConnection *dispatcher,
+                                 GAsyncResult           *res,
+                                 MMBaseBearer           *self)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (!mm_dispatcher_connection_run_finish (dispatcher, res, &error))
+        mm_obj_warn (self, "errors detected in dispatcher: %s", error->message);
+
+    g_object_unref (self);
+}
+
+static void
+bearer_run_dispatcher_scripts (MMBaseBearer *self,
+                               gboolean      connected)
+{
+    MMDispatcherConnection *dispatcher;
+    const gchar *interface;
+
+    interface = mm_gdbus_bearer_get_interface (MM_GDBUS_BEARER (self));
+    if (!self->priv->modem || !self->priv->path || !interface)
+        return;
+
+    dispatcher = mm_dispatcher_connection_get ();
+    mm_dispatcher_connection_run (dispatcher,
+                                  g_dbus_object_get_object_path (G_DBUS_OBJECT (self->priv->modem)),
+                                  self->priv->path,
+                                  interface,
+                                  connected,
+                                  NULL, /* cancellable */
+                                  (GAsyncReadyCallback)dispatcher_connection_run_ready,
+                                  g_object_ref (self));
 }
 
 /*****************************************************************************/
@@ -410,6 +516,8 @@ bearer_stats_start (MMBaseBearer *self)
 static void
 bearer_reset_interface_status (MMBaseBearer *self)
 {
+    mm_gdbus_bearer_set_profile_id (MM_GDBUS_BEARER (self), MM_3GPP_PROFILE_ID_UNKNOWN);
+    mm_gdbus_bearer_set_multiplexed (MM_GDBUS_BEARER (self), FALSE);
     mm_gdbus_bearer_set_connected (MM_GDBUS_BEARER (self), FALSE);
     mm_gdbus_bearer_set_suspended (MM_GDBUS_BEARER (self), FALSE);
     mm_gdbus_bearer_set_interface (MM_GDBUS_BEARER (self), NULL);
@@ -441,6 +549,9 @@ bearer_update_status (MMBaseBearer *self,
     if (self->priv->status == MM_BEARER_STATUS_DISCONNECTED) {
         g_autoptr(GString) report = NULL;
 
+        /* Report disconnection via dispatcher scripts, before reseting the interface */
+        bearer_run_dispatcher_scripts (self, FALSE);
+
         bearer_reset_interface_status (self);
         /* Cleanup flag to ignore disconnection reports */
         self->priv->ignore_disconnection_reports = FALSE;
@@ -455,21 +566,27 @@ bearer_update_status (MMBaseBearer *self,
                                 "connection #%u finished: duration %us",
                                 mm_bearer_stats_get_attempts (self->priv->stats),
                                 mm_bearer_stats_get_duration (self->priv->stats));
-        if (!self->priv->reload_stats_unsupported)
+        if (self->priv->reload_stats_supported)
             g_string_append_printf (report,
-                                    ", tx: %" G_GUINT64_FORMAT " bytes, rx :%" G_GUINT64_FORMAT " bytes",
+                                    ", tx: %" G_GUINT64_FORMAT " bytes, rx: %" G_GUINT64_FORMAT " bytes",
                                     mm_bearer_stats_get_tx_bytes (self->priv->stats),
                                     mm_bearer_stats_get_rx_bytes (self->priv->stats));
-        mm_obj_info (self, "%s", report->str);
+        mm_obj_msg (self, "%s", report->str);
     }
 }
 
 static void
-bearer_update_status_connected (MMBaseBearer *self,
-                                const gchar *interface,
+bearer_update_status_connected (MMBaseBearer     *self,
+                                const gchar      *interface,
+                                gboolean          multiplexed,
+                                gint              profile_id,
                                 MMBearerIpConfig *ipv4_config,
-                                MMBearerIpConfig *ipv6_config)
+                                MMBearerIpConfig *ipv6_config,
+                                guint64           uplink_speed,
+                                guint64           downlink_speed)
 {
+    mm_gdbus_bearer_set_profile_id (MM_GDBUS_BEARER (self), profile_id);
+    mm_gdbus_bearer_set_multiplexed (MM_GDBUS_BEARER (self), multiplexed);
     mm_gdbus_bearer_set_connected (MM_GDBUS_BEARER (self), TRUE);
     mm_gdbus_bearer_set_suspended (MM_GDBUS_BEARER (self), FALSE);
     mm_gdbus_bearer_set_interface (MM_GDBUS_BEARER (self), interface);
@@ -495,10 +612,13 @@ bearer_update_status_connected (MMBaseBearer *self,
     g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_STATUS]);
 
     /* Start statistics */
-    bearer_stats_start (self);
+    bearer_stats_start (self, uplink_speed, downlink_speed);
 
     /* Start connection monitor, if supported */
     connection_monitor_start (self);
+
+    /* Run dispatcher scripts */
+    bearer_run_dispatcher_scripts (self, TRUE);
 }
 
 /*****************************************************************************/
@@ -760,23 +880,46 @@ reset_signal_handlers (MMBaseBearer *self)
 /* CONNECT */
 
 gboolean
-mm_base_bearer_connect_finish (MMBaseBearer *self,
-                               GAsyncResult *res,
-                               GError **error)
+mm_base_bearer_connect_finish (MMBaseBearer  *self,
+                               GAsyncResult  *res,
+                               GError       **error)
 {
     return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+connect_succeeded (MMBaseBearer *self,
+                   GTask        *task)
+{
+    MMBearerConnectResult *result;
+
+    result = g_task_get_task_data (task);
+
+    /* Update bearer and interface status */
+    bearer_update_status_connected (
+        self,
+        mm_port_get_device (mm_bearer_connect_result_peek_data (result)),
+        mm_bearer_connect_result_get_multiplexed (result),
+        mm_bearer_connect_result_get_profile_id (result),
+        mm_bearer_connect_result_peek_ipv4_config (result),
+        mm_bearer_connect_result_peek_ipv6_config (result),
+        mm_bearer_connect_result_get_uplink_speed (result),
+        mm_bearer_connect_result_get_downlink_speed (result));
+
+    g_clear_object (&self->priv->connect_cancellable);
+
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
 }
 
 static void
 disconnect_after_cancel_ready (MMBaseBearer *self,
                                GAsyncResult *res)
 {
-    GError *error = NULL;
+    g_autoptr(GError) error = NULL;
 
-    if (!MM_BASE_BEARER_GET_CLASS (self)->disconnect_finish (self, res, &error)) {
+    if (!MM_BASE_BEARER_GET_CLASS (self)->disconnect_finish (self, res, &error))
         mm_obj_warn (self, "error disconnecting: %s; will assume disconnected anyway", error->message);
-        g_error_free (error);
-    }
     else
         mm_obj_dbg (self, "disconnected bearer '%s'", self->priv->path);
 
@@ -789,13 +932,72 @@ disconnect_after_cancel_ready (MMBaseBearer *self,
 }
 
 static void
-connect_ready (MMBaseBearer *self,
-               GAsyncResult *res,
-               GTask *task)
+connect_failed (MMBaseBearer *self,
+                GTask        *task,
+                GError       *error)
+{
+    /* Update failed attempts */
+    mm_bearer_stats_set_failed_attempts (self->priv->stats,
+                                         mm_bearer_stats_get_failed_attempts (self->priv->stats) + 1);
+    bearer_update_interface_stats (self);
+
+    /* Update reported connection error before the status update */
+    bearer_update_connection_error (self, error);
+    if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+        bearer_update_status (self, MM_BEARER_STATUS_DISCONNECTING);
+        MM_BASE_BEARER_GET_CLASS (self)->disconnect (self,
+                                                     (GAsyncReadyCallback)disconnect_after_cancel_ready,
+                                                     NULL);
+    } else
+        bearer_update_status (self, MM_BEARER_STATUS_DISCONNECTED);
+
+    g_clear_object (&self->priv->connect_cancellable);
+
+    g_task_return_error (task, error);
+    g_object_unref (task);
+}
+
+static gboolean
+connect_check_cancel (MMBaseBearer *self,
+                      GTask        *task)
 {
     GError *error = NULL;
-    gboolean launch_disconnect = FALSE;
-    MMBearerConnectResult *result;
+
+    if (!g_cancellable_is_cancelled (self->priv->connect_cancellable))
+        return FALSE;
+
+    mm_obj_dbg (self, "connected, but need to disconnect");
+    error = g_error_new (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                         "Bearer got connected, but had to disconnect after cancellation request");
+    connect_failed (self, task, error);
+    return TRUE;
+}
+
+static void
+reload_stats_supported_ready (MMBaseBearer *self,
+                              GAsyncResult *res,
+                              GTask        *task)
+{
+    if (MM_BASE_BEARER_GET_CLASS (self)->reload_stats_finish (self, NULL, NULL, res, NULL)) {
+        mm_obj_dbg (self, "reloading stats is supported by the device");
+        self->priv->reload_stats_supported = TRUE;
+        mm_gdbus_bearer_set_reload_stats_supported (MM_GDBUS_BEARER (self), self->priv->reload_stats_supported);
+    } else
+        mm_obj_dbg (self, "reloading stats is not supported by the device");
+
+    if (connect_check_cancel (self, task))
+        return;
+
+    connect_succeeded (self, task);
+}
+
+static void
+connect_ready (MMBaseBearer *self,
+               GAsyncResult *res,
+               GTask        *task)
+{
+    GError                           *error = NULL;
+    g_autoptr(MMBearerConnectResult)  result = NULL;
 
     /* NOTE: connect() implementations *MUST* handle cancellations themselves */
     result = MM_BASE_BEARER_GET_CLASS (self)->connect_finish (self, res, &error);
@@ -803,54 +1005,29 @@ connect_ready (MMBaseBearer *self,
         mm_obj_warn (self, "connection attempt #%u failed: %s",
                      mm_bearer_stats_get_attempts (self->priv->stats),
                      error->message);
-
-        /* Update failed attempts */
-        mm_bearer_stats_set_failed_attempts (self->priv->stats,
-                                             mm_bearer_stats_get_failed_attempts (self->priv->stats) + 1);
-        bearer_update_interface_stats (self);
-
-        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-            /* Will launch disconnection */
-            launch_disconnect = TRUE;
-        } else
-            bearer_update_status (self, MM_BEARER_STATUS_DISCONNECTED);
+        connect_failed (self, task, error);
+        return;
     }
+
     /* Handle cancellations detected after successful connection */
-    else if (g_cancellable_is_cancelled (self->priv->connect_cancellable)) {
-        mm_obj_dbg (self, "connected, but need to disconnect");
-        mm_bearer_connect_result_unref (result);
-        error = g_error_new (G_IO_ERROR, G_IO_ERROR_CANCELLED,
-                             "Bearer got connected, but had to disconnect after cancellation request");
-        launch_disconnect = TRUE;
-    }
-    else {
-        mm_obj_dbg (self, "connected");
+    if (connect_check_cancel (self, task))
+        return;
 
-        /* Update bearer and interface status */
-        bearer_update_status_connected (
+    mm_obj_dbg (self, "connected");
+    g_task_set_task_data (task, g_steal_pointer (&result), (GDestroyNotify)mm_bearer_connect_result_unref);
+
+    /* Check that reload statistics is supported by the device; we can only do this while
+     * connected. */
+    if (MM_BASE_BEARER_GET_CLASS (self)->reload_stats &&
+        MM_BASE_BEARER_GET_CLASS (self)->reload_stats_finish) {
+        MM_BASE_BEARER_GET_CLASS (self)->reload_stats (
             self,
-            mm_port_get_device (mm_bearer_connect_result_peek_data (result)),
-            mm_bearer_connect_result_peek_ipv4_config (result),
-            mm_bearer_connect_result_peek_ipv6_config (result));
-        mm_bearer_connect_result_unref (result);
+            (GAsyncReadyCallback)reload_stats_supported_ready,
+            task);
+        return;
     }
 
-    if (launch_disconnect) {
-        bearer_update_status (self, MM_BEARER_STATUS_DISCONNECTING);
-        MM_BASE_BEARER_GET_CLASS (self)->disconnect (
-            self,
-            (GAsyncReadyCallback)disconnect_after_cancel_ready,
-            NULL);
-    }
-
-    g_clear_object (&self->priv->connect_cancellable);
-
-    if (error)
-        g_task_return_error (task, error);
-    else
-        g_task_return_boolean (task, TRUE);
-
-    g_object_unref (task);
+    connect_succeeded (self, task);
 }
 
 void
@@ -943,6 +1120,9 @@ mm_base_bearer_connect (MMBaseBearer *self,
     mm_bearer_stats_set_attempts (self->priv->stats,
                                   mm_bearer_stats_get_attempts (self->priv->stats) + 1);
     bearer_reset_ongoing_interface_stats (self);
+
+    /* Clear previous connection error, if any */
+    bearer_update_connection_error (self, NULL);
 
     /* Connecting! */
     mm_obj_dbg (self, "connecting...");
@@ -1285,10 +1465,19 @@ mm_base_bearer_get_config (MMBaseBearer *self)
             NULL);
 }
 
-MMBearerIpFamily
-mm_base_bearer_get_default_ip_family (MMBaseBearer *self)
+gint
+mm_base_bearer_get_profile_id (MMBaseBearer *self)
 {
-    return self->priv->default_ip_family;
+    return mm_gdbus_bearer_get_profile_id (MM_GDBUS_BEARER (self));
+}
+
+MMBearerApnType
+mm_base_bearer_get_apn_type (MMBaseBearer *self)
+{
+    /* when none explicitly requested, apn type always defaults to internet */
+    return (self->priv->config ?
+            mm_bearer_properties_get_apn_type (self->priv->config) :
+            MM_BEARER_APN_TYPE_DEFAULT);
 }
 
 /*****************************************************************************/
@@ -1321,6 +1510,11 @@ mm_base_bearer_disconnect_force (MMBaseBearer *self)
         self->priv->status == MM_BEARER_STATUS_DISCONNECTED)
         return;
 
+    if (self->priv->ignore_disconnection_reports) {
+        mm_obj_dbg (self, "disconnection should be forced but it's explicitly ignored");
+        return;
+    }
+
     mm_obj_dbg (self, "forcing disconnection");
 
     /* If currently connecting, try to cancel that operation. */
@@ -1340,8 +1534,9 @@ mm_base_bearer_disconnect_force (MMBaseBearer *self)
 /*****************************************************************************/
 
 static void
-report_connection_status (MMBaseBearer *self,
-                          MMBearerConnectionStatus status)
+report_connection_status (MMBaseBearer             *self,
+                          MMBearerConnectionStatus status,
+                          const GError             *connection_error)
 {
     /* The only status expected at this point is DISCONNECTED or CONNECTED,
      * although here we just process the DISCONNECTED one.
@@ -1350,8 +1545,10 @@ report_connection_status (MMBaseBearer *self,
 
     /* In the generic bearer implementation we just need to reset the
      * interface status */
-    if (status == MM_BEARER_CONNECTION_STATUS_DISCONNECTED)
+    if (status == MM_BEARER_CONNECTION_STATUS_DISCONNECTED) {
+        bearer_update_connection_error (self, connection_error);
         bearer_update_status (self, MM_BEARER_STATUS_DISCONNECTED);
+    }
 }
 
 /*
@@ -1381,16 +1578,156 @@ report_connection_status (MMBaseBearer *self,
  * pppd should detect it) and disconnect the bearer through DBus.
  */
 void
-mm_base_bearer_report_connection_status (MMBaseBearer             *self,
-                                         MMBearerConnectionStatus  status)
+mm_base_bearer_report_connection_status_detailed (MMBaseBearer             *self,
+                                                  MMBearerConnectionStatus  status,
+                                                  const GError             *connection_error)
 {
-    if ((status == MM_BEARER_CONNECTION_STATUS_DISCONNECTED) && self->priv->ignore_disconnection_reports) {
-        mm_obj_dbg (self, "ignoring disconnection report");
-        return;
+    /* Reporting disconnection? */
+    if (status == MM_BEARER_CONNECTION_STATUS_DISCONNECTED || status == MM_BEARER_CONNECTION_STATUS_CONNECTION_FAILED) {
+        if (self->priv->ignore_disconnection_reports) {
+            mm_obj_dbg (self, "ignoring disconnection report");
+            return;
+        }
+
+        /* Setup a generic default error if none explicitly given when reporting
+         * bearer disconnections. */
+        if (!connection_error) {
+            g_autoptr(GError) default_connection_error = NULL;
+
+            default_connection_error = mm_mobile_equipment_error_for_code (MM_MOBILE_EQUIPMENT_ERROR_UNKNOWN, self);
+            return MM_BASE_BEARER_GET_CLASS (self)->report_connection_status (self, status, default_connection_error);
+        }
     }
 
-    return MM_BASE_BEARER_GET_CLASS (self)->report_connection_status (self, status);
+    return MM_BASE_BEARER_GET_CLASS (self)->report_connection_status (self, status, connection_error);
 }
+
+/*****************************************************************************/
+
+#if defined WITH_SUSPEND_RESUME
+
+typedef struct _SyncingContext SyncingContext;
+static void interface_syncing_step (GTask *task);
+
+typedef enum {
+    SYNCING_STEP_FIRST,
+    SYNCING_STEP_REFRESH_CONNECTION,
+    SYNCING_STEP_LAST
+} SyncingStep;
+
+struct _SyncingContext {
+    SyncingStep    step;
+    MMBearerStatus status;
+};
+
+gboolean
+mm_base_bearer_sync_finish (MMBaseBearer  *self,
+                            GAsyncResult  *res,
+                            GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+reload_connection_status_ready (MMBaseBearer *self,
+                                GAsyncResult *res,
+                                GTask        *task)
+{
+    SyncingContext           *ctx;
+    MMBearerConnectionStatus  reloaded_status;
+    g_autoptr(GError)         error = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    /* The only update we're really interested in is the connected->disconnected
+     * one, because any other would be extremely strange and it's probably not
+     * worth trying to support those; e.g. a disconnected->connected change here
+     * would be impossible to be handled correctly. We'll also ignore intermediate
+     * states (connecting/disconnecting), as we can rely on the reports of the final
+     * state at some point soon.
+     *
+     * So, just handle DISCONNECTED at this point.
+     */
+    reloaded_status = MM_BASE_BEARER_GET_CLASS (self)->reload_connection_status_finish (self, res, &error);
+    if (reloaded_status == MM_BEARER_CONNECTION_STATUS_UNKNOWN)
+        mm_obj_warn (self, "reloading connection status failed: %s", error->message);
+    else if ((ctx->status == MM_BEARER_STATUS_CONNECTED) &&
+             (reloaded_status == MM_BEARER_CONNECTION_STATUS_DISCONNECTED)) {
+        mm_obj_dbg (self, "disconnection detected during status synchronization");
+        mm_base_bearer_report_connection_status (self, reloaded_status);
+    }
+
+    /* Go on to the next step */
+    ctx->step++;
+    interface_syncing_step (task);
+}
+
+static void
+interface_syncing_step (GTask *task)
+{
+    MMBaseBearer   *self;
+    SyncingContext *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx = g_task_get_task_data (task);
+
+    switch (ctx->step) {
+    case SYNCING_STEP_FIRST:
+        ctx->step++;
+        /* fall through */
+
+    case SYNCING_STEP_REFRESH_CONNECTION:
+        /*
+         * AT+PPP based connections should not be synced.
+         * When a AT+PPP connection bearer is connected, the 'ignore_disconnection_reports' flag is set.
+         */
+        if (!self->priv->ignore_disconnection_reports) {
+            if (!MM_BASE_BEARER_GET_CLASS (self)->reload_connection_status)
+                mm_obj_warn (self, "unable to reload connection status, method not implemented");
+            else {
+                mm_obj_dbg (self, "refreshing connection status");
+                MM_BASE_BEARER_GET_CLASS (self)->reload_connection_status (self,
+                                                                           (GAsyncReadyCallback) reload_connection_status_ready,
+                                                                           task);
+                return;
+            }
+        }
+        ctx->step++;
+        /* fall through */
+
+    case SYNCING_STEP_LAST:
+        /* We are done without errors! */
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+
+    default:
+        break;
+    }
+
+    g_assert_not_reached ();
+}
+
+void
+mm_base_bearer_sync (MMBaseBearer        *self,
+                     GAsyncReadyCallback  callback,
+                     gpointer             user_data)
+{
+    SyncingContext *ctx;
+    GTask          *task;
+
+    /* Create SyncingContext and store the original bearer status */
+    ctx = g_new0 (SyncingContext, 1);
+    ctx->step = SYNCING_STEP_FIRST;
+    ctx->status = self->priv->status;
+
+    /* Create sync steps task and execute it */
+    task = g_task_new (self, NULL, callback, user_data);
+    g_task_set_task_data (task, ctx, (GDestroyNotify)g_free);
+    interface_syncing_step (task);
+}
+
+#endif
 
 /*****************************************************************************/
 
@@ -1472,9 +1809,6 @@ set_property (GObject *object,
             g_variant_unref (dictionary);
         break;
     }
-    case PROP_DEFAULT_IP_FAMILY:
-        self->priv->default_ip_family = g_value_get_flags (value);
-        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
         break;
@@ -1505,9 +1839,6 @@ get_property (GObject *object,
     case PROP_CONFIG:
         g_value_set_object (value, self->priv->config);
         break;
-    case PROP_DEFAULT_IP_FAMILY:
-        g_value_set_flags (value, self->priv->default_ip_family);
-        break;
     default:
         G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
         break;
@@ -1530,11 +1861,13 @@ mm_base_bearer_init (MMBaseBearer *self)
     self->priv->status = MM_BEARER_STATUS_DISCONNECTED;
     self->priv->reason_3gpp = CONNECTION_FORBIDDEN_REASON_NONE;
     self->priv->reason_cdma = CONNECTION_FORBIDDEN_REASON_NONE;
-    self->priv->default_ip_family = MM_BEARER_IP_FAMILY_IPV4;
+    self->priv->reload_stats_supported = FALSE;
     self->priv->stats = mm_bearer_stats_new ();
 
     /* Set defaults */
     mm_gdbus_bearer_set_interface   (MM_GDBUS_BEARER (self), NULL);
+    mm_gdbus_bearer_set_multiplexed (MM_GDBUS_BEARER (self), FALSE);
+    mm_gdbus_bearer_set_profile_id  (MM_GDBUS_BEARER (self), MM_3GPP_PROFILE_ID_UNKNOWN);
     mm_gdbus_bearer_set_connected   (MM_GDBUS_BEARER (self), FALSE);
     mm_gdbus_bearer_set_suspended   (MM_GDBUS_BEARER (self), FALSE);
     mm_gdbus_bearer_set_properties  (MM_GDBUS_BEARER (self), NULL);
@@ -1641,25 +1974,20 @@ mm_base_bearer_class_init (MMBaseBearerClass *klass)
                              MM_TYPE_BEARER_PROPERTIES,
                              G_PARAM_READWRITE);
     g_object_class_install_property (object_class, PROP_CONFIG, properties[PROP_CONFIG]);
-
-    properties[PROP_DEFAULT_IP_FAMILY] =
-        g_param_spec_flags (MM_BASE_BEARER_DEFAULT_IP_FAMILY,
-                            "Bearer default IP family",
-                            "IP family to use for this bearer when no IP family is specified",
-                            MM_TYPE_BEARER_IP_FAMILY,
-                            MM_BEARER_IP_FAMILY_IPV4,
-                            G_PARAM_READWRITE);
-    g_object_class_install_property (object_class, PROP_DEFAULT_IP_FAMILY, properties[PROP_DEFAULT_IP_FAMILY]);
 }
 
 /*****************************************************************************/
 /* Helpers to implement connect() */
 
 struct _MMBearerConnectResult {
-    volatile gint ref_count;
-    MMPort *data;
+    volatile gint     ref_count;
+    MMPort           *data;
     MMBearerIpConfig *ipv4_config;
     MMBearerIpConfig *ipv6_config;
+    gboolean          multiplexed;
+    gint              profile_id;
+    guint64           uplink_speed;
+    guint64           downlink_speed;
 };
 
 MMBearerConnectResult *
@@ -1701,8 +2029,60 @@ mm_bearer_connect_result_peek_ipv6_config (MMBearerConnectResult *result)
     return result->ipv6_config;
 }
 
+void
+mm_bearer_connect_result_set_multiplexed (MMBearerConnectResult *result,
+                                          gboolean               multiplexed)
+{
+    result->multiplexed = multiplexed;
+}
+
+gboolean
+mm_bearer_connect_result_get_multiplexed (MMBearerConnectResult *result)
+{
+    return result->multiplexed;
+}
+
+void
+mm_bearer_connect_result_set_profile_id (MMBearerConnectResult *result,
+                                         gint                   profile_id)
+{
+    result->profile_id = profile_id;
+}
+
+gint
+mm_bearer_connect_result_get_profile_id (MMBearerConnectResult *result)
+{
+    return result->profile_id;
+}
+
+void
+mm_bearer_connect_result_set_uplink_speed (MMBearerConnectResult *result,
+                                           guint64                speed)
+{
+    result->uplink_speed = speed;
+}
+
+guint64
+mm_bearer_connect_result_get_uplink_speed (MMBearerConnectResult *result)
+{
+    return result->uplink_speed;
+}
+
+void
+mm_bearer_connect_result_set_downlink_speed (MMBearerConnectResult *result,
+                                             guint64                speed)
+{
+    result->downlink_speed = speed;
+}
+
+guint64
+mm_bearer_connect_result_get_downlink_speed (MMBearerConnectResult *result)
+{
+    return result->downlink_speed;
+}
+
 MMBearerConnectResult *
-mm_bearer_connect_result_new (MMPort *data,
+mm_bearer_connect_result_new (MMPort           *data,
                               MMBearerIpConfig *ipv4_config,
                               MMBearerIpConfig *ipv6_config)
 {
@@ -1718,5 +2098,7 @@ mm_bearer_connect_result_new (MMPort *data,
         result->ipv4_config = g_object_ref (ipv4_config);
     if (ipv6_config)
         result->ipv6_config = g_object_ref (ipv6_config);
+    result->multiplexed = FALSE; /* default */
+    result->profile_id = MM_3GPP_PROFILE_ID_UNKNOWN;
     return result;
 }
