@@ -112,6 +112,7 @@ generate_3gpp_submit_pdus (MMBaseSms *self,
     gsize data_len = 0;
 
     MMSmsEncoding encoding;
+    MMModemCharset charset;
     gchar **split_text = NULL;
     GByteArray **split_data = NULL;
 
@@ -129,7 +130,7 @@ generate_3gpp_submit_pdus (MMBaseSms *self,
     g_assert (!(text != NULL && data != NULL));
 
     if (text) {
-        split_text = mm_sms_part_3gpp_util_split_text (text, &encoding, self);
+        split_text = mm_charset_util_split_text (text, &charset, self);
         if (!split_text) {
             g_set_error (error,
                          MM_CORE_ERROR,
@@ -137,6 +138,7 @@ generate_3gpp_submit_pdus (MMBaseSms *self,
                          "Cannot generate PDUs: Error processing input text");
             return FALSE;
         }
+        encoding = (charset == MM_MODEM_CHARSET_GSM) ? MM_SMS_ENCODING_GSM7 : MM_SMS_ENCODING_UCS2;
         n_parts = g_strv_length (split_text);
     } else if (data) {
         encoding = MM_SMS_ENCODING_8BIT;
@@ -320,10 +322,10 @@ generate_submit_pdus (MMBaseSms *self,
 /* Store SMS (DBus call handling) */
 
 typedef struct {
-    MMBaseSms *self;
-    MMBaseModem *modem;
+    MMBaseSms             *self;
+    MMBaseModem           *modem;
     GDBusMethodInvocation *invocation;
-    MMSmsStorage storage;
+    MMSmsStorage           storage;
 } HandleStoreContext;
 
 static void
@@ -332,60 +334,66 @@ handle_store_context_free (HandleStoreContext *ctx)
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->modem);
     g_object_unref (ctx->self);
-    g_free (ctx);
+    g_slice_free (HandleStoreContext, ctx);
 }
 
 static void
-handle_store_ready (MMBaseSms *self,
-                    GAsyncResult *res,
+handle_store_ready (MMBaseSms          *self,
+                    GAsyncResult       *res,
                     HandleStoreContext *ctx)
 {
     GError *error = NULL;
 
     if (!MM_BASE_SMS_GET_CLASS (self)->store_finish (self, res, &error)) {
-        /* On error, clear up the parts we generated */
-        g_list_free_full (self->priv->parts, (GDestroyNotify)mm_sms_part_free);
-        self->priv->parts = NULL;
+        mm_obj_warn (self, "failed storing SMS message: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    } else {
-        mm_gdbus_sms_set_storage (MM_GDBUS_SMS (ctx->self), ctx->storage);
-
-        /* Transition from Unknown->Stored for SMS which were created by the user */
-        if (mm_gdbus_sms_get_state (MM_GDBUS_SMS (ctx->self)) == MM_SMS_STATE_UNKNOWN)
-            mm_gdbus_sms_set_state (MM_GDBUS_SMS (ctx->self), MM_SMS_STATE_STORED);
-
-        mm_gdbus_sms_complete_store (MM_GDBUS_SMS (ctx->self), ctx->invocation);
+        handle_store_context_free (ctx);
+        return;
     }
 
+    mm_gdbus_sms_set_storage (MM_GDBUS_SMS (ctx->self), ctx->storage);
+
+    /* Transition from Unknown->Stored for SMS which were created by the user */
+    if (mm_gdbus_sms_get_state (MM_GDBUS_SMS (ctx->self)) == MM_SMS_STATE_UNKNOWN)
+        mm_gdbus_sms_set_state (MM_GDBUS_SMS (ctx->self), MM_SMS_STATE_STORED);
+
+    mm_obj_info (self, "stored SMS message");
+    mm_gdbus_sms_complete_store (MM_GDBUS_SMS (ctx->self), ctx->invocation);
     handle_store_context_free (ctx);
 }
 
 static gboolean
-prepare_sms_to_be_stored (MMBaseSms *self,
-                          GError **error)
+prepare_sms_to_be_stored (MMBaseSms  *self,
+                          GError    **error)
 {
-    GList *l;
-    guint8 reference;
-
-    g_assert (self->priv->parts == NULL);
-
-    /* Look for a valid multipart reference to use. When storing, we need to
-     * check whether we have already stored multipart SMS with the same
-     * reference and destination number */
-    reference = (mm_iface_modem_messaging_get_local_multipart_reference (
-                     MM_IFACE_MODEM_MESSAGING (self->priv->modem),
-                     mm_gdbus_sms_get_number (MM_GDBUS_SMS (self)),
-                     error));
-    if (!reference ||
-        !generate_submit_pdus (self, error)) {
-        g_prefix_error (error, "Cannot prepare SMS to be stored: ");
+    /* Create parts if we did not create them already before (e.g. when
+     * sending) */
+    if (!self->priv->parts && !generate_submit_pdus (self, error)) {
+        g_prefix_error (error, "Cannot create submit PDUs: ");
         return FALSE;
     }
 
     /* If the message is a multipart message, we need to set a proper
      * multipart reference. When sending a message which wasn't stored
-     * yet, we can just get a random multipart reference. */
+     * yet, we chose a random multipart reference, but that doesn't work
+     * when storing locally, as we could collide with the references used
+     * in other existing messages. */
     if (self->priv->is_multipart) {
+        GList  *l;
+        guint8  reference;
+
+        /* Look for a valid multipart reference to use. When storing, we need to
+         * check whether we have already stored multipart SMS with the same
+         * reference and destination number */
+        reference = mm_iface_modem_messaging_get_local_multipart_reference (
+                        MM_IFACE_MODEM_MESSAGING (self->priv->modem),
+                        mm_gdbus_sms_get_number (MM_GDBUS_SMS (self)),
+                        error);
+        if (!reference) {
+            g_prefix_error (error, "Cannot get local multipart reference: ");
+            return FALSE;
+        }
+
         self->priv->multipart_reference = reference;
         for (l = self->priv->parts; l; l = g_list_next (l)) {
             mm_sms_part_set_concat_reference ((MMSmsPart *)l->data,
@@ -397,8 +405,8 @@ prepare_sms_to_be_stored (MMBaseSms *self,
 }
 
 static void
-handle_store_auth_ready (MMBaseModem *modem,
-                         GAsyncResult *res,
+handle_store_auth_ready (MMBaseModem        *modem,
+                         GAsyncResult       *res,
                          HandleStoreContext *ctx)
 {
     GError *error = NULL;
@@ -409,20 +417,25 @@ handle_store_auth_ready (MMBaseModem *modem,
         return;
     }
 
+    mm_obj_info (ctx->self, "processing user request to store SMS message in storage '%s'...",
+                 mm_sms_storage_get_string (ctx->storage));
+
     /* First of all, check if we already have the SMS stored. */
     if (mm_base_sms_get_storage (ctx->self) != MM_SMS_STORAGE_UNKNOWN) {
         /* Check if SMS stored in some other storage */
-        if (mm_base_sms_get_storage (ctx->self) == ctx->storage)
+        if (mm_base_sms_get_storage (ctx->self) == ctx->storage) {
             /* Good, same storage */
+            mm_obj_info (ctx->self, "SMS message already stored");
             mm_gdbus_sms_complete_store (MM_GDBUS_SMS (ctx->self), ctx->invocation);
-        else
-            g_dbus_method_invocation_return_error (
-                ctx->invocation,
-                MM_CORE_ERROR,
-                MM_CORE_ERROR_FAILED,
-                "SMS is already stored in storage '%s', cannot store it in storage '%s'",
-                mm_sms_storage_get_string (mm_base_sms_get_storage (ctx->self)),
-                mm_sms_storage_get_string (ctx->storage));
+        } else {
+            error = g_error_new (MM_CORE_ERROR,
+                                 MM_CORE_ERROR_FAILED,
+                                 "SMS is already stored in storage '%s', cannot store it in storage '%s'",
+                                 mm_sms_storage_get_string (mm_base_sms_get_storage (ctx->self)),
+                                 mm_sms_storage_get_string (ctx->storage));
+            mm_obj_warn (ctx->self, "failed storing SMS message: %s", error->message);
+            g_dbus_method_invocation_take_error (ctx->invocation, error);
+        }
         handle_store_context_free (ctx);
         return;
     }
@@ -431,6 +444,7 @@ handle_store_auth_ready (MMBaseModem *modem,
     if (!mm_iface_modem_messaging_is_storage_supported_for_storing (MM_IFACE_MODEM_MESSAGING (ctx->modem),
                                                                     ctx->storage,
                                                                     &error)) {
+        mm_obj_warn (ctx->self, "failed storing SMS message: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
         handle_store_context_free (ctx);
         return;
@@ -438,6 +452,7 @@ handle_store_auth_ready (MMBaseModem *modem,
 
     /* Prepare the SMS to be stored, creating the PDU list if required */
     if (!prepare_sms_to_be_stored (ctx->self, &error)) {
+        mm_obj_warn (ctx->self, "failed preparing SMS message to be stored: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
         handle_store_context_free (ctx);
         return;
@@ -446,6 +461,7 @@ handle_store_auth_ready (MMBaseModem *modem,
     /* If not stored, check if we do support doing it */
     if (!MM_BASE_SMS_GET_CLASS (ctx->self)->store ||
         !MM_BASE_SMS_GET_CLASS (ctx->self)->store_finish) {
+        mm_obj_warn (ctx->self, "failed storing SMS message: unsupported");
         g_dbus_method_invocation_return_error (ctx->invocation,
                                                MM_CORE_ERROR,
                                                MM_CORE_ERROR_UNSUPPORTED,
@@ -461,13 +477,13 @@ handle_store_auth_ready (MMBaseModem *modem,
 }
 
 static gboolean
-handle_store (MMBaseSms *self,
+handle_store (MMBaseSms             *self,
               GDBusMethodInvocation *invocation,
-              guint32 storage)
+              guint32                storage)
 {
     HandleStoreContext *ctx;
 
-    ctx = g_new0 (HandleStoreContext, 1);
+    ctx = g_slice_new0 (HandleStoreContext);
     ctx->self = g_object_ref (self);
     ctx->invocation = g_object_ref (invocation);
     g_object_get (self,
@@ -495,8 +511,8 @@ handle_store (MMBaseSms *self,
 /* Send SMS (DBus call handling) */
 
 typedef struct {
-    MMBaseSms *self;
-    MMBaseModem *modem;
+    MMBaseSms             *self;
+    MMBaseModem           *modem;
     GDBusMethodInvocation *invocation;
 } HandleSendContext;
 
@@ -506,51 +522,53 @@ handle_send_context_free (HandleSendContext *ctx)
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->modem);
     g_object_unref (ctx->self);
-    g_free (ctx);
+    g_slice_free (HandleSendContext, ctx);
 }
 
 static void
-handle_send_ready (MMBaseSms *self,
-                   GAsyncResult *res,
+handle_send_ready (MMBaseSms         *self,
+                   GAsyncResult      *res,
                    HandleSendContext *ctx)
 {
     GError *error = NULL;
 
     if (!MM_BASE_SMS_GET_CLASS (self)->send_finish (self, res, &error)) {
-        /* On error, clear up the parts we generated */
-        g_list_free_full (self->priv->parts, (GDestroyNotify)mm_sms_part_free);
-        self->priv->parts = NULL;
+        mm_obj_warn (self, "failed sending SMS message: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    } else {
-        /* Transition from Unknown->Sent or Stored->Sent */
-        if (mm_gdbus_sms_get_state (MM_GDBUS_SMS (ctx->self)) == MM_SMS_STATE_UNKNOWN ||
-            mm_gdbus_sms_get_state (MM_GDBUS_SMS (ctx->self)) == MM_SMS_STATE_STORED) {
-            GList *l;
-
-            /* Update state */
-            mm_gdbus_sms_set_state (MM_GDBUS_SMS (ctx->self), MM_SMS_STATE_SENT);
-            /* Grab last message reference */
-            l = g_list_last (mm_base_sms_get_parts (ctx->self));
-            mm_gdbus_sms_set_message_reference (MM_GDBUS_SMS (ctx->self),
-                                                mm_sms_part_get_message_reference ((MMSmsPart *)l->data));
-        }
-        mm_gdbus_sms_complete_send (MM_GDBUS_SMS (ctx->self), ctx->invocation);
+        handle_send_context_free (ctx);
+        return;
     }
 
+    /* Transition from Unknown->Sent or Stored->Sent */
+    if (mm_gdbus_sms_get_state (MM_GDBUS_SMS (ctx->self)) == MM_SMS_STATE_UNKNOWN ||
+        mm_gdbus_sms_get_state (MM_GDBUS_SMS (ctx->self)) == MM_SMS_STATE_STORED) {
+        GList *l;
+
+        /* Update state */
+        mm_gdbus_sms_set_state (MM_GDBUS_SMS (ctx->self), MM_SMS_STATE_SENT);
+        /* Grab last message reference */
+        l = g_list_last (mm_base_sms_get_parts (ctx->self));
+        mm_gdbus_sms_set_message_reference (MM_GDBUS_SMS (ctx->self),
+                                            mm_sms_part_get_message_reference ((MMSmsPart *)l->data));
+    }
+
+    mm_obj_info (self, "sent SMS message");
+    mm_gdbus_sms_complete_send (MM_GDBUS_SMS (ctx->self), ctx->invocation);
     handle_send_context_free (ctx);
 }
 
 static gboolean
-prepare_sms_to_be_sent (MMBaseSms *self,
-                        GError **error)
+prepare_sms_to_be_sent (MMBaseSms  *self,
+                        GError    **error)
 {
     GList *l;
 
+    /* If we created the parts when storing, we're fine already */
     if (self->priv->parts)
         return TRUE;
 
     if (!generate_submit_pdus (self, error)) {
-        g_prefix_error (error, "Cannot prepare SMS to be sent: ");
+        g_prefix_error (error, "Cannot create submit PDUs: ");
         return FALSE;
     }
 
@@ -569,12 +587,12 @@ prepare_sms_to_be_sent (MMBaseSms *self,
 }
 
 static void
-handle_send_auth_ready (MMBaseModem *modem,
-                        GAsyncResult *res,
+handle_send_auth_ready (MMBaseModem       *modem,
+                        GAsyncResult      *res,
                         HandleSendContext *ctx)
 {
-    MMSmsState state;
-    GError *error = NULL;
+    MMSmsState  state;
+    GError     *error = NULL;
 
     if (!mm_base_modem_authorize_finish (modem, res, &error)) {
         g_dbus_method_invocation_take_error (ctx->invocation, error);
@@ -584,8 +602,7 @@ handle_send_auth_ready (MMBaseModem *modem,
 
     /* We can only send SMS created by the user */
     state = mm_gdbus_sms_get_state (MM_GDBUS_SMS (ctx->self));
-    if (state == MM_SMS_STATE_RECEIVED ||
-        state == MM_SMS_STATE_RECEIVING) {
+    if (state == MM_SMS_STATE_RECEIVED || state == MM_SMS_STATE_RECEIVING) {
         g_dbus_method_invocation_return_error (ctx->invocation,
                                                MM_CORE_ERROR,
                                                MM_CORE_ERROR_FAILED,
@@ -604,8 +621,11 @@ handle_send_auth_ready (MMBaseModem *modem,
         return;
     }
 
+    mm_obj_info (ctx->self, "processing user request to send SMS message...");
+
     /* Prepare the SMS to be sent, creating the PDU list if required */
     if (!prepare_sms_to_be_sent (ctx->self, &error)) {
+        mm_obj_warn (ctx->self, "failed preparing SMS message to be sent: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
         handle_send_context_free (ctx);
         return;
@@ -614,6 +634,7 @@ handle_send_auth_ready (MMBaseModem *modem,
     /* Check if we do support doing it */
     if (!MM_BASE_SMS_GET_CLASS (ctx->self)->send ||
         !MM_BASE_SMS_GET_CLASS (ctx->self)->send_finish) {
+        mm_obj_warn (ctx->self, "failed sending SMS message: unsupported");
         g_dbus_method_invocation_return_error (ctx->invocation,
                                                MM_CORE_ERROR,
                                                MM_CORE_ERROR_UNSUPPORTED,
@@ -628,12 +649,12 @@ handle_send_auth_ready (MMBaseModem *modem,
 }
 
 static gboolean
-handle_send (MMBaseSms *self,
+handle_send (MMBaseSms             *self,
              GDBusMethodInvocation *invocation)
 {
     HandleSendContext *ctx;
 
-    ctx = g_new0 (HandleSendContext, 1);
+    ctx = g_slice_new0 (HandleSendContext);
     ctx->self = g_object_ref (self);
     ctx->invocation = g_object_ref (invocation);
     g_object_get (self,
@@ -1145,7 +1166,7 @@ send_generic_ready (MMBaseModem *modem,
      * sent right away (not queued after other AT commands). */
     mm_base_modem_at_command_raw (ctx->modem,
                                   ctx->msg_data,
-                                  60,
+                                  MM_BASE_SMS_DEFAULT_SEND_TIMEOUT,
                                   FALSE,
                                   (GAsyncReadyCallback)send_generic_msg_data_ready,
                                   task);
@@ -1219,7 +1240,7 @@ sms_send_next_part (GTask *task)
                                mm_sms_part_get_index ((MMSmsPart *)ctx->current->data));
         mm_base_modem_at_command (ctx->modem,
                                   cmd,
-                                  60,
+                                  MM_BASE_SMS_DEFAULT_SEND_TIMEOUT,
                                   FALSE,
                                   (GAsyncReadyCallback)send_from_storage_ready,
                                   task);
@@ -1245,9 +1266,11 @@ sms_send_next_part (GTask *task)
 
     g_assert (cmd != NULL);
     g_assert (ctx->msg_data != NULL);
+
+    /* no network involved in this initial AT command, so lower timeout */
     mm_base_modem_at_command (ctx->modem,
                               cmd,
-                              60,
+                              10,
                               FALSE,
                               (GAsyncReadyCallback)send_generic_ready,
                               task);

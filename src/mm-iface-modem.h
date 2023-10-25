@@ -11,6 +11,7 @@
  * GNU General Public License for more details:
  *
  * Copyright (C) 2011 Google, Inc.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc.
  */
 
 #ifndef MM_IFACE_MODEM_H
@@ -26,6 +27,7 @@
 #include "mm-port-serial-at.h"
 #include "mm-base-bearer.h"
 #include "mm-base-sim.h"
+#include "mm-bearer-list.h"
 
 #define MM_TYPE_IFACE_MODEM            (mm_iface_modem_get_type ())
 #define MM_IFACE_MODEM(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_IFACE_MODEM, MMIfaceModem))
@@ -35,9 +37,9 @@
 #define MM_IFACE_MODEM_DBUS_SKELETON           "iface-modem-dbus-skeleton"
 #define MM_IFACE_MODEM_STATE                   "iface-modem-state"
 #define MM_IFACE_MODEM_SIM                     "iface-modem-sim"
+#define MM_IFACE_MODEM_SIM_SLOTS               "iface-modem-sim-slots"
 #define MM_IFACE_MODEM_BEARER_LIST             "iface-modem-bearer-list"
 #define MM_IFACE_MODEM_SIM_HOT_SWAP_SUPPORTED  "iface-modem-sim-hot-swap-supported"
-#define MM_IFACE_MODEM_SIM_HOT_SWAP_CONFIGURED "iface-modem-sim-hot-swap-configured"
 #define MM_IFACE_MODEM_CARRIER_CONFIG_MAPPING  "iface-modem-carrier-config-mapping"
 #define MM_IFACE_MODEM_PERIODIC_SIGNAL_CHECK_DISABLED      "iface-modem-periodic-signal-check-disabled"
 #define MM_IFACE_MODEM_PERIODIC_ACCESS_TECH_CHECK_DISABLED "iface-modem-periodic-access-tech-check-disabled"
@@ -289,6 +291,8 @@ struct _MMIfaceModem {
      * Useful for when the modem changes power states since we might
      * not get the relevant notifications from the modem. */
     void (*check_for_sim_swap) (MMIfaceModem *self,
+                                const gchar *iccid,
+                                const gchar *imsi,
                                 GAsyncReadyCallback callback,
                                 gpointer user_data);
     gboolean (*check_for_sim_swap_finish) (MMIfaceModem *self,
@@ -343,6 +347,25 @@ struct _MMIfaceModem {
                                       GAsyncResult *res,
                                       GError **error);
 
+    /* Create SIMs in all SIM slots */
+    void     (* load_sim_slots)        (MMIfaceModem         *self,
+                                        GAsyncReadyCallback   callback,
+                                        gpointer              user_data);
+    gboolean (* load_sim_slots_finish) (MMIfaceModem         *self,
+                                        GAsyncResult         *res,
+                                        GPtrArray           **sim_slots,
+                                        guint                *primary_sim_slot,
+                                        GError              **error);
+
+    /* Set primary SIM slot */
+    void     (* set_primary_sim_slot)        (MMIfaceModem         *self,
+                                              guint                 sim_slot,
+                                              GAsyncReadyCallback   callback,
+                                              gpointer              user_data);
+    gboolean (* set_primary_sim_slot_finish) (MMIfaceModem         *self,
+                                              GAsyncResult         *res,
+                                              GError              **error);
+
     /* Create bearer */
     void (*create_bearer) (MMIfaceModem *self,
                            MMBearerProperties *properties,
@@ -351,14 +374,18 @@ struct _MMIfaceModem {
     MMBaseBearer * (*create_bearer_finish) (MMIfaceModem *self,
                                             GAsyncResult *res,
                                             GError **error);
-    /* Setup SIM hot swap */
-    void (*setup_sim_hot_swap) (MMIfaceModem *self,
-                                GAsyncReadyCallback callback,
-                                gpointer user_data);
 
-    gboolean (*setup_sim_hot_swap_finish) (MMIfaceModem *self,
-                                            GAsyncResult *res,
-                                            GError **error);
+    /* Create new bearer list object */
+    MMBearerList * (* create_bearer_list) (MMIfaceModem *self);
+
+    /* Setup/cleanup SIM hot swap */
+    void     (* setup_sim_hot_swap)          (MMIfaceModem         *self,
+                                              GAsyncReadyCallback   callback,
+                                              gpointer              user_data);
+    gboolean (* setup_sim_hot_swap_finish)   (MMIfaceModem         *self,
+                                              GAsyncResult         *res,
+                                              GError              **error);
+    void     (* cleanup_sim_hot_swap)        (MMIfaceModem         *self);
 
     /* Load carrier config */
     void     (* load_carrier_config)        (MMIfaceModem         *self,
@@ -379,6 +406,14 @@ struct _MMIfaceModem {
     gboolean (* setup_carrier_config_finish) (MMIfaceModem         *self,
                                               GAsyncResult         *res,
                                               GError              **error);
+
+    /* Asynchronous cell info retrieval operation */
+    void    (* get_cell_info)        (MMIfaceModem         *self,
+                                      GAsyncReadyCallback   callback,
+                                      gpointer              user_data);
+    GList * (* get_cell_info_finish) (MMIfaceModem         *self,
+                                      GAsyncResult         *res,
+                                      GError              **error);
 };
 
 GType mm_iface_modem_get_type (void);
@@ -439,6 +474,27 @@ gboolean mm_iface_modem_disable_finish (MMIfaceModem *self,
                                         GAsyncResult *res,
                                         GError **error);
 
+/* Shutdown Modem interface */
+void mm_iface_modem_shutdown (MMIfaceModem *self);
+
+/* Helper to return an error when the modem is in failed state and so it
+ * cannot process a given method invocation
+ */
+gboolean mm_iface_modem_abort_invocation_if_state_not_reached (MMIfaceModem          *self,
+                                                               GDBusMethodInvocation *invocation,
+                                                               MMModemState           minimum_required);
+#if defined WITH_SUSPEND_RESUME
+
+/* Sync Modem interface (async) */
+void     mm_iface_modem_sync           (MMIfaceModem *self,
+                                        GAsyncReadyCallback callback,
+                                        gpointer user_data);
+gboolean mm_iface_modem_sync_finish    (MMIfaceModem *self,
+                                        GAsyncResult *res,
+                                        GError **error);
+
+#endif
+
 /* Allow setting power state */
 void     mm_iface_modem_set_power_state        (MMIfaceModem *self,
                                                 MMModemPowerState power_state,
@@ -447,9 +503,6 @@ void     mm_iface_modem_set_power_state        (MMIfaceModem *self,
 gboolean mm_iface_modem_set_power_state_finish (MMIfaceModem *self,
                                                 GAsyncResult *res,
                                                 GError **error);
-
-/* Shutdown Modem interface */
-void mm_iface_modem_shutdown (MMIfaceModem *self);
 
 /* Request lock info update.
  * It will not only return the lock status, but also set the property values
@@ -465,9 +518,6 @@ MMModemLock mm_iface_modem_update_lock_info_finish (MMIfaceModem *self,
 
 MMModemLock      mm_iface_modem_get_unlock_required (MMIfaceModem *self);
 MMUnlockRetries *mm_iface_modem_get_unlock_retries  (MMIfaceModem *self);
-
-void mm_iface_modem_update_unlock_retries (MMIfaceModem *self,
-                                           MMUnlockRetries *unlock_retries);
 
 /* Request signal quality check update.
  * It will not only return the signal quality status, but also set the property
@@ -546,5 +596,22 @@ MMModemState mm_iface_modem_wait_for_final_state_finish (MMIfaceModem *self,
 
 void mm_iface_modem_bind_simple_status (MMIfaceModem *self,
                                         MMSimpleStatus *status);
+
+/* Check if the SIM or eSIM profile has changed */
+void     mm_iface_modem_check_for_sim_swap        (MMIfaceModem *self,
+                                                   const gchar *iccid,
+                                                   const gchar *imsi,
+                                                   GAsyncReadyCallback callback,
+                                                   gpointer user_data);
+gboolean mm_iface_modem_check_for_sim_swap_finish (MMIfaceModem *self,
+                                                   GAsyncResult *res,
+                                                   GError **error);
+
+void mm_iface_modem_modify_sim (MMIfaceModem *self,
+                                guint slot_index,
+                                MMBaseSim *new_sim);
+
+void mm_iface_modem_process_sim_event (MMIfaceModem *self);
+
 
 #endif /* MM_IFACE_MODEM_H */

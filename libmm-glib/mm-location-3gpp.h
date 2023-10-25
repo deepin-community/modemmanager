@@ -1,14 +1,21 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * libmm-glib -- Access modem status & information from glib applications
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details:
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA 02110-1301 USA.
  *
  * Copyright (C) 2012 Google, Inc.
  */
@@ -56,11 +63,11 @@ struct _MMLocation3gppClass {
 GType mm_location_3gpp_get_type (void);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMLocation3gpp, g_object_unref)
 
-guint  mm_location_3gpp_get_mobile_country_code (MMLocation3gpp *self);
-guint  mm_location_3gpp_get_mobile_network_code (MMLocation3gpp *self);
-gulong mm_location_3gpp_get_location_area_code  (MMLocation3gpp *self);
-gulong mm_location_3gpp_get_cell_id             (MMLocation3gpp *self);
-gulong mm_location_3gpp_get_tracking_area_code  (MMLocation3gpp *self);
+guint        mm_location_3gpp_get_mobile_country_code (MMLocation3gpp *self);
+gulong       mm_location_3gpp_get_location_area_code  (MMLocation3gpp *self);
+gulong       mm_location_3gpp_get_cell_id             (MMLocation3gpp *self);
+gulong       mm_location_3gpp_get_tracking_area_code  (MMLocation3gpp *self);
+const gchar *mm_location_3gpp_get_operator_code       (MMLocation3gpp *self);
 
 /*****************************************************************************/
 /* ModemManager/libmm-glib/mmcli specific methods */
@@ -75,17 +82,15 @@ MMLocation3gpp *mm_location_3gpp_new (void);
 MMLocation3gpp *mm_location_3gpp_new_from_string_variant (GVariant *string,
                                                           GError **error);
 
-gboolean mm_location_3gpp_set_mobile_country_code (MMLocation3gpp *self,
-                                                   guint mobile_country_code);
-gboolean mm_location_3gpp_set_mobile_network_code (MMLocation3gpp *self,
-                                                   guint mobile_network_code);
-gboolean mm_location_3gpp_set_location_area_code  (MMLocation3gpp *self,
-                                                   gulong location_area_code);
-gboolean mm_location_3gpp_set_cell_id             (MMLocation3gpp *self,
-                                                   gulong cell_id);
-gboolean mm_location_3gpp_set_tracking_area_code  (MMLocation3gpp *self,
-                                                   gulong tracking_area_code);
-gboolean mm_location_3gpp_reset                   (MMLocation3gpp *self);
+gboolean mm_location_3gpp_set_operator_code      (MMLocation3gpp *self,
+                                                  const gchar *operator_code);
+gboolean mm_location_3gpp_set_location_area_code (MMLocation3gpp *self,
+                                                  gulong location_area_code);
+gboolean mm_location_3gpp_set_cell_id            (MMLocation3gpp *self,
+                                                  gulong cell_id);
+gboolean mm_location_3gpp_set_tracking_area_code (MMLocation3gpp *self,
+                                                  gulong tracking_area_code);
+gboolean mm_location_3gpp_reset                  (MMLocation3gpp *self);
 
 #endif
 

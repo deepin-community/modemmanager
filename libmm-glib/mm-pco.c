@@ -1,14 +1,21 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * libmm-glib -- Access modem status & information from glib applications
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details:
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA 02110-1301 USA.
  *
  * Copyright 2018 Google LLC.
  */
@@ -17,6 +24,7 @@
 #include <glib.h>
 
 #include "mm-enums-types.h"
+#include "mm-flags-types.h"
 #include "mm-errors-types.h"
 #include "mm-common-helpers.h"
 #include "mm-pco.h"
@@ -245,27 +253,6 @@ mm_pco_to_variant (MMPco *self)
 }
 
 /*****************************************************************************/
-
-#ifndef MM_DISABLE_DEPRECATED
-
-/**
- * mm_pco_list_free:
- * @pco_list: (transfer full)(element-type ModemManager.Pco): a #GList of
- *  #MMPco.
- *
- * Frees all of the memory used by a #GList of #MMPco.
- *
- * Since: 1.10
- * Deprecated: 1.12.0: Use g_list_free_full() using g_object_unref() as
- * #GDestroyNotify function instead.
- */
-void
-mm_pco_list_free (GList *pco_list)
-{
-    g_list_free_full (pco_list, g_object_unref);
-}
-
-#endif /* MM_DISABLE_DEPRECATED */
 
 /**
  * mm_pco_list_add: (skip)

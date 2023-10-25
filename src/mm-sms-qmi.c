@@ -24,6 +24,7 @@
 #define _LIBMM_INSIDE_MM
 #include <libmm-glib.h>
 
+#include "mm-broadband-modem-qmi.h"
 #include "mm-modem-helpers-qmi.h"
 #include "mm-iface-modem.h"
 #include "mm-iface-modem-messaging.h"
@@ -53,7 +54,7 @@ ensure_qmi_client (MMSmsQmi *self,
                   NULL);
     g_assert (MM_IS_BASE_MODEM (modem));
 
-    port = mm_base_modem_peek_port_qmi (modem);
+    port = mm_broadband_modem_qmi_peek_port_qmi (MM_BROADBAND_MODEM_QMI (modem));
     g_object_unref (modem);
 
     if (!port) {
@@ -276,7 +277,7 @@ sms_store (MMBaseSms *self,
 
     /* Setup the context */
     ctx = g_slice_new0 (SmsStoreContext);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_WMS (g_object_ref (client));
     ctx->storage = storage;
     g_object_get (self,
                   MM_BASE_SMS_MODEM, &ctx->modem,
@@ -436,7 +437,7 @@ sms_send_generic (GTask *task)
 
     qmi_client_wms_raw_send (ctx->client,
                              input,
-                             30,
+                             MM_BASE_SMS_DEFAULT_SEND_TIMEOUT,
                              NULL,
                              (GAsyncReadyCallback)send_generic_ready,
                              task);
@@ -564,7 +565,7 @@ sms_send_from_storage (GTask *task)
     qmi_client_wms_send_from_memory_storage (
         ctx->client,
         input,
-        30,
+        MM_BASE_SMS_DEFAULT_SEND_TIMEOUT,
         NULL,
         (GAsyncReadyCallback)send_from_storage_ready,
         task);
@@ -610,7 +611,7 @@ sms_send (MMBaseSms *self,
 
     /* Setup the context */
     ctx = g_slice_new0 (SmsSendContext);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_WMS (g_object_ref (client));
     g_object_get (self,
                   MM_BASE_SMS_MODEM, &ctx->modem,
                   NULL);
@@ -768,7 +769,7 @@ sms_delete (MMBaseSms *self,
         return;
 
     ctx = g_slice_new0 (SmsDeletePartsContext);
-    ctx->client = g_object_ref (client);
+    ctx->client = QMI_CLIENT_WMS (g_object_ref (client));
     g_object_get (self,
                   MM_BASE_SMS_MODEM, &ctx->modem,
                   NULL);

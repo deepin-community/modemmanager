@@ -12,6 +12,7 @@
  *
  * Copyright (C) 2012 Google, Inc.
  * Copyright (C) 2016 Aleksander Morgado <aleksander@aleksander.es>
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc.
  */
 
 #include <config.h>
@@ -25,8 +26,11 @@
 #define _LIBMM_INSIDE_MM
 #include <libmm-glib.h>
 
+#include "mm-broadband-modem-qmi.h"
 #include "mm-log-object.h"
 #include "mm-sim-qmi.h"
+#include "mm-modem-helpers-qmi.h"
+#include "mm-shared-qmi.h"
 
 G_DEFINE_TYPE (MMSimQmi, mm_sim_qmi, MM_TYPE_BASE_SIM)
 
@@ -39,8 +43,12 @@ enum {
 static GParamSpec *properties[PROP_LAST];
 
 struct _MMSimQmiPrivate {
-    gboolean dms_uim_deprecated;
+    gboolean  dms_uim_deprecated;
+    gchar    *imsi;
 };
+
+static const guint16 mf_file_path[]  = { 0x3F00 };
+static const guint16 adf_file_path[] = { 0x3F00, 0x7FFF };
 
 /*****************************************************************************/
 
@@ -52,33 +60,24 @@ ensure_qmi_client (GTask       *task,
 {
     MMBaseModem *modem = NULL;
     QmiClient *client;
-    MMPortQmi *port;
+    g_autoptr(GError) error = NULL;
 
     g_object_get (self,
                   MM_BASE_SIM_MODEM, &modem,
                   NULL);
     g_assert (MM_IS_BASE_MODEM (modem));
 
-    port = mm_base_modem_peek_port_qmi (modem);
+    g_assert (MM_IS_SHARED_QMI (modem));
+    client = mm_shared_qmi_peek_client (MM_SHARED_QMI (modem),
+                                        service,
+                                        MM_PORT_QMI_FLAG_DEFAULT,
+                                        &error);
+
     g_object_unref (modem);
 
-    if (!port) {
-        if (task) {
-            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-                                     "Couldn't peek QMI port");
-            g_object_unref (task);
-        }
-        return FALSE;
-    }
-
-    client = mm_port_qmi_peek_client (port,
-                                      service,
-                                      MM_PORT_QMI_FLAG_DEFAULT);
     if (!client) {
         if (task) {
-            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-                                     "Couldn't peek client for service '%s'",
-                                     qmi_service_get_string (service));
+            g_task_return_error (task, g_steal_pointer (&error));
             g_object_unref (task);
         }
         return FALSE;
@@ -86,6 +85,131 @@ ensure_qmi_client (GTask       *task,
 
     *o_client = client;
     return TRUE;
+}
+
+/*****************************************************************************/
+/* Wait for SIM ready */
+
+#define SIM_READY_CHECKS_MAX 5
+#define SIM_READY_CHECKS_TIMEOUT_SECS 1
+
+typedef struct {
+    QmiClient *client_uim;
+    guint      ready_checks_n;
+} WaitSimReadyContext;
+
+static void
+wait_sim_ready_context_free (WaitSimReadyContext *ctx)
+{
+    g_clear_object (&ctx->client_uim);
+    g_slice_free (WaitSimReadyContext, ctx);
+}
+
+static gboolean
+wait_sim_ready_finish (MMBaseSim     *self,
+                       GAsyncResult  *res,
+                       GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void sim_ready_check (GTask *task);
+
+static gboolean
+sim_ready_retry_cb (GTask *task)
+{
+    sim_ready_check (task);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+sim_ready_retry (GTask *task)
+{
+    g_timeout_add_seconds (SIM_READY_CHECKS_TIMEOUT_SECS, (GSourceFunc) sim_ready_retry_cb, task);
+}
+
+static void
+uim_get_card_status_ready (QmiClientUim *client,
+                           GAsyncResult *res,
+                           GTask        *task)
+{
+    g_autoptr(QmiMessageUimGetCardStatusOutput)  output = NULL;
+    g_autoptr(GError)                            error = NULL;
+    MMSimQmi                                    *self;
+
+    self = g_task_get_source_object (task);
+
+    output = qmi_client_uim_get_card_status_finish (client, res, &error);
+    if (!output ||
+        !qmi_message_uim_get_card_status_output_get_result (output, &error) ||
+        (!mm_qmi_uim_get_card_status_output_parse (self, output, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &error) &&
+         (g_error_matches (error, MM_MOBILE_EQUIPMENT_ERROR, MM_MOBILE_EQUIPMENT_ERROR_SIM_NOT_INSERTED) ||
+          g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_RETRY)))) {
+        mm_obj_dbg (self, "sim not yet considered ready... retrying");
+        sim_ready_retry (task);
+        return;
+    }
+
+    /* SIM is considered ready now */
+    mm_obj_dbg (self, "sim is ready");
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+sim_ready_check (GTask *task)
+{
+    WaitSimReadyContext *ctx;
+    MMSimQmi            *self;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    ctx->ready_checks_n++;
+    if (ctx->ready_checks_n == SIM_READY_CHECKS_MAX) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                 "failed waiting for SIM readiness");
+        g_object_unref (task);
+        return;
+    }
+
+    mm_obj_dbg (self, "checking SIM readiness");
+    qmi_client_uim_get_card_status (QMI_CLIENT_UIM (ctx->client_uim),
+                                    NULL,
+                                    5,
+                                    NULL,
+                                    (GAsyncReadyCallback) uim_get_card_status_ready,
+                                    task);
+}
+
+static void
+wait_sim_ready (MMBaseSim           *_self,
+                GAsyncReadyCallback  callback,
+                gpointer             user_data)
+{
+    QmiClient           *client;
+    MMSimQmi            *self;
+    GTask               *task;
+    WaitSimReadyContext *ctx;
+
+    self = MM_SIM_QMI (_self);
+    task = g_task_new (self, NULL, callback, user_data);
+
+    mm_obj_dbg (self, "waiting for SIM to be ready...");
+    if (!self->priv->dms_uim_deprecated) {
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
+
+    if (!ensure_qmi_client (task, self, QMI_SERVICE_UIM, &client))
+        return;
+
+    ctx = g_slice_new0 (WaitSimReadyContext);
+    ctx->client_uim = g_object_ref (client);
+    g_task_set_task_data (task, ctx, (GDestroyNotify) wait_sim_ready_context_free);
+
+    sim_ready_check (task);
 }
 
 /*****************************************************************************/
@@ -207,9 +331,10 @@ uim_get_iccid_ready (QmiClientUim *client,
                      GAsyncResult *res,
                      GTask        *task)
 {
-    GError *error = NULL;
-    GArray *read_result;
-    gchar *iccid;
+    GError            *error = NULL;
+    g_autoptr(GArray)  read_result = NULL;
+    g_autofree gchar  *raw_iccid = NULL;
+    gchar             *iccid;
 
     read_result = uim_read_finish (client, res, &error);
     if (!read_result) {
@@ -218,24 +343,24 @@ uim_get_iccid_ready (QmiClientUim *client,
         return;
     }
 
-    iccid = mm_bcd_to_string ((const guint8 *) read_result->data, read_result->len);
-    g_assert (iccid);
-    g_task_return_pointer (task, iccid, g_free);
+    raw_iccid = mm_utils_bin2hexstr ((const guint8 *) read_result->data, read_result->len);
+    g_assert (raw_iccid);
+    iccid = mm_3gpp_parse_iccid (raw_iccid, &error);
+    if (!iccid)
+        g_task_return_error (task, error);
+    else
+        g_task_return_pointer (task, iccid, g_free);
     g_object_unref (task);
-
-    g_array_unref (read_result);
 }
 
 static void
 uim_get_iccid (MMSimQmi *self,
                GTask    *task)
 {
-    static const guint16 file_path[] = { 0x3F00 };
-
     uim_read (self,
               0x2FE2,
-              file_path,
-              G_N_ELEMENTS (file_path),
+              mf_file_path,
+              G_N_ELEMENTS (mf_file_path),
               (GAsyncReadyCallback)uim_get_iccid_ready,
               task);
 }
@@ -321,9 +446,12 @@ uim_get_imsi_ready (QmiClientUim *client,
                     GAsyncResult *res,
                     GTask        *task)
 {
-    GError *error = NULL;
-    GArray *read_result;
-    gchar *imsi;
+    MMSimQmi          *self;
+    GError            *error = NULL;
+    g_autoptr(GArray)  read_result = NULL;
+    g_autofree gchar  *imsi = NULL;
+
+    self = g_task_get_source_object (task);
 
     read_result = uim_read_finish (client, res, &error);
     if (!read_result) {
@@ -332,35 +460,37 @@ uim_get_imsi_ready (QmiClientUim *client,
         return;
     }
 
-    imsi = mm_bcd_to_string ((const guint8 *) read_result->data, read_result->len);
+    imsi = mm_bcd_to_string ((const guint8 *) read_result->data, read_result->len,
+                             TRUE /* low_nybble_first */);
     g_assert (imsi);
     if (strlen (imsi) < 3)
         g_task_return_new_error (task,
                                  MM_CORE_ERROR,
                                  MM_CORE_ERROR_FAILED,
                                  "IMSI is malformed");
-    else
+    else {
         /* EFimsi contains a length byte, follwed by a nibble for parity,
          * and then followed by the actual IMSI in BCD. After converting
          * the BCD into a decimal string, we simply skip the first 3
          * decimal digits to obtain the IMSI. */
-        g_task_return_pointer (task, g_strdup (imsi + 3), g_free);
-    g_object_unref (task);
 
-    g_free (imsi);
-    g_array_unref (read_result);
+        /* Cache IMSI */
+        g_free (self->priv->imsi);
+        self->priv->imsi = g_strdup (imsi + 3);
+
+        g_task_return_pointer (task, g_strdup (imsi + 3), g_free);
+    }
+    g_object_unref (task);
 }
 
 static void
 uim_get_imsi (MMSimQmi *self,
               GTask    *task)
 {
-    static const guint16 file_path[] = { 0x3F00, 0x7FFF };
-
     uim_read (self,
               0x6F07,
-              file_path,
-              G_N_ELEMENTS (file_path),
+              adf_file_path,
+              G_N_ELEMENTS (adf_file_path),
               (GAsyncReadyCallback)uim_get_imsi_ready,
               task);
 }
@@ -370,8 +500,11 @@ dms_uim_get_imsi_ready (QmiClientDms *client,
                         GAsyncResult *res,
                         GTask        *task)
 {
+    MMSimQmi                      *self;
     QmiMessageDmsUimGetImsiOutput *output = NULL;
-    GError *error = NULL;
+    GError                        *error = NULL;
+
+    self = g_task_get_source_object (task);
 
     output = qmi_client_dms_uim_get_imsi_finish (client, res, &error);
     if (!output) {
@@ -384,6 +517,11 @@ dms_uim_get_imsi_ready (QmiClientDms *client,
         const gchar *str = NULL;
 
         qmi_message_dms_uim_get_imsi_output_get_imsi (output, &str, NULL);
+
+        /* Cache IMSI */
+        g_free (self->priv->imsi);
+        self->priv->imsi = g_strdup (str);
+
         g_task_return_pointer (task, g_strdup (str), g_free);
     }
 
@@ -431,64 +569,88 @@ load_imsi (MMBaseSim           *_self,
 }
 
 /*****************************************************************************/
-/* Load operator identifier */
+/* Load GID1 and GID2 */
 
-static gboolean
-get_home_network (QmiClientNas  *client,
+static GByteArray *
+common_load_gid_finish (MMBaseSim     *self,
+                        GAsyncResult  *res,
+                        GError       **error)
+{
+    return g_task_propagate_pointer (G_TASK (res), error);
+}
+
+static void
+uim_get_gid_ready (QmiClientUim *client,
+                   GAsyncResult *res,
+                   GTask        *task)
+{
+    GError            *error = NULL;
+    g_autoptr(GArray)  read_result = NULL;
+
+    read_result = uim_read_finish (client, res, &error);
+    if (!read_result)
+        g_task_return_error (task, error);
+    else
+        g_task_return_pointer (task,
+                               g_byte_array_append (g_byte_array_sized_new (read_result->len),
+                                                    (const guint8 *)(read_result->data),
+                                                    read_result->len),
+                               (GDestroyNotify)g_byte_array_unref);
+    g_object_unref (task);
+}
+
+static void
+common_load_gid (MMBaseSim           *self,
+                 guint16              file_id,
+                 GAsyncReadyCallback  callback,
+                 gpointer             user_data)
+{
+    GTask *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    uim_read (MM_SIM_QMI (self),
+              file_id,
+              adf_file_path,
+              G_N_ELEMENTS (adf_file_path),
+              (GAsyncReadyCallback)uim_get_gid_ready,
+              task);
+}
+
+static GByteArray *
+load_gid1_finish (MMBaseSim     *self,
                   GAsyncResult  *res,
-                  guint16       *out_mcc,
-                  guint16       *out_mnc,
-                  gboolean      *out_mnc_with_pcs,
-                  gchar        **out_operator_name,
                   GError       **error)
 {
-    QmiMessageNasGetHomeNetworkOutput *output = NULL;
-    gboolean success = FALSE;
-
-    output = qmi_client_nas_get_home_network_finish (client, res, error);
-    if (!output) {
-        g_prefix_error (error, "QMI operation failed: ");
-    } else if (!qmi_message_nas_get_home_network_output_get_result (output, error)) {
-        g_prefix_error (error, "Couldn't get home network: ");
-    } else {
-        const gchar *name = NULL;
-
-        qmi_message_nas_get_home_network_output_get_home_network (
-            output,
-            out_mcc,
-            out_mnc,
-            &name,
-            NULL);
-        if (out_operator_name)
-            *out_operator_name = g_strdup (name);
-
-        if (out_mnc_with_pcs) {
-            gboolean is_3gpp;
-            gboolean mnc_includes_pcs_digit;
-
-            if (qmi_message_nas_get_home_network_output_get_home_network_3gpp_mnc (
-                    output,
-                    &is_3gpp,
-                    &mnc_includes_pcs_digit,
-                    NULL) &&
-                is_3gpp &&
-                mnc_includes_pcs_digit) {
-                /* MNC should include PCS digit */
-                *out_mnc_with_pcs = TRUE;
-            } else {
-                /* We default to NO PCS digit, unless of course the MNC is already > 99 */
-                *out_mnc_with_pcs = FALSE;
-            }
-        }
-
-        success = TRUE;
-    }
-
-    if (output)
-        qmi_message_nas_get_home_network_output_unref (output);
-
-    return success;
+    return common_load_gid_finish (self, res, error);
 }
+
+static void
+load_gid1 (MMBaseSim           *self,
+           GAsyncReadyCallback  callback,
+           gpointer             user_data)
+{
+    common_load_gid (self, 0x6F3E, callback, user_data);
+}
+
+static GByteArray *
+load_gid2_finish (MMBaseSim     *self,
+                  GAsyncResult  *res,
+                  GError       **error)
+{
+    return common_load_gid_finish (self, res, error);
+}
+
+static void
+load_gid2 (MMBaseSim           *self,
+           GAsyncReadyCallback  callback,
+           gpointer             user_data)
+{
+    common_load_gid (self, 0x6F3F, callback, user_data);
+}
+
+/*****************************************************************************/
+/* Load operator identifier */
 
 static gchar *
 load_operator_identifier_finish (MMBaseSim     *self,
@@ -499,54 +661,70 @@ load_operator_identifier_finish (MMBaseSim     *self,
 }
 
 static void
-load_operator_identifier_ready (QmiClientNas *client,
-                                GAsyncResult *res,
-                                GTask        *task)
+uim_read_efad_ready (QmiClientUim *client,
+                     GAsyncResult *res,
+                     GTask        *task)
 {
-    guint16 mcc, mnc;
-    gboolean mnc_with_pcs;
-    GError *error = NULL;
-    GString *aux;
+    MMSimQmi          *self;
+    GError            *error = NULL;
+    g_autoptr(GArray)  read_result = NULL;
+    guint              mnc_length;
 
-    if (!get_home_network (client, res, &mcc, &mnc, &mnc_with_pcs, NULL, &error)) {
+    self = g_task_get_source_object (task);
+
+    read_result = uim_read_finish (client, res, &error);
+    if (!read_result) {
         g_task_return_error (task, error);
         g_object_unref (task);
         return;
     }
 
-    aux = g_string_new ("");
-    /* MCC always 3 digits */
-    g_string_append_printf (aux, "%.3" G_GUINT16_FORMAT, mcc);
-    /* Guess about MNC, if < 100 assume it's 2 digits, no PCS info here */
-    if (mnc >= 100 || mnc_with_pcs)
-        g_string_append_printf (aux, "%.3" G_GUINT16_FORMAT, mnc);
-    else
-        g_string_append_printf (aux, "%.2" G_GUINT16_FORMAT, mnc);
-    g_task_return_pointer (task, g_string_free (aux, FALSE), g_free);
+    if (read_result->len < 4) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                 "Unexpected response length reading EFad: %u", read_result->len);
+        g_object_unref (task);
+        return;
+    }
+
+    /* MNC length is byte 4 of this SIM file */
+    mnc_length = read_result->data[3];
+    if (mnc_length == 2 || mnc_length == 3) {
+        g_task_return_pointer (task, g_strndup (self->priv->imsi, 3 + mnc_length), g_free);
+    } else {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                 "SIM returned invalid MNC length %d (should be either 2 or 3)", mnc_length);
+    }
     g_object_unref (task);
 }
 
 static void
-load_operator_identifier (MMBaseSim           *self,
+load_operator_identifier (MMBaseSim           *_self,
                           GAsyncReadyCallback  callback,
                           gpointer             user_data)
 {
-    GTask *task;
-    QmiClient *client = NULL;
+    MMSimQmi *self;
+    GTask    *task;
 
+    self = MM_SIM_QMI (_self);
     task = g_task_new (self, NULL, callback, user_data);
-    if (!ensure_qmi_client (task,
-                            MM_SIM_QMI (self),
-                            QMI_SERVICE_NAS, &client))
-        return;
 
     mm_obj_dbg (self, "loading SIM operator identifier...");
-    qmi_client_nas_get_home_network (QMI_CLIENT_NAS (client),
-                                     NULL,
-                                     5,
-                                     NULL,
-                                     (GAsyncReadyCallback)load_operator_identifier_ready,
-                                     task);
+
+    if (!self->priv->imsi) {
+        g_task_return_new_error (task,
+                                 MM_CORE_ERROR,
+                                 MM_CORE_ERROR_FAILED,
+                                 "Couldn't load SIM operator identifier without IMSI");
+        g_object_unref (task);
+        return;
+    }
+
+    uim_read (self,
+              0x6FAD,
+              adf_file_path,
+              G_N_ELEMENTS (adf_file_path),
+              (GAsyncReadyCallback)uim_read_efad_ready,
+              task);
 }
 
 /*****************************************************************************/
@@ -560,27 +738,173 @@ load_operator_name_finish (MMBaseSim     *self,
     return g_task_propagate_pointer (G_TASK (res), error);
 }
 
-static void
-load_operator_name_ready (QmiClientNas *client,
-                          GAsyncResult *res,
-                          GTask        *task)
+static gchar *
+parse_spn (const guint8  *bin,
+           gsize          len,
+           GError       **error)
 {
-    gchar *operator_name = NULL;
-    GError *error = NULL;
+    g_autoptr(GByteArray)  bin_array = NULL;
+    gsize                  binlen;
 
-    if (!get_home_network (client, res, NULL, NULL, NULL, &operator_name, &error))
+    /* Remove the FF filler at the end */
+    binlen = len;
+    while (binlen > 1 && bin[binlen - 1] == 0xff)
+        binlen--;
+    if (binlen <= 1) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "SIM returned empty spn");
+        return NULL;
+    }
+
+    /* Setup as bytearray.
+     * First byte is metadata; remainder is GSM-7 unpacked into octets; convert to UTF8 */
+    bin_array = g_byte_array_sized_new (binlen - 1);
+    g_byte_array_append (bin_array, bin + 1, binlen - 1);
+
+    return mm_modem_charset_bytearray_to_utf8 (bin_array, MM_MODEM_CHARSET_GSM, FALSE, error);
+}
+
+static void
+uim_read_efspn_ready (QmiClientUim *client,
+                      GAsyncResult *res,
+                      GTask        *task)
+{
+    GError            *error = NULL;
+    g_autoptr(GArray)  read_result = NULL;
+    gchar             *spn;
+
+    read_result = uim_read_finish (client, res, &error);
+    if (!read_result) {
         g_task_return_error (task, error);
-    else
-        g_task_return_pointer (task, operator_name, g_free);
+        g_object_unref (task);
+        return;
+    }
+
+    spn = parse_spn ((const guint8 *) read_result->data, read_result->len, &error);
+
+    if (!spn) {
+        g_task_return_error (task, error);
+    } else {
+        g_task_return_pointer (task, spn, g_free);
+    }
+
     g_object_unref (task);
 }
 
 static void
-load_operator_name (MMBaseSim           *self,
+load_operator_name (MMBaseSim           *_self,
                     GAsyncReadyCallback  callback,
                     gpointer             user_data)
 {
-    GTask *task;
+    MMSimQmi *self;
+    GTask    *task;
+
+    self = MM_SIM_QMI (_self);
+    task = g_task_new (self, NULL, callback, user_data);
+
+    mm_obj_dbg (self, "loading SIM operator name...");
+
+    uim_read (self,
+              0x6F46,
+              adf_file_path,
+              G_N_ELEMENTS (adf_file_path),
+              (GAsyncReadyCallback)uim_read_efspn_ready,
+              task);
+}
+
+/*****************************************************************************/
+/* Load preferred networks */
+
+static GList *
+load_preferred_networks_finish (MMBaseSim     *self,
+                                GAsyncResult  *res,
+                                GError       **error)
+{
+    return g_task_propagate_pointer (G_TASK (res), error);
+}
+
+static GList *
+parse_get_preferred_networks (QmiMessageNasGetPreferredNetworksOutput *output)
+{
+    GList  *result = NULL;
+    GArray *preferred_nets_array = NULL;
+    GArray *preferred_nets_mnc_pcs_digit_array = NULL;
+    guint   i;
+
+    if (qmi_message_nas_get_preferred_networks_output_get_preferred_networks (output,
+                                                                              &preferred_nets_array,
+                                                                              NULL)) {
+        qmi_message_nas_get_preferred_networks_output_get_mnc_pcs_digit_include_status (output,
+                                                                                        &preferred_nets_mnc_pcs_digit_array,
+                                                                                        NULL);
+        for (i = 0; i < preferred_nets_array->len; i++) {
+            QmiMessageNasGetPreferredNetworksOutputPreferredNetworksElement        *net;
+            QmiMessageNasGetPreferredNetworksOutputMncPcsDigitIncludeStatusElement *mnc_pcs_digit = NULL;
+            MMSimPreferredNetwork   *new_item;
+            g_autofree gchar        *operator_code = NULL;
+            MMModemAccessTechnology  act = MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN;
+
+            net = &g_array_index (preferred_nets_array,
+                                  QmiMessageNasGetPreferredNetworksOutputPreferredNetworksElement, i);
+            if (preferred_nets_mnc_pcs_digit_array && i < preferred_nets_mnc_pcs_digit_array->len)
+                mnc_pcs_digit = &g_array_index (preferred_nets_mnc_pcs_digit_array,
+                                                QmiMessageNasGetPreferredNetworksOutputMncPcsDigitIncludeStatusElement, i);
+
+            new_item = mm_sim_preferred_network_new ();
+
+            if (net->mnc > 99 || (mnc_pcs_digit != NULL && mnc_pcs_digit->includes_pcs_digit))
+                operator_code = g_strdup_printf ("%03d%03d", net->mcc, net->mnc);
+            else
+                operator_code = g_strdup_printf ("%03d%02d", net->mcc, net->mnc);
+            mm_sim_preferred_network_set_operator_code (new_item, operator_code);
+
+            if (net->radio_access_technology & QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_GSM)
+                act |= MM_MODEM_ACCESS_TECHNOLOGY_GSM;
+            if (net->radio_access_technology & QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_GSM_COMPACT)
+                act |= MM_MODEM_ACCESS_TECHNOLOGY_GSM_COMPACT;
+            if (net->radio_access_technology & QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_UTRAN)
+                act |= MM_MODEM_ACCESS_TECHNOLOGY_UMTS;
+            if (net->radio_access_technology & QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_EUTRAN)
+                act |= MM_MODEM_ACCESS_TECHNOLOGY_LTE;
+            if (net->radio_access_technology & QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_NGRAN)
+                act |= MM_MODEM_ACCESS_TECHNOLOGY_5GNR;
+            mm_sim_preferred_network_set_access_technology (new_item, act);
+
+            result = g_list_append (result, new_item);
+        }
+    }
+
+    return result;
+}
+
+static void
+load_preferred_networks_ready (QmiClientNas *client,
+                               GAsyncResult *res,
+                               GTask        *task)
+{
+    QmiMessageNasGetPreferredNetworksOutput *output;
+    GError *error = NULL;
+
+    output = qmi_client_nas_get_preferred_networks_finish (client, res, &error);
+    if (!output) {
+        g_prefix_error (&error, "QMI operation failed: ");
+        g_task_return_error (task, error);
+    } else if (!qmi_message_nas_get_preferred_networks_output_get_result (output, &error)) {
+        g_prefix_error (&error, "Couldn't get preferred networks: ");
+        g_task_return_error (task, error);
+    } else
+        g_task_return_pointer (task, parse_get_preferred_networks (output), (GDestroyNotify) mm_sim_preferred_network_list_free);
+
+    if (output)
+        qmi_message_nas_get_preferred_networks_output_unref (output);
+    g_object_unref (task);
+}
+
+static void
+load_preferred_networks (MMBaseSim           *self,
+                         GAsyncReadyCallback  callback,
+                         gpointer             user_data)
+{
+    GTask     *task;
     QmiClient *client = NULL;
 
     task = g_task_new (self, NULL, callback, user_data);
@@ -589,13 +913,227 @@ load_operator_name (MMBaseSim           *self,
                             QMI_SERVICE_NAS, &client))
         return;
 
-    mm_obj_dbg (self, "loading SIM operator name...");
-    qmi_client_nas_get_home_network (QMI_CLIENT_NAS (client),
-                                     NULL,
-                                     5,
-                                     NULL,
-                                     (GAsyncReadyCallback)load_operator_name_ready,
-                                     task);
+    mm_obj_dbg (self, "loading preferred network list...");
+    qmi_client_nas_get_preferred_networks (QMI_CLIENT_NAS (client),
+                                           NULL,
+                                           5,
+                                           NULL,
+                                           (GAsyncReadyCallback)load_preferred_networks_ready,
+                                           task);
+}
+
+/*****************************************************************************/
+/* Set preferred networks */
+
+typedef struct {
+    /* Preferred network list to be set, used for after-check comparison */
+    GList    *set_list;
+} SetPreferredNetworksContext;
+
+static void
+set_preferred_network_context_free (SetPreferredNetworksContext *ctx)
+{
+    g_list_free_full (ctx->set_list, (GDestroyNotify) mm_sim_preferred_network_free);
+    g_slice_free (SetPreferredNetworksContext, ctx);
+}
+
+static gboolean
+set_preferred_networks_finish (MMBaseSim *self,
+                               GAsyncResult *res,
+                               GError **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+set_preferred_networks_reload_ready (MMBaseSim    *self,
+                                     GAsyncResult *res,
+                                     GTask        *task)
+{
+    GError                      *error = NULL;
+    GList                       *loaded_list;
+    GList                       *loaded_iter;
+    GList                       *set_iter;
+    SetPreferredNetworksContext *ctx;
+
+    ctx = g_task_get_task_data (task);
+
+    loaded_list = load_preferred_networks_finish (self, res, &error);
+    if (error) {
+        mm_obj_warn (self, "couldn't reload list of preferred networks: %s", error->message);
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    /* Compare the set and loaded network list for differences */
+    loaded_iter = loaded_list;
+    set_iter = ctx->set_list;
+
+    while (loaded_iter && set_iter) {
+        const gchar             *loaded_op_code;
+        const gchar             *set_op_code;
+        MMModemAccessTechnology  loaded_act;
+        MMModemAccessTechnology  set_act;
+
+        loaded_op_code = mm_sim_preferred_network_get_operator_code (loaded_iter->data);
+        set_op_code = mm_sim_preferred_network_get_operator_code (set_iter->data);
+        loaded_act = mm_sim_preferred_network_get_access_technology (loaded_iter->data);
+        set_act = mm_sim_preferred_network_get_access_technology (set_iter->data);
+
+        /* Operator code mismatch is never expected, but check it just in case */
+        if (g_strcmp0 (loaded_op_code, set_op_code)) {
+            mm_obj_warn (self, "operator code mismatch, expected '%s' loaded '%s'",
+                         set_op_code, loaded_op_code);
+            error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                                 "Mismatch in requested and set operator code");
+            break;
+        }
+        /* Check if there are access technology bits requested but unset */
+        if ((loaded_act & set_act) != set_act) {
+            MMModemAccessTechnology unset = set_act & ~loaded_act;
+
+            mm_obj_warn (self, "access technologies '%s' not set for operator code '%s'",
+                         mm_modem_access_technology_build_string_from_mask (unset),
+                         set_op_code);
+            error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                 "Access technology unsupported by modem or SIM");
+            break;
+        }
+        loaded_iter = g_list_next (loaded_iter);
+        set_iter = g_list_next (set_iter);
+    }
+    if (!error && loaded_iter == NULL && set_iter != NULL) {
+        /* Not all networks were written; some modems silently discard networks
+         * that exceed the SIM card capacity.
+         */
+        error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_TOO_MANY,
+                             "Too many networks; %u networks written",
+                             g_list_length (loaded_list));
+    }
+
+    if (error) {
+        /* Update the PreferredNetworks property to real SIM contents */
+        mm_gdbus_sim_set_preferred_networks (MM_GDBUS_SIM (self),
+                                             mm_sim_preferred_network_list_get_variant (loaded_list));
+        g_task_return_error (task, error);
+    } else
+        g_task_return_boolean (task, TRUE);
+
+    g_list_free_full (loaded_list, (GDestroyNotify) mm_sim_preferred_network_free);
+    g_object_unref (task);
+}
+
+static void
+set_preferred_networks_ready (QmiClientNas *client,
+                              GAsyncResult *res,
+                              GTask        *task)
+{
+    QmiMessageNasSetPreferredNetworksOutput *output;
+    GError                                  *error = NULL;
+    MMBaseSim                               *self;
+
+    self = g_task_get_source_object (task);
+
+    output = qmi_client_nas_set_preferred_networks_finish (client, res, &error);
+    if (!output) {
+        g_prefix_error (&error, "QMI operation failed: ");
+        g_task_return_error (task, error);
+    } else if (!qmi_message_nas_set_preferred_networks_output_get_result (output, &error)) {
+        g_prefix_error (&error, "Couldn't set preferred networks: ");
+        g_task_return_error (task, error);
+    } else {
+        /* Reload the networks from modem to check whether everything was written */
+        load_preferred_networks (self, (GAsyncReadyCallback) set_preferred_networks_reload_ready, task);
+        qmi_message_nas_set_preferred_networks_output_unref (output);
+        return;
+    }
+
+    if (output)
+        qmi_message_nas_set_preferred_networks_output_unref (output);
+    g_object_unref (task);
+}
+
+static void
+set_preferred_networks (MMBaseSim *self,
+                        GList *preferred_network_list,
+                        GAsyncReadyCallback callback,
+                        gpointer user_data)
+{
+    GTask                                  *task;
+    QmiMessageNasSetPreferredNetworksInput *input;
+    QmiClient                              *client = NULL;
+    GArray                                 *preferred_nets_array;
+    GArray                                 *preferred_nets_mnc_pcs_digit_array;
+    SetPreferredNetworksContext            *ctx;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    if (!ensure_qmi_client (task,
+                            MM_SIM_QMI (self),
+                            QMI_SERVICE_NAS, &client))
+        return;
+
+    ctx = g_slice_new0 (SetPreferredNetworksContext);
+    ctx->set_list = mm_sim_preferred_network_list_copy (preferred_network_list);
+    g_task_set_task_data (task, ctx, (GDestroyNotify) set_preferred_network_context_free);
+
+    mm_obj_dbg (self, "setting preferred networks...");
+
+    input = qmi_message_nas_set_preferred_networks_input_new ();
+
+    preferred_nets_array = g_array_new (FALSE, TRUE, sizeof (QmiMessageNasSetPreferredNetworksInputPreferredNetworksElement));
+    preferred_nets_mnc_pcs_digit_array = g_array_new (FALSE, TRUE, sizeof (QmiMessageNasSetPreferredNetworksInputMncPcsDigitIncludeStatusElement));
+
+    while (preferred_network_list) {
+        QmiMessageNasSetPreferredNetworksInputPreferredNetworksElement         preferred_nets_element;
+        QmiMessageNasSetPreferredNetworksInputMncPcsDigitIncludeStatusElement  pcs_digit_element;
+        const gchar                                                           *operator_code;
+        MMModemAccessTechnology                                                act;
+
+        memset (&preferred_nets_element, 0, sizeof (preferred_nets_element));
+        memset (&pcs_digit_element, 0, sizeof (pcs_digit_element));
+
+        operator_code = mm_sim_preferred_network_get_operator_code (preferred_network_list->data);
+        act = mm_sim_preferred_network_get_access_technology (preferred_network_list->data);
+        if (mm_3gpp_parse_operator_id (operator_code, &preferred_nets_element.mcc, &preferred_nets_element.mnc,
+                                       &pcs_digit_element.includes_pcs_digit, NULL)) {
+            pcs_digit_element.mcc = preferred_nets_element.mcc;
+            pcs_digit_element.mnc = preferred_nets_element.mnc;
+
+            preferred_nets_element.radio_access_technology = QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_UNSPECIFIED;
+            if (act & MM_MODEM_ACCESS_TECHNOLOGY_GSM)
+                preferred_nets_element.radio_access_technology |= QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_GSM;
+            if (act & MM_MODEM_ACCESS_TECHNOLOGY_GSM_COMPACT)
+                preferred_nets_element.radio_access_technology |= QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_GSM_COMPACT;
+            if (act & MM_MODEM_ACCESS_TECHNOLOGY_UMTS)
+                preferred_nets_element.radio_access_technology |= QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_UTRAN;
+            if (act & MM_MODEM_ACCESS_TECHNOLOGY_LTE)
+                preferred_nets_element.radio_access_technology |= QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_EUTRAN;
+            if (act & MM_MODEM_ACCESS_TECHNOLOGY_5GNR)
+                preferred_nets_element.radio_access_technology |= QMI_NAS_PLMN_ACCESS_TECHNOLOGY_IDENTIFIER_NGRAN;
+
+            g_array_append_val (preferred_nets_array, preferred_nets_element);
+            g_array_append_val (preferred_nets_mnc_pcs_digit_array, pcs_digit_element);
+        }
+
+        preferred_network_list = g_list_next (preferred_network_list);
+    }
+
+    qmi_message_nas_set_preferred_networks_input_set_preferred_networks (input, preferred_nets_array, NULL);
+    qmi_message_nas_set_preferred_networks_input_set_mnc_pcs_digit_include_status (input, preferred_nets_mnc_pcs_digit_array, NULL);
+    /* Always clear any pre-existing networks */
+    qmi_message_nas_set_preferred_networks_input_set_clear_previous_preferred_networks (input, TRUE, NULL);
+
+    qmi_client_nas_set_preferred_networks (QMI_CLIENT_NAS (client),
+                                           input,
+                                           5,
+                                           NULL,
+                                           (GAsyncReadyCallback)set_preferred_networks_ready,
+                                           task);
+
+    qmi_message_nas_set_preferred_networks_input_unref (input);
+    g_array_unref (preferred_nets_array);
+    g_array_unref (preferred_nets_mnc_pcs_digit_array);
 }
 
 /*****************************************************************************/
@@ -1315,8 +1853,42 @@ mm_sim_qmi_new (MMBaseModem         *modem,
                                 user_data,
                                 MM_BASE_SIM_MODEM, modem,
                                 MM_SIM_QMI_DMS_UIM_DEPRECATED, dms_uim_deprecated,
+                                "active", TRUE, /* by default always active */
                                 NULL);
 }
+
+MMBaseSim *
+mm_sim_qmi_new_initialized (MMBaseModem *modem,
+                            gboolean     dms_uim_deprecated,
+                            guint        slot_number,
+                            gboolean     active,
+                            const gchar *sim_identifier,
+                            const gchar *imsi,
+                            const gchar *eid,
+                            const gchar *operator_identifier,
+                            const gchar *operator_name,
+                            const GStrv  emergency_numbers)
+{
+    MMBaseSim *sim;
+
+    sim = MM_BASE_SIM (g_object_new (MM_TYPE_SIM_QMI,
+                                     MM_BASE_SIM_MODEM,             modem,
+                                     MM_SIM_QMI_DMS_UIM_DEPRECATED, dms_uim_deprecated,
+                                     MM_BASE_SIM_SLOT_NUMBER,       slot_number,
+                                     "active",                      active,
+                                     "sim-identifier",              sim_identifier,
+                                     "imsi",                        imsi,
+                                     "eid",                         eid,
+                                     "operator-identifier",         operator_identifier,
+                                     "operator-name",               operator_name,
+                                     "emergency-numbers",           emergency_numbers,
+                                     NULL));
+
+    mm_base_sim_export (sim);
+    return sim;
+}
+
+/*****************************************************************************/
 
 static void
 mm_sim_qmi_init (MMSimQmi *self)
@@ -1364,6 +1936,16 @@ get_property (GObject    *object,
 }
 
 static void
+finalize (GObject *object)
+{
+    MMSimQmi *self = MM_SIM_QMI (object);
+
+    g_free (self->priv->imsi);
+
+    G_OBJECT_CLASS (mm_sim_qmi_parent_class)->finalize (object);
+}
+
+static void
 mm_sim_qmi_class_init (MMSimQmiClass *klass)
 {
     GObjectClass *object_class = G_OBJECT_CLASS (klass);
@@ -1373,7 +1955,10 @@ mm_sim_qmi_class_init (MMSimQmiClass *klass)
 
     object_class->get_property = get_property;
     object_class->set_property = set_property;
+    object_class->finalize = finalize;
 
+    base_sim_class->wait_sim_ready = wait_sim_ready;
+    base_sim_class->wait_sim_ready_finish = wait_sim_ready_finish;
     base_sim_class->load_sim_identifier = load_sim_identifier;
     base_sim_class->load_sim_identifier_finish = load_sim_identifier_finish;
     base_sim_class->load_imsi = load_imsi;
@@ -1382,6 +1967,14 @@ mm_sim_qmi_class_init (MMSimQmiClass *klass)
     base_sim_class->load_operator_identifier_finish = load_operator_identifier_finish;
     base_sim_class->load_operator_name = load_operator_name;
     base_sim_class->load_operator_name_finish = load_operator_name_finish;
+    base_sim_class->load_gid1 = load_gid1;
+    base_sim_class->load_gid1_finish = load_gid1_finish;
+    base_sim_class->load_gid2 = load_gid2;
+    base_sim_class->load_gid2_finish = load_gid2_finish;
+    base_sim_class->load_preferred_networks = load_preferred_networks;
+    base_sim_class->load_preferred_networks_finish = load_preferred_networks_finish;
+    base_sim_class->set_preferred_networks = set_preferred_networks;
+    base_sim_class->set_preferred_networks_finish = set_preferred_networks_finish;
     base_sim_class->send_pin = send_pin;
     base_sim_class->send_pin_finish = send_pin_finish;
     base_sim_class->send_puk = send_puk;

@@ -11,8 +11,10 @@
  * GNU General Public License for more details:
  *
  * Copyright (C) 2011 Google, Inc.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc.
  */
 
+#include <config.h>
 
 #include <ModemManager.h>
 #define _LIBMM_INSIDE_MM
@@ -26,8 +28,17 @@
 #include "mm-base-modem-at.h"
 #include "mm-base-sim.h"
 #include "mm-bearer-list.h"
+#include "mm-private-boxed-types.h"
 #include "mm-log-object.h"
+#include "mm-log-helpers.h"
 #include "mm-context.h"
+#include "mm-dispatcher-fcc-unlock.h"
+#if defined WITH_QMI
+# include "mm-broadband-modem-qmi.h"
+#endif
+#if defined WITH_MBIM
+# include "mm-broadband-modem-mbim.h"
+#endif
 
 #define SIGNAL_QUALITY_RECENT_TIMEOUT_SEC 60
 
@@ -35,15 +46,240 @@
 #define SIGNAL_CHECK_INITIAL_TIMEOUT_SEC  3
 #define SIGNAL_CHECK_TIMEOUT_SEC          30
 
-#define STATE_UPDATE_CONTEXT_TAG          "state-update-context-tag"
-#define SIGNAL_QUALITY_UPDATE_CONTEXT_TAG "signal-quality-update-context-tag"
-#define SIGNAL_CHECK_CONTEXT_TAG          "signal-check-context-tag"
-#define RESTART_INITIALIZE_IDLE_TAG       "restart-initialize-tag"
+/*****************************************************************************/
+/* Private data context */
 
-static GQuark state_update_context_quark;
-static GQuark signal_quality_update_context_quark;
-static GQuark signal_check_context_quark;
-static GQuark restart_initialize_idle_quark;
+#define PRIVATE_TAG "modem-private-tag"
+static GQuark private_quark;
+
+typedef struct {
+    /* Subsystem specific states */
+    GArray *subsystem_states;
+
+    /* Signal quality recent flag handling */
+    guint signal_quality_recent_timeout_source;
+
+    /* If both signal and access tech polling are either unsupported
+     * or disabled, we'll automatically stop polling */
+    gboolean signal_quality_polling_supported;
+    gboolean signal_quality_polling_disabled;
+    gboolean access_technology_polling_supported;
+    gboolean access_technology_polling_disabled;
+
+    /* Signal quality and access tech polling support */
+    gboolean signal_check_enabled;
+    guint    signal_check_timeout_source;
+    guint    signal_check_initial_retries;
+    gboolean signal_check_initial_done;
+    gboolean signal_check_running;
+
+    /* Initialization restart support */
+    guint restart_initialize_idle_id;
+
+    /* SIM hot swap setup done flag */
+    gboolean sim_hot_swap_configured;
+} Private;
+
+static void
+private_free (Private *priv)
+{
+    if (priv->subsystem_states)
+        g_array_unref (priv->subsystem_states);
+    if (priv->signal_quality_recent_timeout_source)
+        g_source_remove (priv->signal_quality_recent_timeout_source);
+    if (priv->signal_check_timeout_source)
+        g_source_remove (priv->signal_check_timeout_source);
+    if (priv->restart_initialize_idle_id)
+        g_source_remove (priv->restart_initialize_idle_id);
+    g_slice_free (Private, priv);
+}
+
+static Private *
+get_private (MMIfaceModem *self)
+{
+    Private *priv;
+
+    if (G_UNLIKELY (!private_quark))
+        private_quark = g_quark_from_static_string (PRIVATE_TAG);
+
+    priv = g_object_get_qdata (G_OBJECT (self), private_quark);
+    if (!priv) {
+        priv = g_slice_new0 (Private);
+
+        /* Initially assume supported if load_access_technologies() is
+         * implemented. If the plugin reports an UNSUPPORTED error we'll clear
+         * this flag and no longer poll. */
+        priv->access_technology_polling_supported = (MM_IFACE_MODEM_GET_INTERFACE (self)->load_access_technologies &&
+                                                     MM_IFACE_MODEM_GET_INTERFACE (self)->load_access_technologies_finish);
+
+        /* Initially assume supported if load_signal_quality() is
+         * implemented. If the plugin reports an UNSUPPORTED error we'll clear
+         * this flag and no longer poll. */
+        priv->signal_quality_polling_supported = (MM_IFACE_MODEM_GET_INTERFACE (self)->load_signal_quality &&
+                                                  MM_IFACE_MODEM_GET_INTERFACE (self)->load_signal_quality_finish);
+
+        /* Get plugin-specific setup for the polling logic */
+        g_object_get (self,
+                      MM_IFACE_MODEM_PERIODIC_SIGNAL_CHECK_DISABLED,      &priv->signal_quality_polling_disabled,
+                      MM_IFACE_MODEM_PERIODIC_ACCESS_TECH_CHECK_DISABLED, &priv->access_technology_polling_disabled,
+                      NULL);
+
+        g_object_set_qdata_full (G_OBJECT (self), private_quark, priv, (GDestroyNotify)private_free);
+    }
+
+    return priv;
+}
+
+/*****************************************************************************/
+
+gboolean
+mm_iface_modem_check_for_sim_swap_finish (MMIfaceModem *self,
+                                          GAsyncResult *res,
+                                          GError **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+explicit_check_for_sim_swap_ready (MMIfaceModem *self,
+                                   GAsyncResult *res,
+                                   GTask *task)
+{
+    GError *error = NULL;
+
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap_finish (self, res, &error)) {
+        mm_obj_warn (self, "SIM swap check failed: %s", error->message);
+        g_task_return_error (task, error);
+    } else {
+        mm_obj_dbg (self, "SIM swap check completed");
+        g_task_return_boolean (task, TRUE);
+    }
+    g_object_unref (task);
+}
+
+void
+mm_iface_modem_check_for_sim_swap (MMIfaceModem *self,
+                                   const gchar *iccid,
+                                   const gchar *imsi,
+                                   GAsyncReadyCallback callback,
+                                   gpointer user_data)
+{
+    GTask *task;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap ||
+        !MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap_finish) {
+        mm_obj_info (self, "checking for SIM swap ignored: not implemented");
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+    }
+
+    mm_obj_info (self, "started checking for SIM swap...");
+    MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap (
+        self,
+        iccid,
+        imsi,
+        (GAsyncReadyCallback)explicit_check_for_sim_swap_ready,
+        task);
+}
+
+/*****************************************************************************/
+
+static void
+sim_slot_free (MMBaseSim *sim)
+{
+    if (sim)
+        g_object_unref (sim);
+}
+
+void
+mm_iface_modem_modify_sim (MMIfaceModem  *self,
+                           guint          slot_index,
+                           MMBaseSim     *new_sim)
+{
+    g_autoptr(MmGdbusModemSkeleton)  skeleton = NULL;
+    g_autoptr(GPtrArray)             sim_slots_old = NULL;
+    g_autoptr(GPtrArray)             sim_slots_new = NULL;
+    guint                            i;
+    GPtrArray                       *sim_slot_paths_array;
+    g_auto(GStrv)                    sim_slot_paths = NULL;
+
+    g_object_get (self,
+                  MM_IFACE_MODEM_SIM_SLOTS,     &sim_slots_old,
+                  MM_IFACE_MODEM_DBUS_SKELETON, &skeleton,
+                  NULL);
+
+    if (!sim_slots_old) {
+        mm_obj_warn (self, "failed to process SIM hot swap: couldn't load current list of SIM slots");
+        return;
+    }
+
+    if (!skeleton)
+        return;
+
+    sim_slot_paths_array = g_ptr_array_new ();
+    sim_slots_new        = g_ptr_array_new_with_free_func ((GDestroyNotify) sim_slot_free);
+    for (i = 0; i < sim_slots_old->len; i++) {
+        MMBaseSim   *sim;
+        const gchar *sim_path = NULL;
+
+        if (i == slot_index)
+            sim = new_sim;
+        else
+            sim = MM_BASE_SIM (g_ptr_array_index (sim_slots_old, i));
+
+        if (sim) {
+            g_ptr_array_add (sim_slots_new, g_object_ref (sim));
+            sim_path = mm_base_sim_get_path (sim);
+        } else
+            g_ptr_array_add (sim_slots_new, NULL);
+
+        if (sim_path)
+            g_ptr_array_add (sim_slot_paths_array, g_strdup (sim_path));
+        else
+            g_ptr_array_add (sim_slot_paths_array, g_strdup ("/"));
+    }
+    g_ptr_array_add (sim_slot_paths_array, NULL);
+    sim_slot_paths = (GStrv) g_ptr_array_free (sim_slot_paths_array, FALSE);
+
+    g_object_set (self,
+                  MM_IFACE_MODEM_SIM_SLOTS,
+                  sim_slots_new,
+                  NULL);
+    mm_gdbus_modem_set_sim_slots (MM_GDBUS_MODEM (skeleton), (const gchar *const *) sim_slot_paths);
+}
+
+/*****************************************************************************/
+
+static void
+after_sim_event_disable_ready (MMBaseModem  *self,
+                               GAsyncResult *res)
+{
+    g_autoptr(GError) error = NULL;
+
+    mm_base_modem_disable_finish (self, res, &error);
+    if (error)
+        mm_obj_err (self, "failed to disable after SIM switch event: %s", error->message);
+
+    /* set invalid either way, so that it's reprobed */
+    mm_base_modem_set_valid (self, FALSE);
+}
+
+void
+mm_iface_modem_process_sim_event (MMIfaceModem *self)
+{
+    mm_obj_info (self, "Processing SIM event");
+
+    if (MM_IFACE_MODEM_GET_INTERFACE (self)->cleanup_sim_hot_swap)
+        MM_IFACE_MODEM_GET_INTERFACE (self)->cleanup_sim_hot_swap (self);
+
+    mm_base_modem_set_reprobe (MM_BASE_MODEM (self), TRUE);
+    mm_base_modem_disable (MM_BASE_MODEM (self),
+                           (GAsyncReadyCallback) after_sim_event_disable_ready,
+                           NULL);
+}
 
 /*****************************************************************************/
 
@@ -110,7 +346,9 @@ wait_for_final_state_context_complete (GTask *task,
      * 'task' in order to prevent state_changed from being invoked, which
      * invokes wait_for_final_state_context_complete again. */
     if (ctx->state_changed_id) {
-        g_signal_handler_disconnect (self, ctx->state_changed_id);
+        /* may be automatically disconnected during dispose */
+        if (g_signal_handler_is_connected (self, ctx->state_changed_id))
+            g_signal_handler_disconnect (self, ctx->state_changed_id);
         ctx->state_changed_id = 0;
     }
 
@@ -141,6 +379,9 @@ mm_iface_modem_wait_for_final_state_finish (MMIfaceModem *self,
         g_propagate_error (error, inner_error);
         return MM_MODEM_STATE_UNKNOWN;
     }
+    if (value == MM_MODEM_STATE_UNKNOWN)
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                     "Unknown modem state");
     return (MMModemState)value;
 }
 
@@ -168,6 +409,10 @@ state_changed (MMIfaceModem *self,
                   MM_IFACE_MODEM_STATE, &state,
                   NULL);
 
+    /* Ignore unknown state explicitly during a wait operation */
+    if (state == MM_MODEM_STATE_UNKNOWN)
+        return;
+
     /* Are we in a final state already? */
     if (MODEM_STATE_IS_INTERMEDIATE (state))
         return;
@@ -177,7 +422,6 @@ state_changed (MMIfaceModem *self,
     /* If we want a specific final state and this is not the one we were
      * looking for, then skip */
     if (ctx->final_state != MM_MODEM_STATE_UNKNOWN &&
-        state != MM_MODEM_STATE_UNKNOWN &&
         state != ctx->final_state)
         return;
 
@@ -231,14 +475,11 @@ mm_iface_modem_wait_for_final_state (MMIfaceModem *self,
 }
 
 /*****************************************************************************/
-/* Helper to return an error when the modem is in failed state and so it
- * cannot process a given method invocation
- */
 
-static gboolean
-abort_invocation_if_state_not_reached (MMIfaceModem          *self,
-                                       GDBusMethodInvocation *invocation,
-                                       MMModemState           minimum_required)
+gboolean
+mm_iface_modem_abort_invocation_if_state_not_reached (MMIfaceModem          *self,
+                                                      GDBusMethodInvocation *invocation,
+                                                      MMModemState           minimum_required)
 {
     MMModemState state = MM_MODEM_STATE_UNKNOWN;
 
@@ -260,20 +501,30 @@ abort_invocation_if_state_not_reached (MMIfaceModem          *self,
 /*****************************************************************************/
 /* Helper method to load unlock required, considering retries */
 
-#define MAX_RETRIES 6
+/* If a SIM is known to exist, for e.g. if it was created during load_sim_slots,
+ * persist a few more times before giving up on the SIM to be ready. There
+ * are modems on which the SIM takes more than 15s to be ready, luckily,
+ * they happen to be QMI modems where the SIM's iccid in load_sim_slots
+ * lets us know that there is a sim */
+#define MAX_UNLOCK_REQUIRED_RETRIES_NO_SIM     7
+#define MAX_UNLOCK_REQUIRED_RETRIES_SIM_EXISTS 30
+
+/* Time between retries */
+#define UNLOAD_REQUIRED_RETRY_TIMEOUT_SECS 2
 
 typedef struct {
     guint retries;
-    guint pin_check_timeout_id;
+    guint max_retries;
+    guint timeout_id;
 } InternalLoadUnlockRequiredContext;
 
 static MMModemLock
-internal_load_unlock_required_finish (MMIfaceModem *self,
-                                      GAsyncResult *res,
-                                      GError **error)
+internal_load_unlock_required_finish (MMIfaceModem  *self,
+                                      GAsyncResult  *res,
+                                      GError       **error)
 {
     GError *inner_error = NULL;
-    gssize value;
+    gssize  value;
 
     value = g_task_propagate_int (G_TASK (res), &inner_error);
     if (inner_error) {
@@ -291,7 +542,7 @@ load_unlock_required_again (GTask *task)
     InternalLoadUnlockRequiredContext *ctx;
 
     ctx = g_task_get_task_data (task);
-    ctx->pin_check_timeout_id = 0;
+    ctx->timeout_id = 0;
     /* Retry the step */
     internal_load_unlock_required_context_step (task);
     return G_SOURCE_REMOVE;
@@ -300,11 +551,11 @@ load_unlock_required_again (GTask *task)
 static void
 load_unlock_required_ready (MMIfaceModem *self,
                             GAsyncResult *res,
-                            GTask *task)
+                            GTask        *task)
 {
     InternalLoadUnlockRequiredContext *ctx;
-    GError *error = NULL;
-    MMModemLock lock;
+    g_autoptr(GError)                  error = NULL;
+    MMModemLock                        lock;
 
     ctx = g_task_get_task_data (task);
 
@@ -326,31 +577,39 @@ load_unlock_required_ready (MMIfaceModem *self,
             g_error_matches (error,
                              MM_MOBILE_EQUIPMENT_ERROR,
                              MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG)) {
-            g_task_return_error (task, error);
+            g_task_return_error (task, g_steal_pointer (&error));
             g_object_unref (task);
             return;
         }
 
-        /* For the remaining ones, retry if possible */
-        if (ctx->retries < MAX_RETRIES) {
-            ctx->retries++;
-            mm_obj_dbg (self, "retrying (%u) unlock required check", ctx->retries);
+        /* If the error indicates that retry logic needs to be reset... reset the retry count to 0 */
+        if (g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_RESET_AND_RETRY)) {
+            ctx->retries = 0;
+            mm_obj_info (self, "restarting unlock required check");
+        }
 
-            g_assert (ctx->pin_check_timeout_id == 0);
-            ctx->pin_check_timeout_id = g_timeout_add_seconds (2,
-                                                               (GSourceFunc)load_unlock_required_again,
-                                                               task);
-            g_error_free (error);
+        /* For the remaining ones, retry if possible */
+        if (ctx->retries < ctx->max_retries) {
+            ctx->retries++;
+            /* Rate limit how often we log with INFO level */
+            if (ctx->retries % 5)
+                mm_obj_dbg (self, "retrying (%u/%u) unlock required check", ctx->retries, ctx->max_retries);
+            else
+                mm_obj_info (self, "retrying (%u/%u) unlock required check", ctx->retries, ctx->max_retries);
+
+            g_assert (ctx->timeout_id == 0);
+            ctx->timeout_id = g_timeout_add_seconds (UNLOAD_REQUIRED_RETRY_TIMEOUT_SECS,
+                                                     (GSourceFunc)load_unlock_required_again,
+                                                     task);
             return;
         }
 
         /* If reached max retries and still reporting error... default to SIM error */
-        g_error_free (error);
         g_task_return_new_error (task,
                                  MM_MOBILE_EQUIPMENT_ERROR,
                                  MM_MOBILE_EQUIPMENT_ERROR_SIM_FAILURE,
                                  "Couldn't get SIM lock status after %u retries",
-                                 MAX_RETRIES);
+                                 ctx->retries);
         g_object_unref (task);
         return;
     }
@@ -363,29 +622,42 @@ load_unlock_required_ready (MMIfaceModem *self,
 static void
 internal_load_unlock_required_context_step (GTask *task)
 {
-    MMIfaceModem *self;
+    MMIfaceModem                      *self;
     InternalLoadUnlockRequiredContext *ctx;
 
     self = g_task_get_source_object (task);
     ctx = g_task_get_task_data (task);
 
-    g_assert (ctx->pin_check_timeout_id == 0);
+    g_assert (ctx->timeout_id == 0);
     MM_IFACE_MODEM_GET_INTERFACE (self)->load_unlock_required (
         self,
-        (ctx->retries == MAX_RETRIES), /* last_attempt? */
-        (GAsyncReadyCallback)load_unlock_required_ready,
+        (ctx->retries >= ctx->max_retries), /* last_attempt? */
+        (GAsyncReadyCallback) load_unlock_required_ready,
         task);
 }
 
+static guint
+load_unlock_required_max_retries (MMIfaceModem *self)
+{
+    g_autoptr(MMBaseSim) sim = NULL;
+
+    g_object_get (self,
+                  MM_IFACE_MODEM_SIM, &sim,
+                  NULL);
+
+    return (sim ? MAX_UNLOCK_REQUIRED_RETRIES_SIM_EXISTS : MAX_UNLOCK_REQUIRED_RETRIES_NO_SIM);
+}
+
 static void
-internal_load_unlock_required (MMIfaceModem *self,
-                               GAsyncReadyCallback callback,
-                               gpointer user_data)
+internal_load_unlock_required (MMIfaceModem        *self,
+                               GAsyncReadyCallback  callback,
+                               gpointer             user_data)
 {
     InternalLoadUnlockRequiredContext *ctx;
-    GTask *task;
+    GTask                             *task;
 
     ctx = g_new0 (InternalLoadUnlockRequiredContext, 1);
+    ctx->max_retries = load_unlock_required_max_retries (self);
 
     task = g_task_new (self, NULL, callback, user_data);
     g_task_set_task_data (task, ctx, g_free);
@@ -588,17 +860,6 @@ mm_iface_modem_create_bearer (MMIfaceModem *self,
         return;
     }
 
-    if (mm_bearer_list_get_count (ctx->list) == mm_bearer_list_get_max (ctx->list)) {
-        g_task_return_new_error (
-            task,
-            MM_CORE_ERROR,
-            MM_CORE_ERROR_TOO_MANY,
-            "Cannot add new bearer: already reached maximum (%u)",
-            mm_bearer_list_get_count (ctx->list));
-        g_object_unref (task);
-        return;
-    }
-
     MM_IFACE_MODEM_GET_INTERFACE (self)->create_bearer (
         self,
         properties,
@@ -606,11 +867,13 @@ mm_iface_modem_create_bearer (MMIfaceModem *self,
         task);
 }
 
+/*****************************************************************************/
+
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    GVariant *dictionary;
+    MMIfaceModem          *self;
+    GVariant              *dictionary;
 } HandleCreateBearerContext;
 
 static void
@@ -620,37 +883,36 @@ handle_create_bearer_context_free (HandleCreateBearerContext *ctx)
     g_object_unref (ctx->skeleton);
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
-    g_free (ctx);
+    g_slice_free (HandleCreateBearerContext, ctx);
 }
 
 static void
-handle_create_bearer_ready (MMIfaceModem *self,
-                            GAsyncResult *res,
+handle_create_bearer_ready (MMIfaceModem              *self,
+                            GAsyncResult              *res,
                             HandleCreateBearerContext *ctx)
 {
-    MMBaseBearer *bearer;
-    GError *error = NULL;
+    g_autoptr(MMBaseBearer)  bearer = NULL;
+    GError                  *error = NULL;
 
     bearer = mm_iface_modem_create_bearer_finish (self, res, &error);
-    if (!bearer)
+    if (!bearer) {
+        mm_obj_warn (self, "failed creating bearer: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else {
-        mm_gdbus_modem_complete_create_bearer (ctx->skeleton,
-                                               ctx->invocation,
-                                               mm_base_bearer_get_path (bearer));
-        g_object_unref (bearer);
+    } else {
+        mm_obj_info (self, "created bearer: %s", mm_base_bearer_get_path (bearer));
+        mm_gdbus_modem_complete_create_bearer (ctx->skeleton, ctx->invocation, mm_base_bearer_get_path (bearer));
     }
 
     handle_create_bearer_context_free (ctx);
 }
 
 static void
-handle_create_bearer_auth_ready (MMBaseModem *self,
-                                 GAsyncResult *res,
+handle_create_bearer_auth_ready (MMBaseModem               *self,
+                                 GAsyncResult              *res,
                                  HandleCreateBearerContext *ctx)
 {
-    MMBearerProperties *properties;
-    GError *error = NULL;
+    g_autoptr(MMBearerProperties)  properties = NULL;
+    GError                        *error = NULL;
 
     if (!mm_base_modem_authorize_finish (self, res, &error)) {
         g_dbus_method_invocation_take_error (ctx->invocation, error);
@@ -658,7 +920,7 @@ handle_create_bearer_auth_ready (MMBaseModem *self,
         return;
     }
 
-    if (abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_LOCKED)) {
+    if (mm_iface_modem_abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_LOCKED)) {
         handle_create_bearer_context_free (ctx);
         return;
     }
@@ -670,23 +932,25 @@ handle_create_bearer_auth_ready (MMBaseModem *self,
         return;
     }
 
+    mm_obj_info (self, "processing user request to create bearer...");
+    mm_log_bearer_properties (self, MM_LOG_LEVEL_INFO, "  ", properties);
+
     mm_iface_modem_create_bearer (
         ctx->self,
         properties,
         (GAsyncReadyCallback)handle_create_bearer_ready,
         ctx);
-    g_object_unref (properties);
 }
 
 static gboolean
-handle_create_bearer (MmGdbusModem *skeleton,
+handle_create_bearer (MmGdbusModem          *skeleton,
                       GDBusMethodInvocation *invocation,
-                      GVariant *dictionary,
-                      MMIfaceModem *self)
+                      GVariant              *dictionary,
+                      MMIfaceModem          *self)
 {
     HandleCreateBearerContext *ctx;
 
-    ctx = g_new (HandleCreateBearerContext, 1);
+    ctx = g_slice_new0 (HandleCreateBearerContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -703,11 +967,11 @@ handle_create_bearer (MmGdbusModem *skeleton,
 /*****************************************************************************/
 
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    gchar *cmd;
-    guint timeout;
+    MMIfaceModem          *self;
+    gchar                 *cmd;
+    guint                  timeout;
 } HandleCommandContext;
 
 static void
@@ -717,31 +981,32 @@ handle_command_context_free (HandleCommandContext *ctx)
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
     g_free (ctx->cmd);
-    g_free (ctx);
+    g_slice_free (HandleCommandContext, ctx);
 }
 
 static void
-command_ready (MMIfaceModem *self,
-               GAsyncResult *res,
+command_ready (MMIfaceModem         *self,
+               GAsyncResult         *res,
                HandleCommandContext *ctx)
 {
-    GError *error = NULL;
+    GError      *error = NULL;
     const gchar *result;
 
-    result = MM_IFACE_MODEM_GET_INTERFACE (self)->command_finish (self,
-                                                                  res,
-                                                                  &error);
-    if (error)
+    result = MM_IFACE_MODEM_GET_INTERFACE (self)->command_finish (self, res, &error);
+    if (error) {
+        mm_obj_dbg (self, "failed running AT command '%s': %s", ctx->cmd, error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else
+    } else {
+        mm_obj_dbg (self, "AT command '%s' run: %s", ctx->cmd, result);
         mm_gdbus_modem_complete_command (ctx->skeleton, ctx->invocation, result);
+    }
 
     handle_command_context_free (ctx);
 }
 
 static void
-handle_command_auth_ready (MMBaseModem *self,
-                           GAsyncResult *res,
+handle_command_auth_ready (MMBaseModem          *self,
+                           GAsyncResult         *res,
                            HandleCommandContext *ctx)
 {
     GError *error = NULL;
@@ -755,28 +1020,22 @@ handle_command_auth_ready (MMBaseModem *self,
 #if ! defined WITH_AT_COMMAND_VIA_DBUS
     /* If we are not in Debug mode, report an error */
     if (!mm_context_get_debug ()) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_UNAUTHORIZED,
-                                               "Cannot send AT command to modem: "
-                                               "operation only allowed in debug mode");
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNAUTHORIZED,
+                                               "Operation only allowed in debug mode");
         handle_command_context_free (ctx);
         return;
     }
 #endif
 
     /* If command is not implemented, report an error */
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->command ||
-        !MM_IFACE_MODEM_GET_INTERFACE (self)->command_finish) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_UNSUPPORTED,
-                                               "Cannot send AT command to modem: "
-                                               "operation not supported");
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->command || !MM_IFACE_MODEM_GET_INTERFACE (self)->command_finish) {
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                               "Operation not supported");
         handle_command_context_free (ctx);
         return;
     }
 
+    mm_obj_dbg (self, "processing user request to run AT command '%s'...", ctx->cmd);
     MM_IFACE_MODEM_GET_INTERFACE (self)->command (ctx->self,
                                                   ctx->cmd,
                                                   ctx->timeout,
@@ -785,15 +1044,15 @@ handle_command_auth_ready (MMBaseModem *self,
 }
 
 static gboolean
-handle_command (MmGdbusModem *skeleton,
+handle_command (MmGdbusModem          *skeleton,
                 GDBusMethodInvocation *invocation,
-                const gchar *cmd,
-                guint timeout,
-                MMIfaceModem *self)
+                const gchar           *cmd,
+                guint                  timeout,
+                MMIfaceModem          *self)
 {
     HandleCommandContext *ctx;
 
-    ctx = g_new (HandleCommandContext, 1);
+    ctx = g_slice_new0 (HandleCommandContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -811,51 +1070,53 @@ handle_command (MmGdbusModem *skeleton,
 /*****************************************************************************/
 
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    MMBearerList *list;
-    gchar *bearer_path;
-    MMBaseBearer *bearer;
+    MMIfaceModem          *self;
+    MMBearerList          *list;
+    gchar                 *bearer_path;
+    MMBaseBearer          *bearer;
 } HandleDeleteBearerContext;
 
 static void
 handle_delete_bearer_context_free (HandleDeleteBearerContext *ctx)
 {
-    if (ctx->bearer)
-        g_object_unref (ctx->bearer);
     g_object_unref (ctx->skeleton);
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
-    if (ctx->list)
-        g_object_unref (ctx->list);
+    g_clear_object (&ctx->bearer);
+    g_clear_object (&ctx->list);
     g_free (ctx->bearer_path);
-    g_free (ctx);
+    g_slice_free (HandleDeleteBearerContext, ctx);
 }
 
 static void
-delete_bearer_disconnect_ready (MMBaseBearer *bearer,
-                                GAsyncResult *res,
+delete_bearer_disconnect_ready (MMBaseBearer              *bearer,
+                                GAsyncResult              *res,
                                 HandleDeleteBearerContext *ctx)
 {
     GError *error = NULL;
 
     if (!mm_base_bearer_disconnect_finish (bearer, res, &error)) {
+        mm_obj_warn (ctx->self, "failed disconnecting bearer '%s' before deleting: %s", ctx->bearer_path, error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
         handle_delete_bearer_context_free (ctx);
         return;
     }
 
-    if (!mm_bearer_list_delete_bearer (ctx->list, ctx->bearer_path, &error))
+    if (!mm_bearer_list_delete_bearer (ctx->list, ctx->bearer_path, &error)) {
+        mm_obj_warn (ctx->self, "failed deleting bearer '%s': %s", ctx->bearer_path, error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else
+    } else {
+        mm_obj_info (ctx->self, "deleted bearer '%s'", ctx->bearer_path);
         mm_gdbus_modem_complete_delete_bearer (ctx->skeleton, ctx->invocation);
+    }
     handle_delete_bearer_context_free (ctx);
 }
 
 static void
-handle_delete_bearer_auth_ready (MMBaseModem *self,
-                                 GAsyncResult *res,
+handle_delete_bearer_auth_ready (MMBaseModem               *self,
+                                 GAsyncResult              *res,
                                  HandleDeleteBearerContext *ctx)
 {
     GError *error = NULL;
@@ -866,46 +1127,41 @@ handle_delete_bearer_auth_ready (MMBaseModem *self,
         return;
     }
 
-    if (abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_LOCKED)) {
+    if (mm_iface_modem_abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_LOCKED)) {
         handle_delete_bearer_context_free (ctx);
         return;
     }
 
     if (!g_str_has_prefix (ctx->bearer_path, MM_DBUS_BEARER_PREFIX)) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_INVALID_ARGS,
-                                               "Cannot delete bearer: invalid path '%s'",
-                                               ctx->bearer_path);
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
+                                               "Invalid path '%s'", ctx->bearer_path);
         handle_delete_bearer_context_free (ctx);
         return;
     }
 
     ctx->bearer = mm_bearer_list_find_by_path (ctx->list, ctx->bearer_path);
     if (!ctx->bearer) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_INVALID_ARGS,
-                                               "Cannot delete bearer: no bearer found with path '%s'",
-                                               ctx->bearer_path);
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
+                                               "No bearer found with path '%s'", ctx->bearer_path);
         handle_delete_bearer_context_free (ctx);
         return;
     }
 
+    mm_obj_info (self, "processing user request to delete bearer '%s'...", ctx->bearer_path);
     mm_base_bearer_disconnect (ctx->bearer,
                                (GAsyncReadyCallback)delete_bearer_disconnect_ready,
                                ctx);
 }
 
 static gboolean
-handle_delete_bearer (MmGdbusModem *skeleton,
+handle_delete_bearer (MmGdbusModem          *skeleton,
                       GDBusMethodInvocation *invocation,
-                      const gchar *bearer,
-                      MMIfaceModem *self)
+                      const gchar           *bearer,
+                      MMIfaceModem          *self)
 {
     HandleDeleteBearerContext *ctx;
 
-    ctx = g_new (HandleDeleteBearerContext, 1);
+    ctx = g_slice_new0 (HandleDeleteBearerContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -925,35 +1181,265 @@ handle_delete_bearer (MmGdbusModem *skeleton,
 /*****************************************************************************/
 
 static gboolean
-handle_list_bearers (MmGdbusModem *skeleton,
+handle_list_bearers (MmGdbusModem          *skeleton,
                      GDBusMethodInvocation *invocation,
-                     MMIfaceModem *self)
+                     MMIfaceModem          *self)
 {
-    GStrv paths;
-    MMBearerList *list = NULL;
+    g_auto(GStrv)           paths = NULL;
+    g_autoptr(MMBearerList) list = NULL;
 
-    if (abort_invocation_if_state_not_reached (self, invocation, MM_MODEM_STATE_LOCKED))
+    if (mm_iface_modem_abort_invocation_if_state_not_reached (self, invocation, MM_MODEM_STATE_LOCKED))
         return TRUE;
 
     g_object_get (self,
                   MM_IFACE_MODEM_BEARER_LIST, &list,
                   NULL);
     if (!list) {
-        g_dbus_method_invocation_return_error (invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_FAILED,
+        g_dbus_method_invocation_return_error (invocation, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
                                                "Bearer list not found");
         return TRUE;
     }
 
     paths = mm_bearer_list_get_paths (list);
-    mm_gdbus_modem_complete_list_bearers (skeleton,
-                                          invocation,
-                                          (const gchar *const *)paths);
-
-    g_strfreev (paths);
-    g_object_unref (list);
+    mm_gdbus_modem_complete_list_bearers (skeleton, invocation, (const gchar *const *)paths);
     return TRUE;
+}
+
+/*****************************************************************************/
+
+typedef struct {
+    MmGdbusModem          *skeleton;
+    GDBusMethodInvocation *invocation;
+    MMIfaceModem          *self;
+    guint                  requested_sim_slot;
+} HandleSetPrimarySimSlotContext;
+
+static void
+handle_set_primary_sim_slot_context_free (HandleSetPrimarySimSlotContext *ctx)
+{
+    g_clear_object (&ctx->skeleton);
+    g_clear_object (&ctx->invocation);
+    g_clear_object (&ctx->self);
+    g_slice_free (HandleSetPrimarySimSlotContext, ctx);
+}
+
+static void
+set_primary_sim_slot_ready (MMIfaceModem                   *self,
+                            GAsyncResult                   *res,
+                            HandleSetPrimarySimSlotContext *ctx)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->set_primary_sim_slot_finish (self, res, &error)) {
+        /* If the implementation returns EXISTS, we're already in the requested SIM slot,
+         * so we can safely return a success on the operation and skip the reprobing */
+        if (!g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_EXISTS)) {
+            mm_obj_warn (self, "failed setting primary SIM slot '%u': %s", ctx->requested_sim_slot, error->message);
+            g_dbus_method_invocation_take_error (ctx->invocation, g_steal_pointer (&error));
+            handle_set_primary_sim_slot_context_free (ctx);
+            return;
+        }
+        mm_obj_dbg (self, "ignored request to set primary SIM slot '%u': already set", ctx->requested_sim_slot);
+    } else {
+        /* Notify about the SIM swap, which will disable and reprobe the device.
+         * There is no need to update the PrimarySimSlot property, as this value will be
+         * reloaded automatically during the reprobe. */
+        mm_obj_info (self, "primary SIM slot '%u' set", ctx->requested_sim_slot);
+        mm_iface_modem_process_sim_event (self);
+    }
+
+    mm_gdbus_modem_complete_set_primary_sim_slot (ctx->skeleton, ctx->invocation);
+    handle_set_primary_sim_slot_context_free (ctx);
+}
+
+static void
+handle_set_primary_sim_slot_auth_ready (MMBaseModem                    *self,
+                                        GAsyncResult                   *res,
+                                        HandleSetPrimarySimSlotContext *ctx)
+{
+    GError             *error = NULL;
+    const gchar *const *sim_slot_paths;
+
+    if (!mm_base_modem_authorize_finish (self, res, &error)) {
+        g_dbus_method_invocation_take_error (ctx->invocation, error);
+        handle_set_primary_sim_slot_context_free (ctx);
+        return;
+    }
+
+    /* If SIM switching is not implemented, report an error */
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->set_primary_sim_slot ||
+        !MM_IFACE_MODEM_GET_INTERFACE (self)->set_primary_sim_slot_finish) {
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                               "Operation not supported");
+        handle_set_primary_sim_slot_context_free (ctx);
+        return;
+    }
+
+    /* Validate SIM slot number */
+    sim_slot_paths = mm_gdbus_modem_get_sim_slots (ctx->skeleton);
+    if (!sim_slot_paths || (ctx->requested_sim_slot > g_strv_length ((gchar **)sim_slot_paths))) {
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
+                                               "Requested SIM slot number is out of bounds");
+        handle_set_primary_sim_slot_context_free (ctx);
+        return;
+    }
+
+    mm_obj_info (self, "processing user request to set primary SIM slot '%u'...", ctx->requested_sim_slot);
+    MM_IFACE_MODEM_GET_INTERFACE (self)->set_primary_sim_slot (MM_IFACE_MODEM (self),
+                                                               ctx->requested_sim_slot,
+                                                               (GAsyncReadyCallback)set_primary_sim_slot_ready,
+                                                               ctx);
+}
+
+static gboolean
+handle_set_primary_sim_slot (MmGdbusModem          *skeleton,
+                             GDBusMethodInvocation *invocation,
+                             guint                  sim_slot,
+                             MMIfaceModem          *self)
+{
+    HandleSetPrimarySimSlotContext *ctx;
+
+    ctx = g_slice_new0 (HandleSetPrimarySimSlotContext);
+    ctx->skeleton = g_object_ref (skeleton);
+    ctx->invocation = g_object_ref (invocation);
+    ctx->self = g_object_ref (self);
+    ctx->requested_sim_slot = sim_slot;
+
+    mm_base_modem_authorize (MM_BASE_MODEM (self),
+                             invocation,
+                             MM_AUTHORIZATION_DEVICE_CONTROL,
+                             (GAsyncReadyCallback)handle_set_primary_sim_slot_auth_ready,
+                             ctx);
+    return TRUE;
+}
+
+/*****************************************************************************/
+
+typedef struct {
+    MmGdbusModem          *skeleton;
+    GDBusMethodInvocation *invocation;
+    MMIfaceModem          *self;
+} HandleGetCellInfoContext;
+
+static void
+handle_get_cell_info_context_free (HandleGetCellInfoContext *ctx)
+{
+    g_object_unref (ctx->skeleton);
+    g_object_unref (ctx->invocation);
+    g_object_unref (ctx->self);
+    g_slice_free (HandleGetCellInfoContext, ctx);
+}
+
+static GVariant *
+get_cell_info_build_result (GList *info_list)
+{
+    GList *l;
+    GVariantBuilder builder;
+
+    g_variant_builder_init (&builder, G_VARIANT_TYPE ("aa{sv}"));
+
+    for (l = info_list; l; l = g_list_next (l)) {
+        g_autoptr(GVariant) dict = NULL;
+
+        dict = mm_cell_info_get_dictionary (MM_CELL_INFO (l->data));
+        g_variant_builder_add_value (&builder, dict);
+    }
+
+    return g_variant_ref_sink (g_variant_builder_end (&builder));
+}
+
+static void
+get_cell_info_ready (MMIfaceModem             *self,
+                     GAsyncResult             *res,
+                     HandleGetCellInfoContext *ctx)
+{
+    GError *error = NULL;
+    GList  *info_list;
+
+    info_list = MM_IFACE_MODEM_GET_INTERFACE (self)->get_cell_info_finish (self, res, &error);
+    if (error) {
+        mm_obj_dbg (self, "failed retrieving cell info: %s", error->message);
+        g_dbus_method_invocation_take_error (ctx->invocation, error);
+    } else {
+        g_autoptr(GVariant) dict_array = NULL;
+
+        mm_obj_dbg (self, "cell info retrieved");
+        dict_array = get_cell_info_build_result (info_list);
+        mm_gdbus_modem_complete_get_cell_info (ctx->skeleton, ctx->invocation, dict_array);
+    }
+
+    g_list_free_full (info_list, (GDestroyNotify)g_object_unref);
+    handle_get_cell_info_context_free (ctx);
+}
+
+static void
+handle_get_cell_info_auth_ready (MMBaseModem              *self,
+                                 GAsyncResult             *res,
+                                 HandleGetCellInfoContext *ctx)
+{
+    GError *error = NULL;
+
+    if (!mm_base_modem_authorize_finish (self, res, &error)) {
+        g_dbus_method_invocation_take_error (ctx->invocation, error);
+        handle_get_cell_info_context_free (ctx);
+        return;
+    }
+
+    /* If getting cell info is not implemented, report an error */
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->get_cell_info ||
+        !MM_IFACE_MODEM_GET_INTERFACE (self)->get_cell_info_finish) {
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                               "Cannot get cell info: operation not supported");
+        handle_get_cell_info_context_free (ctx);
+        return;
+    }
+
+    if (mm_iface_modem_abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_ENABLED)) {
+        handle_get_cell_info_context_free (ctx);
+        return;
+    }
+
+    mm_obj_info (self, "processing user request to retrieve cell info...");
+    MM_IFACE_MODEM_GET_INTERFACE (self)->get_cell_info (ctx->self,
+                                                        (GAsyncReadyCallback)get_cell_info_ready,
+                                                        ctx);
+}
+
+static gboolean
+handle_get_cell_info (MmGdbusModem          *skeleton,
+                      GDBusMethodInvocation *invocation,
+                      MMIfaceModem          *self)
+{
+    HandleGetCellInfoContext *ctx;
+
+    ctx = g_slice_new0 (HandleGetCellInfoContext);
+    ctx->skeleton = g_object_ref (skeleton);
+    ctx->invocation = g_object_ref (invocation);
+    ctx->self = g_object_ref (self);
+
+    mm_base_modem_authorize (MM_BASE_MODEM (self),
+                             invocation,
+                             MM_AUTHORIZATION_DEVICE_CONTROL,
+                             (GAsyncReadyCallback)handle_get_cell_info_auth_ready,
+                             ctx);
+    return TRUE;
+}
+
+/*****************************************************************************/
+
+void
+mm_iface_modem_update_own_numbers (MMIfaceModem *self,
+                                   const GStrv own_numbers)
+{
+    MmGdbusModem *skeleton = NULL;
+
+    g_object_get (self,
+                  MM_IFACE_MODEM_DBUS_SKELETON, &skeleton,
+                  NULL);
+    if (skeleton) {
+        mm_gdbus_modem_set_own_numbers (skeleton, (const gchar * const *)own_numbers);
+        g_object_unref (skeleton);
+    }
 }
 
 /*****************************************************************************/
@@ -991,7 +1477,7 @@ mm_iface_modem_update_access_technologies (MMIfaceModem *self,
         /* Log */
         old_access_tech_string = mm_modem_access_technology_build_string_from_mask (old_access_tech);
         new_access_tech_string = mm_modem_access_technology_build_string_from_mask (built_access_tech);
-        mm_obj_dbg (self, "access technology changed (%s -> %s)",
+        mm_obj_info (self, "access technology changed (%s -> %s)",
                     old_access_tech_string,
                     new_access_tech_string);
         g_free (old_access_tech_string);
@@ -1003,23 +1489,23 @@ mm_iface_modem_update_access_technologies (MMIfaceModem *self,
 
 /*****************************************************************************/
 
-typedef struct {
-    guint recent_timeout_source;
-} SignalQualityUpdateContext;
-
 static void
-signal_quality_update_context_free (SignalQualityUpdateContext *ctx)
+signal_quality_recent_timeout_disable (MMIfaceModem *self)
 {
-    if (ctx->recent_timeout_source)
-        g_source_remove (ctx->recent_timeout_source);
-    g_free (ctx);
+    Private *priv;
+
+    priv = get_private (self);
+    if (priv->signal_quality_recent_timeout_source) {
+        g_source_remove (priv->signal_quality_recent_timeout_source);
+        priv->signal_quality_recent_timeout_source = 0;
+    }
 }
 
 static gboolean
 expire_signal_quality (MMIfaceModem *self)
 {
-    MmGdbusModem *skeleton = NULL;
-    SignalQualityUpdateContext *ctx;
+    g_autoptr(MmGdbusModemSkeleton)  skeleton = NULL;
+    Private                         *priv;
 
     g_object_get (self,
                   MM_IFACE_MODEM_DBUS_SKELETON, &skeleton,
@@ -1027,10 +1513,10 @@ expire_signal_quality (MMIfaceModem *self)
 
     if (skeleton) {
         GVariant *old;
-        guint signal_quality = 0;
-        gboolean recent = FALSE;
+        guint     signal_quality = 0;
+        gboolean  recent = FALSE;
 
-        old = mm_gdbus_modem_get_signal_quality (skeleton);
+        old = mm_gdbus_modem_get_signal_quality (MM_GDBUS_MODEM (skeleton));
         g_variant_get (old,
                        "(ub)",
                        &signal_quality,
@@ -1040,28 +1526,26 @@ expire_signal_quality (MMIfaceModem *self)
         if (recent) {
             mm_obj_dbg (self, "signal quality value not updated in %us, marking as not being recent",
                         SIGNAL_QUALITY_RECENT_TIMEOUT_SEC);
-            mm_gdbus_modem_set_signal_quality (skeleton,
+            mm_gdbus_modem_set_signal_quality (MM_GDBUS_MODEM (skeleton),
                                                g_variant_new ("(ub)",
                                                               signal_quality,
                                                               FALSE));
         }
-
-        g_object_unref (skeleton);
     }
 
     /* Remove source id */
-    ctx = g_object_get_qdata (G_OBJECT (self), signal_quality_update_context_quark);
-    ctx->recent_timeout_source = 0;
+    priv = get_private (self);
+    priv->signal_quality_recent_timeout_source = 0;
     return G_SOURCE_REMOVE;
 }
 
 static void
 update_signal_quality (MMIfaceModem *self,
-                       guint signal_quality,
-                       gboolean expire)
+                       guint         signal_quality,
+                       gboolean      expire)
 {
-    SignalQualityUpdateContext *ctx;
-    MmGdbusModem *skeleton = NULL;
+    g_autoptr(MmGdbusModemSkeleton)  skeleton = NULL;
+    Private                         *priv;
 
     g_object_get (self,
                   MM_IFACE_MODEM_DBUS_SKELETON, &skeleton,
@@ -1071,27 +1555,14 @@ update_signal_quality (MMIfaceModem *self,
     if (!skeleton)
         return;
 
-    if (G_UNLIKELY (!signal_quality_update_context_quark))
-        signal_quality_update_context_quark = (g_quark_from_static_string (
-                                                   SIGNAL_QUALITY_UPDATE_CONTEXT_TAG));
-
-    ctx = g_object_get_qdata (G_OBJECT (self), signal_quality_update_context_quark);
-    if (!ctx) {
-        /* Create context and keep it as object data */
-        ctx = g_new0 (SignalQualityUpdateContext, 1);
-        g_object_set_qdata_full (
-            G_OBJECT (self),
-            signal_quality_update_context_quark,
-            ctx,
-            (GDestroyNotify)signal_quality_update_context_free);
-    }
+    priv = get_private (self);
 
     /* Note: we always set the new value, even if the signal quality level
      * is the same, in order to provide an up to date 'recent' flag.
      * The only exception being if 'expire' is FALSE; in that case we assume
      * the value won't expire and therefore can be considered obsolete
      * already. */
-    mm_gdbus_modem_set_signal_quality (skeleton,
+    mm_gdbus_modem_set_signal_quality (MM_GDBUS_MODEM (skeleton),
                                        g_variant_new ("(ub)",
                                                       signal_quality,
                                                       expire));
@@ -1099,24 +1570,22 @@ update_signal_quality (MMIfaceModem *self,
     mm_obj_dbg (self, "signal quality updated (%u)", signal_quality);
 
     /* Remove any previous expiration refresh timeout */
-    if (ctx->recent_timeout_source) {
-        g_source_remove (ctx->recent_timeout_source);
-        ctx->recent_timeout_source = 0;
+    if (priv->signal_quality_recent_timeout_source) {
+        g_source_remove (priv->signal_quality_recent_timeout_source);
+        priv->signal_quality_recent_timeout_source = 0;
     }
 
     /* If we got a new expirable value, setup new timeout */
     if (expire)
-        ctx->recent_timeout_source = (g_timeout_add_seconds (
-                                          SIGNAL_QUALITY_RECENT_TIMEOUT_SEC,
-                                          (GSourceFunc)expire_signal_quality,
-                                          self));
-
-    g_object_unref (skeleton);
+        priv->signal_quality_recent_timeout_source = (g_timeout_add_seconds (
+                                                          SIGNAL_QUALITY_RECENT_TIMEOUT_SEC,
+                                                          (GSourceFunc)expire_signal_quality,
+                                                          self));
 }
 
 void
 mm_iface_modem_update_signal_quality (MMIfaceModem *self,
-                                      guint signal_quality)
+                                      guint         signal_quality)
 {
     update_signal_quality (self, signal_quality, TRUE);
 }
@@ -1125,7 +1594,6 @@ mm_iface_modem_update_signal_quality (MMIfaceModem *self,
 /* Signal info (quality and access technology) polling */
 
 typedef enum {
-    SIGNAL_CHECK_STEP_NONE,
     SIGNAL_CHECK_STEP_FIRST,
     SIGNAL_CHECK_STEP_SIGNAL_QUALITY,
     SIGNAL_CHECK_STEP_ACCESS_TECHNOLOGIES,
@@ -1133,92 +1601,45 @@ typedef enum {
 } SignalCheckStep;
 
 typedef struct {
-    gboolean enabled;
-    guint    timeout_source;
-
-    /* We first attempt an initial loading, and once it's done we
-     * setup polling */
-    guint    initial_retries;
-    gboolean initial_check_done;
-
     /* Values polled in this iteration */
     guint                   signal_quality;
     MMModemAccessTechnology access_technologies;
     guint                   access_technologies_mask;
-
-    /* If both signal and access tech polling are either unsupported
-     * or disabled, we'll automatically stop polling */
-    gboolean signal_quality_polling_supported;
-    gboolean signal_quality_polling_disabled;
-    gboolean access_technology_polling_supported;
-    gboolean access_technology_polling_disabled;
-
     /* Steps triggered when polling active */
     SignalCheckStep running_step;
 } SignalCheckContext;
 
-static void
-signal_check_context_free (SignalCheckContext *ctx)
-{
-    if (ctx->timeout_source)
-        g_source_remove (ctx->timeout_source);
-    g_slice_free (SignalCheckContext, ctx);
-}
-
-static SignalCheckContext *
-get_signal_check_context (MMIfaceModem *self)
-{
-    SignalCheckContext *ctx;
-
-    if (G_UNLIKELY (!signal_check_context_quark))
-        signal_check_context_quark = (g_quark_from_static_string (
-                                          SIGNAL_CHECK_CONTEXT_TAG));
-
-    ctx = g_object_get_qdata (G_OBJECT (self), signal_check_context_quark);
-    if (!ctx) {
-        /* Create context and attach it to the object */
-        ctx = g_slice_new0 (SignalCheckContext);
-        ctx->running_step = SIGNAL_CHECK_STEP_NONE;
-
-        /* Initially assume supported if load_access_technologies() is
-         * implemented. If the plugin reports an UNSUPPORTED error we'll clear
-         * this flag and no longer poll. */
-        ctx->access_technology_polling_supported = (MM_IFACE_MODEM_GET_INTERFACE (self)->load_access_technologies &&
-                                                    MM_IFACE_MODEM_GET_INTERFACE (self)->load_access_technologies_finish);
-
-        /* Initially assume supported if load_signal_quality() is
-         * implemented. If the plugin reports an UNSUPPORTED error we'll clear
-         * this flag and no longer poll. */
-        ctx->signal_quality_polling_supported = (MM_IFACE_MODEM_GET_INTERFACE (self)->load_signal_quality &&
-                                                 MM_IFACE_MODEM_GET_INTERFACE (self)->load_signal_quality_finish);
-
-        /* Get plugin-specific setup for the polling logic */
-        g_object_get (self,
-                      MM_IFACE_MODEM_PERIODIC_SIGNAL_CHECK_DISABLED,      &ctx->signal_quality_polling_disabled,
-                      MM_IFACE_MODEM_PERIODIC_ACCESS_TECH_CHECK_DISABLED, &ctx->access_technology_polling_disabled,
-                      NULL);
-
-        g_object_set_qdata_full (G_OBJECT (self), signal_check_context_quark,
-                                 ctx, (GDestroyNotify) signal_check_context_free);
-    }
-
-    g_assert (ctx);
-    return ctx;
-}
-
 static void     periodic_signal_check_disable (MMIfaceModem *self,
                                                gboolean      clear);
-static gboolean periodic_signal_check_cb      (MMIfaceModem *self);
-static void     peridic_signal_check_step     (MMIfaceModem *self);
+static gboolean periodic_signal_check_run     (MMIfaceModem *self);
+static void     periodic_signal_check_step    (GTask        *task);
 
 static void
-access_technologies_check_ready (MMIfaceModem *self,
-                                 GAsyncResult *res)
+periodic_signal_check_complete (GTask *task)
 {
-    GError             *error = NULL;
+    MMIfaceModem *self;
+    Private      *priv;
+
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
+    g_assert (priv->signal_check_running);
+    priv->signal_check_running = FALSE;
+
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+load_access_technologies_ready (MMIfaceModem *self,
+                                GAsyncResult *res,
+                                GTask        *task)
+{
+    g_autoptr(GError)   error = NULL;
+    Private            *priv;
     SignalCheckContext *ctx;
 
-    ctx = get_signal_check_context (self);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
 
     if (!MM_IFACE_MODEM_GET_INTERFACE (self)->load_access_technologies_finish (
             self,
@@ -1229,95 +1650,95 @@ access_technologies_check_ready (MMIfaceModem *self,
         /* Did the plugin report that polling access technology is unsupported? */
         if (g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED)) {
             mm_obj_dbg (self, "polling to refresh access technologies is unsupported");
-            ctx->access_technology_polling_supported = FALSE;
+            priv->access_technology_polling_supported = FALSE;
         }
         /* Ignore logging any message if the error is in 'in-progress' */
         else if (!g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_IN_PROGRESS))
             mm_obj_dbg (self, "couldn't refresh access technologies: %s", error->message);
-        g_error_free (error);
     }
     /* We may have been disabled while this command was running. */
-    else if (ctx->enabled)
+    else if (priv->signal_check_enabled)
         mm_iface_modem_update_access_technologies (self, ctx->access_technologies, ctx->access_technologies_mask);
 
     /* Go on */
     ctx->running_step++;
-    peridic_signal_check_step (self);
+    periodic_signal_check_step (task);
 }
 
 static void
-signal_quality_check_ready (MMIfaceModem *self,
-                            GAsyncResult *res)
+load_signal_quality_ready (MMIfaceModem *self,
+                           GAsyncResult *res,
+                           GTask        *task)
 {
-    GError             *error = NULL;
+    g_autoptr(GError)   error = NULL;
+    Private            *priv;
     SignalCheckContext *ctx;
 
-    ctx = get_signal_check_context (self);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
 
     ctx->signal_quality = MM_IFACE_MODEM_GET_INTERFACE (self)->load_signal_quality_finish (self, res, &error);
     if (error) {
         /* Did the plugin report that polling signal quality is unsupported? */
         if (g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED)) {
             mm_obj_dbg (self, "polling to refresh signal quality is unsupported");
-            ctx->signal_quality_polling_supported = FALSE;
+            priv->signal_quality_polling_supported = FALSE;
         }
         /* Ignore logging any message if the error is in 'in-progress' */
         else if (!g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_IN_PROGRESS))
             mm_obj_dbg (self, "couldn't refresh signal quality: %s", error->message);
-        g_error_free (error);
     }
     /* We may have been disabled while this command was running. */
-    else if (ctx->enabled)
+    else if (priv->signal_check_enabled)
         update_signal_quality (self, ctx->signal_quality, TRUE);
 
     /* Go on */
     ctx->running_step++;
-    peridic_signal_check_step (self);
+    periodic_signal_check_step (task);
 }
 
 static void
-peridic_signal_check_step (MMIfaceModem *self)
+periodic_signal_check_step (GTask *task)
 {
+    MMIfaceModem       *self;
+    Private            *priv;
     SignalCheckContext *ctx;
 
-    ctx = get_signal_check_context (self);
+    self = g_task_get_source_object (task);
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
 
     switch (ctx->running_step) {
-    case SIGNAL_CHECK_STEP_NONE:
-        g_assert_not_reached ();
-
     case SIGNAL_CHECK_STEP_FIRST:
         ctx->running_step++;
         /* fall-through */
 
     case SIGNAL_CHECK_STEP_SIGNAL_QUALITY:
-        if (ctx->enabled && ctx->signal_quality_polling_supported &&
-            (!ctx->initial_check_done || !ctx->signal_quality_polling_disabled)) {
+        if (priv->signal_check_enabled && priv->signal_quality_polling_supported &&
+            (!priv->signal_check_initial_done || !priv->signal_quality_polling_disabled)) {
             MM_IFACE_MODEM_GET_INTERFACE (self)->load_signal_quality (
-                self, (GAsyncReadyCallback)signal_quality_check_ready, NULL);
+                self, (GAsyncReadyCallback)load_signal_quality_ready, task);
             return;
         }
         ctx->running_step++;
         /* fall-through */
 
     case SIGNAL_CHECK_STEP_ACCESS_TECHNOLOGIES:
-        if (ctx->enabled && ctx->access_technology_polling_supported &&
-            (!ctx->initial_check_done || !ctx->access_technology_polling_disabled)) {
+        if (priv->signal_check_enabled && priv->access_technology_polling_supported &&
+            (!priv->signal_check_initial_done || !priv->access_technology_polling_disabled)) {
             MM_IFACE_MODEM_GET_INTERFACE (self)->load_access_technologies (
-                self, (GAsyncReadyCallback)access_technologies_check_ready, NULL);
+                self, (GAsyncReadyCallback)load_access_technologies_ready, task);
             return;
         }
         ctx->running_step++;
         /* fall-through */
 
     case SIGNAL_CHECK_STEP_LAST:
-        /* Flag as sequence finished */
-        ctx->running_step = SIGNAL_CHECK_STEP_NONE;
-
         /* If we have been disabled while we were running the steps, we don't
          * do anything else. */
-        if (!ctx->enabled) {
+        if (!priv->signal_check_enabled) {
             mm_obj_dbg (self, "periodic signal quality and access technology checks not rescheduled: disabled");
+            periodic_signal_check_complete (task);
             return;
         }
 
@@ -1326,38 +1747,39 @@ peridic_signal_check_step (MMIfaceModem *self)
          * quality and access technology values. As soon as we get them, OR if
          * we made too many retries at a high frequency, we fallback to the
          * slower polling. */
-        if (!ctx->initial_check_done) {
+        if (!priv->signal_check_initial_done) {
             gboolean signal_quality_ready;
             gboolean access_technology_ready;
 
             /* Signal quality is ready if unsupported or if we got a valid
              * value reported */
-            signal_quality_ready = (!ctx->signal_quality_polling_supported || (ctx->signal_quality != 0));
+            signal_quality_ready = (!priv->signal_quality_polling_supported || (ctx->signal_quality != 0));
 
             /* Access technology is ready if unsupported or if we got a valid
              * value reported */
-            access_technology_ready = (!ctx->access_technology_polling_supported ||
+            access_technology_ready = (!priv->access_technology_polling_supported ||
                                        ((ctx->access_technologies & ctx->access_technologies_mask) != MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN));
 
-            ctx->initial_check_done = ((signal_quality_ready && access_technology_ready) || (--ctx->initial_retries == 0));
+            priv->signal_check_initial_done = ((signal_quality_ready && access_technology_ready) || (--priv->signal_check_initial_retries == 0));
         }
 
         /* After running the initial check, if both signal quality and access tech
          * loading are either disabled or unsupported, we'll stop polling completely,
          * because they may be loaded asynchronously by unsolicited messages */
-        if (ctx->initial_check_done &&
-            (!ctx->signal_quality_polling_supported    || ctx->signal_quality_polling_disabled) &&
-            (!ctx->access_technology_polling_supported || ctx->access_technology_polling_disabled)) {
+        if (priv->signal_check_initial_done &&
+            (!priv->signal_quality_polling_supported    || priv->signal_quality_polling_disabled) &&
+            (!priv->access_technology_polling_supported || priv->access_technology_polling_disabled)) {
             mm_obj_dbg (self, "periodic signal quality and access technology checks not rescheduled: unneeded or unsupported");
             periodic_signal_check_disable (self, FALSE);
-            return;
+        } else {
+            mm_obj_dbg (self, "periodic signal quality and access technology checks scheduled");
+            g_assert (!priv->signal_check_timeout_source);
+            priv->signal_check_timeout_source = g_timeout_add_seconds (priv->signal_check_initial_done ? SIGNAL_CHECK_TIMEOUT_SEC : SIGNAL_CHECK_INITIAL_TIMEOUT_SEC,
+                                                                       (GSourceFunc) periodic_signal_check_run,
+                                                                       self);
         }
 
-        mm_obj_dbg (self, "periodic signal quality and access technology checks scheduled");
-        g_assert (!ctx->timeout_source);
-        ctx->timeout_source = g_timeout_add_seconds (ctx->initial_check_done ? SIGNAL_CHECK_TIMEOUT_SEC : SIGNAL_CHECK_INITIAL_TIMEOUT_SEC,
-                                                     (GSourceFunc) periodic_signal_check_cb,
-                                                     self);
+        periodic_signal_check_complete (task);
         return;
 
     default:
@@ -1366,40 +1788,49 @@ peridic_signal_check_step (MMIfaceModem *self)
 }
 
 static gboolean
-periodic_signal_check_cb (MMIfaceModem *self)
+periodic_signal_check_run (MMIfaceModem *self)
 {
+    GTask              *task;
     SignalCheckContext *ctx;
+    Private            *priv;
 
-    ctx = get_signal_check_context (self);
-    g_assert (ctx->enabled);
+    priv = get_private (self);
 
-    /* Start the sequence */
+    task = g_task_new (self, NULL, NULL, NULL);
+
+    ctx = g_new0 (SignalCheckContext, 1);
     ctx->running_step             = SIGNAL_CHECK_STEP_FIRST;
     ctx->signal_quality           = 0;
     ctx->access_technologies      = MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN;
     ctx->access_technologies_mask = MM_MODEM_ACCESS_TECHNOLOGY_ANY;
-    peridic_signal_check_step (self);
+    g_task_set_task_data (task, ctx, (GDestroyNotify) g_free);
 
-    /* Remove the timeout and clear the source id */
-    if (ctx->timeout_source)
-        ctx->timeout_source = 0;
+    g_assert (!priv->signal_check_running);
+    priv->signal_check_running = TRUE;
+
+    periodic_signal_check_step (task);
+
+    /* Reset the source id as we're removing the timeout source */
+    if (priv->signal_check_timeout_source)
+        priv->signal_check_timeout_source = 0;
     return G_SOURCE_REMOVE;
 }
 
 void
 mm_iface_modem_refresh_signal (MMIfaceModem *self)
 {
-    SignalCheckContext *ctx;
+    Private *priv;
+
+    priv = get_private (self);
 
     /* Don't refresh polling if we're not enabled */
-    ctx = get_signal_check_context (self);
-    if (!ctx->enabled) {
+    if (!priv->signal_check_enabled) {
         mm_obj_dbg (self, "periodic signal check refresh ignored: checks not enabled");
         return;
     }
 
     /* Don't refresh if we're already doing it */
-    if (ctx->running_step != SIGNAL_CHECK_STEP_NONE) {
+    if (priv->signal_check_running) {
         mm_obj_dbg (self, "periodic signal check refresh ignored: check already running");
         return;
     }
@@ -1408,28 +1839,29 @@ mm_iface_modem_refresh_signal (MMIfaceModem *self)
 
     /* Remove the scheduled timeout as we're going to refresh
      * right away */
-    if (ctx->timeout_source) {
-        g_source_remove (ctx->timeout_source);
-        ctx->timeout_source = 0;
+    if (priv->signal_check_timeout_source) {
+        g_source_remove (priv->signal_check_timeout_source);
+        priv->signal_check_timeout_source = 0;
     }
 
     /* Reset refresh rate and initial retries when we're asked to refresh signal
      * so that we poll at a higher frequency */
-    ctx->initial_retries    = SIGNAL_CHECK_INITIAL_RETRIES;
-    ctx->initial_check_done = FALSE;
+    priv->signal_check_initial_retries = SIGNAL_CHECK_INITIAL_RETRIES;
+    priv->signal_check_initial_done    = FALSE;
 
     /* Start sequence */
-    periodic_signal_check_cb (self);
+    periodic_signal_check_run (self);
 }
 
 static void
 periodic_signal_check_disable (MMIfaceModem *self,
                                gboolean      clear)
 {
-    SignalCheckContext *ctx;
+    Private *priv;
 
-    ctx = get_signal_check_context (self);
-    if (!ctx->enabled)
+    priv = get_private (self);
+
+    if (!priv->signal_check_enabled)
         return;
 
     /* Clear access technology and signal quality */
@@ -1441,33 +1873,33 @@ periodic_signal_check_disable (MMIfaceModem *self,
     }
 
     /* Remove scheduled timeout */
-    if (ctx->timeout_source) {
-        g_source_remove (ctx->timeout_source);
-        ctx->timeout_source = 0;
+    if (priv->signal_check_timeout_source) {
+        g_source_remove (priv->signal_check_timeout_source);
+        priv->signal_check_timeout_source = 0;
     }
 
-    ctx->enabled = FALSE;
+    priv->signal_check_enabled = FALSE;
     mm_obj_dbg (self, "periodic signal checks disabled");
 }
 
 static void
 periodic_signal_check_enable (MMIfaceModem *self)
 {
-    SignalCheckContext *ctx;
+    Private *priv;
 
-    ctx = get_signal_check_context (self);
+    priv = get_private (self);
 
     /* If polling access technology and signal quality not supported, don't even
      * bother trying. */
-    if (!ctx->signal_quality_polling_supported && !ctx->access_technology_polling_supported) {
+    if (!priv->signal_quality_polling_supported && !priv->access_technology_polling_supported) {
         mm_obj_dbg (self, "not enabling periodic signal checks: unsupported");
         return;
     }
 
     /* Log and flag as enabled */
-    if (!ctx->enabled) {
+    if (!priv->signal_check_enabled) {
         mm_obj_dbg (self, "periodic signal checks enabled");
-        ctx->enabled = TRUE;
+        priv->signal_check_enabled = TRUE;
     }
 
     /* And refresh, which will trigger the first check at high frequency */
@@ -1485,28 +1917,23 @@ bearer_list_count_connected (MMBaseBearer *bearer,
 }
 
 static void
-__iface_modem_update_state_internal (MMIfaceModem *self,
-                                     MMModemState new_state,
-                                     MMModemStateChangeReason reason,
-                                     MMModemStateFailedReason failed_reason)
+update_state_internal (MMIfaceModem             *self,
+                       MMModemState              new_state,
+                       MMModemStateChangeReason  reason,
+                       MMModemStateFailedReason  failed_reason)
 {
-    MMModemState old_state = MM_MODEM_STATE_UNKNOWN;
-    MmGdbusModem *skeleton = NULL;
-    MMBearerList *bearer_list = NULL;
+    MMModemState                    old_state = MM_MODEM_STATE_UNKNOWN;
+    g_autoptr(MmGdbusModemSkeleton) skeleton = NULL;
+    g_autoptr(MMBearerList)         bearer_list = NULL;
 
     g_object_get (self,
-                  MM_IFACE_MODEM_STATE, &old_state,
+                  MM_IFACE_MODEM_STATE,         &old_state,
                   MM_IFACE_MODEM_DBUS_SKELETON, &skeleton,
-                  MM_IFACE_MODEM_BEARER_LIST, &bearer_list,
+                  MM_IFACE_MODEM_BEARER_LIST,   &bearer_list,
                   NULL);
 
-    if (!skeleton || !bearer_list) {
-        if (skeleton)
-            g_object_unref (skeleton);
-        if (bearer_list)
-            g_object_unref (bearer_list);
+    if (!skeleton)
         return;
-    }
 
     /* While connected we don't want registration status changes to change
      * the modem's state away from CONNECTED. */
@@ -1531,9 +1958,9 @@ __iface_modem_update_state_internal (MMIfaceModem *self,
 
     /* Update state only if different */
     if (new_state != old_state) {
-        mm_obj_info (self, "state changed (%s -> %s)",
-                     mm_modem_state_get_string (old_state),
-                     mm_modem_state_get_string (new_state));
+        mm_obj_msg (self, "state changed (%s -> %s)",
+                    mm_modem_state_get_string (old_state),
+                    mm_modem_state_get_string (new_state));
 
         /* The property in the interface is bound to the property
          * in the skeleton, so just updating here is enough */
@@ -1544,17 +1971,14 @@ __iface_modem_update_state_internal (MMIfaceModem *self,
         /* Signal status change */
         if (skeleton) {
             /* Set failure reason */
-            if (failed_reason != mm_gdbus_modem_get_state_failed_reason (skeleton))
-                mm_gdbus_modem_set_state_failed_reason (skeleton, failed_reason);
+            if (failed_reason != mm_gdbus_modem_get_state_failed_reason (MM_GDBUS_MODEM (skeleton)))
+                mm_gdbus_modem_set_state_failed_reason (MM_GDBUS_MODEM (skeleton), failed_reason);
 
             /* Flush current change before signaling the state change,
              * so that clients get the proper state already in the
              * state-changed callback */
             g_dbus_interface_skeleton_flush (G_DBUS_INTERFACE_SKELETON (skeleton));
-            mm_gdbus_modem_emit_state_changed (skeleton,
-                                               old_state,
-                                               new_state,
-                                               reason);
+            mm_gdbus_modem_emit_state_changed (MM_GDBUS_MODEM (skeleton), old_state, new_state, reason);
         }
 
         /* If we go to a registered/connected state (from unregistered), setup
@@ -1566,53 +1990,39 @@ __iface_modem_update_state_internal (MMIfaceModem *self,
         else if (old_state >= MM_MODEM_STATE_REGISTERED && new_state < MM_MODEM_STATE_REGISTERED)
             periodic_signal_check_disable (self, TRUE);
     }
-
-    if (skeleton)
-        g_object_unref (skeleton);
-    if (bearer_list)
-        g_object_unref (bearer_list);
 }
 
 void
-mm_iface_modem_update_state (MMIfaceModem *self,
-                             MMModemState new_state,
-                             MMModemStateChangeReason reason)
+mm_iface_modem_update_state (MMIfaceModem             *self,
+                             MMModemState              new_state,
+                             MMModemStateChangeReason  reason)
 {
     if (new_state == MM_MODEM_STATE_FAILED) {
         mm_iface_modem_update_failed_state (self, MM_MODEM_STATE_FAILED_REASON_UNKNOWN);
         return;
     }
 
-    __iface_modem_update_state_internal (self, new_state, reason, MM_MODEM_STATE_FAILED_REASON_NONE);
+    update_state_internal (self, new_state, reason, MM_MODEM_STATE_FAILED_REASON_NONE);
 }
 
 void
-mm_iface_modem_update_failed_state (MMIfaceModem *self,
-                                    MMModemStateFailedReason failed_reason)
+mm_iface_modem_update_failed_state (MMIfaceModem             *self,
+                                    MMModemStateFailedReason  failed_reason)
 {
-    __iface_modem_update_state_internal (self, MM_MODEM_STATE_FAILED, MM_MODEM_STATE_CHANGE_REASON_FAILURE, failed_reason);
+    update_state_internal (self, MM_MODEM_STATE_FAILED, MM_MODEM_STATE_CHANGE_REASON_FAILURE, failed_reason);
 }
 
 /*****************************************************************************/
 
 typedef struct {
-    gchar *subsystem;
-    MMModemState state;
+    gchar        *subsystem;
+    MMModemState  state;
 } SubsystemState;
 
 static void
-subsystem_state_array_free (GArray *array)
+subsystem_state_clear (SubsystemState *s)
 {
-    guint i;
-
-    for (i = 0; i < array->len; i++) {
-        SubsystemState *s;
-
-        s = &g_array_index (array, SubsystemState, i);
-        g_free (s->subsystem);
-    }
-
-    g_array_free (array, TRUE);
+    g_free (s->subsystem);
 }
 
 static MMModemState
@@ -1621,27 +2031,22 @@ get_consolidated_subsystem_state (MMIfaceModem *self)
     /* Use as initial state ENABLED, which is the minimum one expected. Do not
      * use the old modem state as initial state, as that would disallow reporting
      * e.g. ENABLED if the old state was REGISTERED (as ENABLED < REGISTERED). */
-    MMModemState consolidated = MM_MODEM_STATE_ENABLED;
-    GArray *subsystem_states;
+    MMModemState  consolidated = MM_MODEM_STATE_ENABLED;
+    Private      *priv;
 
-    if (G_UNLIKELY (!state_update_context_quark))
-        state_update_context_quark = (g_quark_from_static_string (
-                                          STATE_UPDATE_CONTEXT_TAG));
-
-    subsystem_states = g_object_get_qdata (G_OBJECT (self),
-                                           state_update_context_quark);
+    priv = get_private (self);
 
     /* Build consolidated state, expected fixes are:
      *  - Enabled (meaning unregistered) --> Searching|Registered
      *  - Searching --> Registered
      */
-    if (subsystem_states) {
+    if (priv->subsystem_states) {
         guint i;
 
-        for (i = 0; i < subsystem_states->len; i++) {
+        for (i = 0; i < priv->subsystem_states->len; i++) {
             SubsystemState *s;
 
-            s = &g_array_index (subsystem_states, SubsystemState, i);
+            s = &g_array_index (priv->subsystem_states, SubsystemState, i);
             if (s->state > consolidated)
                 consolidated = s->state;
         }
@@ -1652,12 +2057,14 @@ get_consolidated_subsystem_state (MMIfaceModem *self)
 
 static MMModemState
 get_updated_consolidated_state (MMIfaceModem *self,
-                                MMModemState modem_state,
-                                const gchar *subsystem,
-                                MMModemState subsystem_state)
+                                MMModemState  modem_state,
+                                const gchar  *subsystem,
+                                MMModemState  subsystem_state)
 {
-    guint i;
-    GArray *subsystem_states;
+    guint    i;
+    Private *priv;
+
+    priv = get_private (self);
 
     /* Reported subsystem states will be REGISTRATION-related. This means
      * that we would only expect a subset of the states being reported for
@@ -1666,28 +2073,16 @@ get_updated_consolidated_state (MMIfaceModem *self,
                     subsystem_state == MM_MODEM_STATE_SEARCHING ||
                     subsystem_state == MM_MODEM_STATE_REGISTERED);
 
-    if (G_UNLIKELY (!state_update_context_quark))
-        state_update_context_quark = (g_quark_from_static_string (
-                                          STATE_UPDATE_CONTEXT_TAG));
-
-    subsystem_states = g_object_get_qdata (G_OBJECT (self),
-                                           state_update_context_quark);
-    if (!subsystem_states) {
-        subsystem_states = g_array_sized_new (FALSE,
-                                              FALSE,
-                                              sizeof (SubsystemState),
-                                              2);
-        g_object_set_qdata_full (G_OBJECT (self),
-                                 state_update_context_quark,
-                                 subsystem_states,
-                                 (GDestroyNotify)subsystem_state_array_free);
+    if (!priv->subsystem_states) {
+        priv->subsystem_states = g_array_sized_new (FALSE, FALSE, sizeof (SubsystemState), 2);
+        g_array_set_clear_func (priv->subsystem_states, (GDestroyNotify)subsystem_state_clear);
     }
 
     /* Store new subsystem state */
-    for (i = 0; i < subsystem_states->len; i++) {
+    for (i = 0; i < priv->subsystem_states->len; i++) {
         SubsystemState *s;
 
-        s = &g_array_index (subsystem_states, SubsystemState, i);
+        s = &g_array_index (priv->subsystem_states, SubsystemState, i);
         if (g_str_equal (s->subsystem, subsystem)) {
             s->state = subsystem_state;
             break;
@@ -1695,13 +2090,13 @@ get_updated_consolidated_state (MMIfaceModem *self,
     }
 
     /* If not found, insert new element */
-    if (i == subsystem_states->len) {
+    if (i == priv->subsystem_states->len) {
         SubsystemState s;
 
         mm_obj_dbg (self, "will start keeping track of state for subsystem '%s'", subsystem);
         s.subsystem = g_strdup (subsystem);
         s.state = subsystem_state;
-        g_array_append_val (subsystem_states, s);
+        g_array_append_val (priv->subsystem_states, s);
     }
 
     return get_consolidated_subsystem_state (self);
@@ -1736,10 +2131,10 @@ mm_iface_modem_update_subsystem_state (MMIfaceModem *self,
 /*****************************************************************************/
 
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    gboolean enable;
+    MMIfaceModem          *self;
+    gboolean               enable;
 } HandleEnableContext;
 
 static void
@@ -1748,26 +2143,32 @@ handle_enable_context_free (HandleEnableContext *ctx)
     g_object_unref (ctx->skeleton);
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
-    g_free (ctx);
+    g_slice_free (HandleEnableContext, ctx);
 }
 
 static void
-enable_ready (MMBaseModem *self,
-              GAsyncResult *res,
+enable_ready (MMBaseModem         *self,
+              GAsyncResult        *res,
               HandleEnableContext *ctx)
 {
     GError *error = NULL;
 
     if (ctx->enable) {
-        if (!mm_base_modem_enable_finish (self, res, &error))
+        if (!mm_base_modem_enable_finish (self, res, &error)) {
+            mm_obj_warn (self, "failed enabling modem: %s", error->message);
             g_dbus_method_invocation_take_error (ctx->invocation, error);
-        else
+        } else {
+            mm_obj_info (self, "enabled modem");
             mm_gdbus_modem_complete_enable (ctx->skeleton, ctx->invocation);
+        }
     } else {
-        if (!mm_base_modem_disable_finish (self, res, &error))
+        if (!mm_base_modem_disable_finish (self, res, &error)) {
+            mm_obj_warn (self, "failed disabling modem: %s", error->message);
             g_dbus_method_invocation_take_error (ctx->invocation, error);
-        else
+        } else {
+            mm_obj_info (self, "disabled modem");
             mm_gdbus_modem_complete_enable (ctx->skeleton, ctx->invocation);
+        }
     }
 
     handle_enable_context_free (ctx);
@@ -1786,30 +2187,33 @@ handle_enable_auth_ready (MMBaseModem *self,
         return;
     }
 
-    if (abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_LOCKED)) {
+    if (mm_iface_modem_abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_LOCKED)) {
         handle_enable_context_free (ctx);
         return;
     }
 
-    if (ctx->enable)
+    if (ctx->enable) {
+        mm_obj_info (self, "processing user request to enable modem...");
         mm_base_modem_enable (self,
                               (GAsyncReadyCallback)enable_ready,
                               ctx);
-    else
+    } else {
+        mm_obj_info (self, "processing user request to disable modem...");
         mm_base_modem_disable (self,
                                (GAsyncReadyCallback)enable_ready,
                                ctx);
+    }
 }
 
 static gboolean
-handle_enable (MmGdbusModem *skeleton,
+handle_enable (MmGdbusModem          *skeleton,
                GDBusMethodInvocation *invocation,
-               gboolean enable,
-               MMIfaceModem *self)
+               gboolean               enable,
+               MMIfaceModem          *self)
 {
     HandleEnableContext *ctx;
 
-    ctx = g_new (HandleEnableContext, 1);
+    ctx = g_slice_new0 (HandleEnableContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -1826,10 +2230,10 @@ handle_enable (MmGdbusModem *skeleton,
 /*****************************************************************************/
 
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    MMModemPowerState power_state;
+    MMIfaceModem          *self;
+    MMModemPowerState      power_state;
 } HandleSetPowerStateContext;
 
 static void
@@ -1842,26 +2246,29 @@ handle_set_power_state_context_free (HandleSetPowerStateContext *ctx)
 }
 
 static void
-set_power_state_ready (MMIfaceModem *self,
-                       GAsyncResult *res,
+set_power_state_ready (MMIfaceModem               *self,
+                       GAsyncResult               *res,
                        HandleSetPowerStateContext *ctx)
 {
     GError *error = NULL;
 
-    if (!mm_iface_modem_set_power_state_finish (self, res, &error))
+    if (!mm_iface_modem_set_power_state_finish (self, res, &error)) {
+        mm_obj_warn (self, "failed setting power state '%s': %s", mm_modem_power_state_get_string (ctx->power_state), error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else
+    } else {
+        mm_obj_info (self, "set power state '%s'", mm_modem_power_state_get_string (ctx->power_state));
         mm_gdbus_modem_complete_set_power_state (ctx->skeleton, ctx->invocation);
+    }
     handle_set_power_state_context_free (ctx);
 }
 
 static void
-handle_set_power_state_auth_ready (MMBaseModem *self,
-                                   GAsyncResult *res,
+handle_set_power_state_auth_ready (MMBaseModem                *self,
+                                   GAsyncResult               *res,
                                    HandleSetPowerStateContext *ctx)
 {
-    MMModemState modem_state;
-    GError *error = NULL;
+    MMModemState  modem_state;
+    GError       *error = NULL;
 
     if (!mm_base_modem_authorize_finish (self, res, &error)) {
         g_dbus_method_invocation_take_error (ctx->invocation, error);
@@ -1873,10 +2280,8 @@ handle_set_power_state_auth_ready (MMBaseModem *self,
     if (ctx->power_state != MM_MODEM_POWER_STATE_LOW &&
         ctx->power_state != MM_MODEM_POWER_STATE_ON &&
         ctx->power_state != MM_MODEM_POWER_STATE_OFF) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_INVALID_ARGS,
-                                               "Cannot set '%s' power state",
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_INVALID_ARGS,
+                                               "Unknown power state: '%s'",
                                                mm_modem_power_state_get_string (ctx->power_state));
         handle_set_power_state_context_free (ctx);
         return;
@@ -1887,14 +2292,12 @@ handle_set_power_state_auth_ready (MMBaseModem *self,
                   MM_IFACE_MODEM_STATE, &modem_state,
                   NULL);
 
-    /* Going into LOW or ON only allowed in disabled state */
-    if ((ctx->power_state == MM_MODEM_POWER_STATE_LOW ||
-         ctx->power_state == MM_MODEM_POWER_STATE_ON) &&
+    /* Going into LOW or ON only allowed in disabled and failed states */
+    if ((ctx->power_state == MM_MODEM_POWER_STATE_LOW || ctx->power_state == MM_MODEM_POWER_STATE_ON) &&
+        modem_state != MM_MODEM_STATE_FAILED &&
         modem_state != MM_MODEM_STATE_DISABLED) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_WRONG_STATE,
-                                               "Cannot set power state: not in disabled state");
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_WRONG_STATE,
+                                               "Must be in disabled or failed state");
         handle_set_power_state_context_free (ctx);
         return;
     }
@@ -1907,11 +2310,12 @@ handle_set_power_state_auth_ready (MMBaseModem *self,
         g_dbus_method_invocation_return_error (ctx->invocation,
                                                MM_CORE_ERROR,
                                                MM_CORE_ERROR_WRONG_STATE,
-                                               "Cannot set power state: modem either enabled or initializing");
+                                               "Modem either enabled or initializing");
         handle_set_power_state_context_free (ctx);
         return;
     }
 
+    mm_obj_info (self, "processing user request to set power state '%s'...", mm_modem_power_state_get_string (ctx->power_state));
     mm_iface_modem_set_power_state (MM_IFACE_MODEM (self),
                                     ctx->power_state,
                                     (GAsyncReadyCallback)set_power_state_ready,
@@ -1919,14 +2323,14 @@ handle_set_power_state_auth_ready (MMBaseModem *self,
 }
 
 static gboolean
-handle_set_power_state (MmGdbusModem *skeleton,
+handle_set_power_state (MmGdbusModem          *skeleton,
                         GDBusMethodInvocation *invocation,
-                        guint32 power_state,
-                        MMIfaceModem *self)
+                        guint32                power_state,
+                        MMIfaceModem          *self)
 {
     HandleSetPowerStateContext *ctx;
 
-    ctx = g_slice_new (HandleSetPowerStateContext);
+    ctx = g_slice_new0 (HandleSetPowerStateContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -1943,9 +2347,9 @@ handle_set_power_state (MmGdbusModem *skeleton,
 /*****************************************************************************/
 
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
+    MMIfaceModem          *self;
 } HandleResetContext;
 
 static void
@@ -1954,27 +2358,30 @@ handle_reset_context_free (HandleResetContext *ctx)
     g_object_unref (ctx->skeleton);
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
-    g_free (ctx);
+    g_slice_free (HandleResetContext, ctx);
 }
 
 static void
-handle_reset_ready (MMIfaceModem *self,
-                    GAsyncResult *res,
+handle_reset_ready (MMIfaceModem       *self,
+                    GAsyncResult       *res,
                     HandleResetContext *ctx)
 {
     GError *error = NULL;
 
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->reset_finish (self, res, &error))
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->reset_finish (self, res, &error)) {
+        mm_obj_warn (self, "failed requesting modem reset: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else
+    } else {
+        mm_obj_info (self, "modem reset requested");
         mm_gdbus_modem_complete_reset (ctx->skeleton, ctx->invocation);
+    }
 
     handle_reset_context_free (ctx);
 }
 
 static void
-handle_reset_auth_ready (MMBaseModem *self,
-                         GAsyncResult *res,
+handle_reset_auth_ready (MMBaseModem        *self,
+                         GAsyncResult       *res,
                          HandleResetContext *ctx)
 {
     GError *error = NULL;
@@ -1986,29 +2393,27 @@ handle_reset_auth_ready (MMBaseModem *self,
     }
 
     /* If reseting is not implemented, report an error */
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->reset ||
-        !MM_IFACE_MODEM_GET_INTERFACE (self)->reset_finish) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_UNSUPPORTED,
-                                               "Cannot reset the modem: operation not supported");
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->reset || !MM_IFACE_MODEM_GET_INTERFACE (self)->reset_finish) {
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                               "Operation not supported");
         handle_reset_context_free (ctx);
         return;
     }
 
+    mm_obj_info (self, "processing user request to reset modem...");
     MM_IFACE_MODEM_GET_INTERFACE (self)->reset (MM_IFACE_MODEM (self),
                                                 (GAsyncReadyCallback)handle_reset_ready,
                                                 ctx);
 }
 
 static gboolean
-handle_reset (MmGdbusModem *skeleton,
+handle_reset (MmGdbusModem          *skeleton,
               GDBusMethodInvocation *invocation,
-              MMIfaceModem *self)
+              MMIfaceModem          *self)
 {
     HandleResetContext *ctx;
 
-    ctx = g_new (HandleResetContext, 1);
+    ctx = g_slice_new0 (HandleResetContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -2025,10 +2430,10 @@ handle_reset (MmGdbusModem *skeleton,
 /*****************************************************************************/
 
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    gchar *code;
+    MMIfaceModem          *self;
+    gchar                 *code;
 } HandleFactoryResetContext;
 
 static void
@@ -2038,27 +2443,30 @@ handle_factory_reset_context_free (HandleFactoryResetContext *ctx)
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
     g_free (ctx->code);
-    g_free (ctx);
+    g_slice_free (HandleFactoryResetContext, ctx);
 }
 
 static void
-handle_factory_reset_ready (MMIfaceModem *self,
-                            GAsyncResult *res,
+handle_factory_reset_ready (MMIfaceModem              *self,
+                            GAsyncResult              *res,
                             HandleFactoryResetContext *ctx)
 {
     GError *error = NULL;
 
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->factory_reset_finish (self, res, &error))
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->factory_reset_finish (self, res, &error)) {
+        mm_obj_warn (self, "failed requesting modem factory reset: %s", error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else
+    } else {
+        mm_obj_info (self, "modem factory reset requested");
         mm_gdbus_modem_complete_factory_reset (ctx->skeleton, ctx->invocation);
+    }
 
     handle_factory_reset_context_free (ctx);
 }
 
 static void
-handle_factory_reset_auth_ready (MMBaseModem *self,
-                                 GAsyncResult *res,
+handle_factory_reset_auth_ready (MMBaseModem               *self,
+                                 GAsyncResult              *res,
                                  HandleFactoryResetContext *ctx)
 {
     GError *error = NULL;
@@ -2070,17 +2478,14 @@ handle_factory_reset_auth_ready (MMBaseModem *self,
     }
 
     /* If reseting is not implemented, report an error */
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->factory_reset ||
-        !MM_IFACE_MODEM_GET_INTERFACE (self)->factory_reset_finish) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_UNSUPPORTED,
-                                               "Cannot reset the modem to factory defaults: "
-                                               "operation not supported");
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->factory_reset || !MM_IFACE_MODEM_GET_INTERFACE (self)->factory_reset_finish) {
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                               "Operation not supported");
         handle_factory_reset_context_free (ctx);
         return;
     }
 
+    mm_obj_info (self, "processing user request to factory reset modem...");
     MM_IFACE_MODEM_GET_INTERFACE (self)->factory_reset (MM_IFACE_MODEM (self),
                                                         ctx->code,
                                                         (GAsyncReadyCallback)handle_factory_reset_ready,
@@ -2088,14 +2493,14 @@ handle_factory_reset_auth_ready (MMBaseModem *self,
 }
 
 static gboolean
-handle_factory_reset (MmGdbusModem *skeleton,
+handle_factory_reset (MmGdbusModem          *skeleton,
                       GDBusMethodInvocation *invocation,
-                      const gchar *code,
-                      MMIfaceModem *self)
+                      const gchar           *code,
+                      MMIfaceModem          *self)
 {
     HandleFactoryResetContext *ctx;
 
-    ctx = g_new (HandleFactoryResetContext, 1);
+    ctx = g_slice_new0 (HandleFactoryResetContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -2119,15 +2524,17 @@ handle_factory_reset (MmGdbusModem *skeleton,
  */
 
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    MMModemCapability capabilities;
+    MMIfaceModem          *self;
+    MMModemCapability      capabilities;
+    gchar                 *capabilities_str;
 } HandleSetCurrentCapabilitiesContext;
 
 static void
 handle_set_current_capabilities_context_free (HandleSetCurrentCapabilitiesContext *ctx)
 {
+    g_free (ctx->capabilities_str);
     g_object_unref (ctx->skeleton);
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
@@ -2135,17 +2542,19 @@ handle_set_current_capabilities_context_free (HandleSetCurrentCapabilitiesContex
 }
 
 static void
-set_current_capabilities_ready (MMIfaceModem *self,
-                                GAsyncResult *res,
+set_current_capabilities_ready (MMIfaceModem                        *self,
+                                GAsyncResult                        *res,
                                 HandleSetCurrentCapabilitiesContext *ctx)
 {
     GError *error = NULL;
 
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->set_current_capabilities_finish (self, res, &error))
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->set_current_capabilities_finish (self, res, &error)) {
+        mm_obj_warn (self, "failed setting current capabilities to '%s': %s", ctx->capabilities_str, error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else {
+    } else {
         /* Capabilities updated: explicitly refresh signal and access technology */
         mm_iface_modem_refresh_signal (self);
+        mm_obj_info (self, "current capabilities set to '%s'", ctx->capabilities_str);
         mm_gdbus_modem_complete_set_current_capabilities (ctx->skeleton, ctx->invocation);
     }
 
@@ -2153,15 +2562,14 @@ set_current_capabilities_ready (MMIfaceModem *self,
 }
 
 static void
-handle_set_current_capabilities_auth_ready (MMBaseModem *self,
-                                            GAsyncResult *res,
+handle_set_current_capabilities_auth_ready (MMBaseModem                         *self,
+                                            GAsyncResult                        *res,
                                             HandleSetCurrentCapabilitiesContext *ctx)
 {
-    GError *error = NULL;
-    gchar *capabilities_string;
-    GArray *supported;
-    gboolean matched = FALSE;
-    guint i;
+    GError            *error = NULL;
+    g_autoptr(GArray)  supported = NULL;
+    gboolean           matched = FALSE;
+    guint              i;
 
     if (!mm_base_modem_authorize_finish (self, res, &error)) {
         g_dbus_method_invocation_take_error (ctx->invocation, error);
@@ -2169,18 +2577,30 @@ handle_set_current_capabilities_auth_ready (MMBaseModem *self,
         return;
     }
 
+    /* Nothing to do if we already are in the requested setup */
+    if (mm_gdbus_modem_get_current_capabilities (ctx->skeleton) == ctx->capabilities) {
+        mm_gdbus_modem_complete_set_current_capabilities (ctx->skeleton, ctx->invocation);
+        handle_set_current_capabilities_context_free (ctx);
+        return;
+    }
+
+    /* If setting current capabilities is not implemented, report an error */
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->set_current_capabilities ||
+        !MM_IFACE_MODEM_GET_INTERFACE (self)->set_current_capabilities_finish) {
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                               "Setting current capabilities not supported");
+        handle_set_current_capabilities_context_free (ctx);
+        return;
+    }
+
     /* Get list of supported capabilities */
-    supported = mm_common_capability_combinations_variant_to_garray (
-        mm_gdbus_modem_get_supported_capabilities (ctx->skeleton));
+    supported = mm_common_capability_combinations_variant_to_garray (mm_gdbus_modem_get_supported_capabilities (ctx->skeleton));
 
     /* Don't allow capability switching if only one item given in the supported list */
     if (supported->len == 1) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_UNSUPPORTED,
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
                                                "Cannot change capabilities: only one combination supported");
         handle_set_current_capabilities_context_free (ctx);
-        g_array_unref (supported);
         return;
     }
 
@@ -2192,39 +2612,15 @@ handle_set_current_capabilities_auth_ready (MMBaseModem *self,
         if (supported_capability == ctx->capabilities)
                 matched = TRUE;
     }
-    g_array_unref (supported);
-
     if (!matched) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_UNSUPPORTED,
+        g_dbus_method_invocation_return_error (ctx->invocation, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
                                                "The given combination of capabilities is not supported");
         handle_set_current_capabilities_context_free (ctx);
         return;
     }
 
-    /* Check if we already are in the requested setup */
-    if (mm_gdbus_modem_get_current_capabilities (ctx->skeleton) == ctx->capabilities) {
-        /* Nothing to do */
-        mm_gdbus_modem_complete_set_current_capabilities (ctx->skeleton, ctx->invocation);
-        handle_set_current_capabilities_context_free (ctx);
-        return;
-    }
-
-    /* If setting current capabilities is not implemented, report an error */
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->set_current_capabilities ||
-        !MM_IFACE_MODEM_GET_INTERFACE (self)->set_current_capabilities_finish) {
-        g_dbus_method_invocation_return_error (ctx->invocation,
-                                               MM_CORE_ERROR,
-                                               MM_CORE_ERROR_UNSUPPORTED,
-                                               "Setting current capabilities not supported");
-        handle_set_current_capabilities_context_free (ctx);
-        return;
-    }
-
-    capabilities_string = mm_modem_capability_build_string_from_mask (ctx->capabilities);
-    mm_obj_dbg (self, "setting new list of capabilities: %s", capabilities_string);
-    g_free (capabilities_string);
+    ctx->capabilities_str = mm_modem_capability_build_string_from_mask (ctx->capabilities);
+    mm_obj_info (self, "processing user request to set current capabilities to '%s'...", ctx->capabilities_str);
 
     MM_IFACE_MODEM_GET_INTERFACE (self)->set_current_capabilities (
         MM_IFACE_MODEM (self),
@@ -2234,14 +2630,14 @@ handle_set_current_capabilities_auth_ready (MMBaseModem *self,
 }
 
 static gboolean
-handle_set_current_capabilities (MmGdbusModem *skeleton,
+handle_set_current_capabilities (MmGdbusModem          *skeleton,
                                  GDBusMethodInvocation *invocation,
-                                 guint capabilities,
-                                 MMIfaceModem *self)
+                                 guint                  capabilities,
+                                 MMIfaceModem          *self)
 {
     HandleSetCurrentCapabilitiesContext *ctx;
 
-    ctx = g_slice_new (HandleSetCurrentCapabilitiesContext);
+    ctx = g_slice_new0 (HandleSetCurrentCapabilitiesContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -2607,16 +3003,20 @@ mm_iface_modem_set_current_bands (MMIfaceModem *self,
     g_free (bands_string);
 }
 
+/*****************************************************************************/
+
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    GVariant *bands;
+    MMIfaceModem          *self;
+    GVariant              *bands;
+    gchar                 *bands_str;
 } HandleSetCurrentBandsContext;
 
 static void
 handle_set_current_bands_context_free (HandleSetCurrentBandsContext *ctx)
 {
+    g_free (ctx->bands_str);
     g_variant_unref (ctx->bands);
     g_object_unref (ctx->skeleton);
     g_object_unref (ctx->invocation);
@@ -2625,17 +3025,19 @@ handle_set_current_bands_context_free (HandleSetCurrentBandsContext *ctx)
 }
 
 static void
-handle_set_current_bands_ready (MMIfaceModem *self,
-                                GAsyncResult *res,
+handle_set_current_bands_ready (MMIfaceModem                 *self,
+                                GAsyncResult                 *res,
                                 HandleSetCurrentBandsContext *ctx)
 {
     GError *error = NULL;
 
-    if (!mm_iface_modem_set_current_bands_finish (self, res, &error))
+    if (!mm_iface_modem_set_current_bands_finish (self, res, &error)) {
+        mm_obj_warn (self, "failed setting current bands to '%s': %s", ctx->bands_str, error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else {
+    } else {
         /* Bands updated: explicitly refresh signal and access technology */
         mm_iface_modem_refresh_signal (self);
+        mm_obj_info (self, "current bands set to '%s'", ctx->bands_str);
         mm_gdbus_modem_complete_set_current_bands (ctx->skeleton, ctx->invocation);
     }
 
@@ -2643,12 +3045,12 @@ handle_set_current_bands_ready (MMIfaceModem *self,
 }
 
 static void
-handle_set_current_bands_auth_ready (MMBaseModem *self,
-                                     GAsyncResult *res,
+handle_set_current_bands_auth_ready (MMBaseModem                  *self,
+                                     GAsyncResult                 *res,
                                      HandleSetCurrentBandsContext *ctx)
 {
-    GArray *bands_array;
-    GError *error = NULL;
+    g_autoptr(GArray)  bands_array = NULL;
+    GError            *error = NULL;
 
     if (!mm_base_modem_authorize_finish (self, res, &error)) {
         g_dbus_method_invocation_take_error (ctx->invocation, error);
@@ -2656,28 +3058,30 @@ handle_set_current_bands_auth_ready (MMBaseModem *self,
         return;
     }
 
-    if (abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_DISABLED)) {
+    if (mm_iface_modem_abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_DISABLED)) {
         handle_set_current_bands_context_free (ctx);
         return;
     }
 
     bands_array = mm_common_bands_variant_to_garray (ctx->bands);
+    ctx->bands_str = mm_common_build_bands_string ((const MMModemBand *)bands_array->data, bands_array->len);
+
+    mm_obj_info (self, "processing user request to set current bands to '%s'...", ctx->bands_str);
     mm_iface_modem_set_current_bands (MM_IFACE_MODEM (self),
                                       bands_array,
                                       (GAsyncReadyCallback)handle_set_current_bands_ready,
                                       ctx);
-    g_array_unref (bands_array);
 }
 
 static gboolean
-handle_set_current_bands (MmGdbusModem *skeleton,
+handle_set_current_bands (MmGdbusModem          *skeleton,
                           GDBusMethodInvocation *invocation,
-                          GVariant *bands_variant,
-                          MMIfaceModem *self)
+                          GVariant              *bands_variant,
+                          MMIfaceModem          *self)
 {
     HandleSetCurrentBandsContext *ctx;
 
-    ctx = g_slice_new (HandleSetCurrentBandsContext);
+    ctx = g_slice_new0 (HandleSetCurrentBandsContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -2782,8 +3186,8 @@ after_set_load_current_modes_ready (MMIfaceModem *self,
         error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
                              "reloaded modes (allowed '%s' and preferred '%s') different "
                              "to the requested ones (allowed '%s' and preferred '%s')",
-                             requested_allowed_str, requested_preferred_str,
-                             current_allowed_str, current_preferred_str);
+                             current_allowed_str, current_preferred_str,
+                             requested_allowed_str, requested_preferred_str);
 
         g_free (requested_allowed_str);
         g_free (requested_preferred_str);
@@ -2994,35 +3398,45 @@ mm_iface_modem_set_current_modes (MMIfaceModem *self,
                                                             task);
 }
 
+/*****************************************************************************/
+
 typedef struct {
-    MmGdbusModem *skeleton;
+    MmGdbusModem          *skeleton;
     GDBusMethodInvocation *invocation;
-    MMIfaceModem *self;
-    MMModemMode allowed;
-    MMModemMode preferred;
+    MMIfaceModem          *self;
+    MMModemMode            allowed;
+    MMModemMode            preferred;
+    gchar                 *allowed_str;
+    gchar                 *preferred_str;
 } HandleSetCurrentModesContext;
 
 static void
 handle_set_current_modes_context_free (HandleSetCurrentModesContext *ctx)
 {
+    g_free (ctx->preferred_str);
+    g_free (ctx->allowed_str);
     g_object_unref (ctx->skeleton);
     g_object_unref (ctx->invocation);
     g_object_unref (ctx->self);
-    g_free (ctx);
+    g_slice_free (HandleSetCurrentModesContext, ctx);
 }
 
 static void
-handle_set_current_modes_ready (MMIfaceModem *self,
-                                GAsyncResult *res,
+handle_set_current_modes_ready (MMIfaceModem                 *self,
+                                GAsyncResult                 *res,
                                 HandleSetCurrentModesContext *ctx)
 {
     GError *error = NULL;
 
-    if (!mm_iface_modem_set_current_modes_finish (self, res, &error))
+    if (!mm_iface_modem_set_current_modes_finish (self, res, &error)) {
+        mm_obj_warn (self, "failed setting current modes to '%s' (preferred '%s'): %s",
+                     ctx->allowed_str, ctx->preferred_str, error->message);
         g_dbus_method_invocation_take_error (ctx->invocation, error);
-    else {
+    } else {
         /* Modes updated: explicitly refresh signal and access technology */
         mm_iface_modem_refresh_signal (self);
+        mm_obj_info (self, "current modes set to '%s' (preferred '%s')",
+                     ctx->allowed_str, ctx->preferred_str);
         mm_gdbus_modem_complete_set_current_modes (ctx->skeleton, ctx->invocation);
     }
 
@@ -3030,8 +3444,8 @@ handle_set_current_modes_ready (MMIfaceModem *self,
 }
 
 static void
-handle_set_current_modes_auth_ready (MMBaseModem *self,
-                                     GAsyncResult *res,
+handle_set_current_modes_auth_ready (MMBaseModem                  *self,
+                                     GAsyncResult                 *res,
                                      HandleSetCurrentModesContext *ctx)
 {
     GError *error = NULL;
@@ -3042,11 +3456,15 @@ handle_set_current_modes_auth_ready (MMBaseModem *self,
         return;
     }
 
-    if (abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_DISABLED)) {
+    if (mm_iface_modem_abort_invocation_if_state_not_reached (ctx->self, ctx->invocation, MM_MODEM_STATE_DISABLED)) {
         handle_set_current_modes_context_free (ctx);
         return;
     }
 
+    ctx->allowed_str = mm_modem_mode_build_string_from_mask (ctx->allowed);
+    ctx->preferred_str = mm_modem_mode_build_string_from_mask (ctx->preferred);
+    mm_obj_info (self, "processing user request to set current modes to '%s' (preferred '%s')...",
+                 ctx->allowed_str, ctx->preferred_str);
     mm_iface_modem_set_current_modes (MM_IFACE_MODEM (self),
                                       ctx->allowed,
                                       ctx->preferred,
@@ -3055,14 +3473,14 @@ handle_set_current_modes_auth_ready (MMBaseModem *self,
 }
 
 static gboolean
-handle_set_current_modes (MmGdbusModem *skeleton,
+handle_set_current_modes (MmGdbusModem          *skeleton,
                           GDBusMethodInvocation *invocation,
-                          GVariant *variant,
-                          MMIfaceModem *self)
+                          GVariant              *variant,
+                          MMIfaceModem          *self)
 {
     HandleSetCurrentModesContext *ctx;
 
-    ctx = g_new (HandleSetCurrentModesContext, 1);
+    ctx = g_slice_new0 (HandleSetCurrentModesContext);
     ctx->skeleton = g_object_ref (skeleton);
     ctx->invocation = g_object_ref (invocation);
     ctx->self = g_object_ref (self);
@@ -3083,45 +3501,57 @@ handle_set_current_modes (MmGdbusModem *skeleton,
 /*****************************************************************************/
 
 static void
-reinitialize_ready (MMBaseModem *self,
+reinitialize_ready (MMBaseModem  *self,
                     GAsyncResult *res)
 {
-    GError *error = NULL;
+    g_autoptr(GError) error = NULL;
 
     mm_base_modem_initialize_finish (self, res, &error);
-    if (error) {
+    if (error)
         mm_obj_warn (self, "reinitialization failed: %s", error->message);
-        g_error_free (error);
-    }
 }
 
 static gboolean
 restart_initialize_idle (MMIfaceModem *self)
 {
-    g_object_set_qdata (G_OBJECT (self), restart_initialize_idle_quark, NULL);
+    Private *priv;
 
-    /* If no wait needed, just go on */
+    priv = get_private (self);
+
     mm_base_modem_initialize (MM_BASE_MODEM (self),
                               (GAsyncReadyCallback) reinitialize_ready,
                               NULL);
+
+    priv->restart_initialize_idle_id = 0;
     return G_SOURCE_REMOVE;
 }
 
 static void
-restart_initialize_idle_cancel (gpointer idp)
+restart_initialize_idle_disable (MMIfaceModem *self)
 {
-    g_source_remove (GPOINTER_TO_UINT (idp));
+    Private *priv;
+
+    priv = get_private (self);
+    if (priv->restart_initialize_idle_id) {
+        g_source_remove (priv->restart_initialize_idle_id);
+        priv->restart_initialize_idle_id = 0;
+    }
 }
 
 static void
 set_lock_status (MMIfaceModem *self,
                  MmGdbusModem *skeleton,
-                 MMModemLock lock)
+                 MMModemLock   lock)
 {
-    MMModemLock old_lock;
+    MMModemLock  old_lock;
+    Private     *priv;
+
+    priv = get_private (self);
 
     old_lock = mm_gdbus_modem_get_unlock_required (skeleton);
     mm_gdbus_modem_set_unlock_required (skeleton, lock);
+    if (lock == MM_MODEM_LOCK_UNKNOWN)
+        mm_gdbus_modem_set_unlock_retries (skeleton, 0);
 
     /* We don't care about SIM-PIN2/SIM-PUK2 since the device is
      * operational without it. */
@@ -3136,25 +3566,19 @@ set_lock_status (MMIfaceModem *self,
              * If this is the case, we do NOT update the state yet, we wait
              * to be completely re-initialized to do so. */
             if (old_lock != MM_MODEM_LOCK_UNKNOWN) {
-                guint id;
-
-                if (G_UNLIKELY (!restart_initialize_idle_quark))
-                    restart_initialize_idle_quark = (g_quark_from_static_string (RESTART_INITIALIZE_IDLE_TAG));
-
-                id = g_idle_add ((GSourceFunc)restart_initialize_idle, self);
-                g_object_set_qdata_full (G_OBJECT (self),
-                                         restart_initialize_idle_quark,
-                                         GUINT_TO_POINTER (id),
-                                         (GDestroyNotify)restart_initialize_idle_cancel);
+                if (priv->restart_initialize_idle_id)
+                    g_source_remove (priv->restart_initialize_idle_id);
+                priv->restart_initialize_idle_id = g_idle_add ((GSourceFunc)restart_initialize_idle, self);
             }
         }
-    } else {
-        if (old_lock == MM_MODEM_LOCK_UNKNOWN) {
-            /* Notify transition from INITIALIZING to LOCKED */
-            mm_iface_modem_update_state (self,
-                                         MM_MODEM_STATE_LOCKED,
-                                         MM_MODEM_STATE_CHANGE_REASON_UNKNOWN);
-        }
+        return;
+    }
+
+    if (old_lock == MM_MODEM_LOCK_UNKNOWN) {
+        /* Notify transition from INITIALIZING to LOCKED */
+        mm_iface_modem_update_state (self,
+                                     MM_MODEM_STATE_LOCKED,
+                                     MM_MODEM_STATE_CHANGE_REASON_UNKNOWN);
     }
 }
 
@@ -3197,9 +3621,9 @@ mm_iface_modem_get_unlock_retries (MMIfaceModem *self)
     return unlock_retries;
 }
 
-void
-mm_iface_modem_update_unlock_retries (MMIfaceModem *self,
-                                      MMUnlockRetries *unlock_retries)
+static void
+update_unlock_retries (MMIfaceModem *self,
+                       MMUnlockRetries *unlock_retries)
 {
     MmGdbusModem *skeleton = NULL;
     GVariant *previous_dictionary;
@@ -3281,11 +3705,11 @@ load_unlock_retries_ready (MMIfaceModem *self,
 
     unlock_retries = MM_IFACE_MODEM_GET_INTERFACE (self)->load_unlock_retries_finish (self, res, &error);
     if (!unlock_retries) {
-        mm_obj_warn (self, "couldn't load unlock retries: %s", error->message);
+        mm_obj_dbg (self, "couldn't load unlock retries: %s", error->message);
         g_error_free (error);
     } else {
         /* Update the dictionary in the DBus interface */
-        mm_iface_modem_update_unlock_retries (self, unlock_retries);
+        update_unlock_retries (self, unlock_retries);
         g_object_unref (unlock_retries);
     }
 
@@ -3304,7 +3728,7 @@ modem_after_sim_unlock_ready (MMIfaceModem *self,
     GError *error = NULL;
 
     if (!MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_sim_unlock_finish (self, res, &error)) {
-        mm_obj_warn (self, "after SIM unlock failed: %s", error->message);
+        mm_obj_dbg (self, "after SIM unlock failed: %s", error->message);
         g_error_free (error);
     }
 
@@ -3348,16 +3772,16 @@ internal_load_unlock_required_ready (MMIfaceModem *self,
             g_error_matches (error,
                              MM_MOBILE_EQUIPMENT_ERROR,
                              MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG)) {
-            /* SIM errors are only critical in 3GPP-only devices */
-            if (!mm_iface_modem_is_cdma (self)) {
+            /* SIM errors are only critical in 3GPP-capable devices */
+            if (mm_iface_modem_is_3gpp (self)) {
                 ctx->saved_error = error;
                 ctx->step = UPDATE_LOCK_INFO_CONTEXT_STEP_LAST;
                 update_lock_info_context_step (task);
                 return;
             }
 
-            /* For mixed 3GPP+3GPP2 devices, skip SIM errors */
-            mm_obj_dbg (self, "skipping SIM error in 3GPP2-capable device, assuming no lock is needed");
+            /* For non 3GPP-capable devices, skip SIM errors */
+            mm_obj_info (self, "skipping SIM error in non 3GPP-capable device, assuming no lock is needed");
             g_error_free (error);
             ctx->lock = MM_MODEM_LOCK_NONE;
         } else {
@@ -3427,7 +3851,7 @@ update_lock_info_context_step (GTask *task)
             }
 
             /* If no way to run after SIM unlock step, we're done */
-            mm_obj_dbg (self, "SIM is ready, and no need for the after SIM unlock step...");
+            mm_obj_info (self, "SIM is ready, and no need for the after SIM unlock step...");
         }
         ctx->step++;
         /* fall-through */
@@ -3447,6 +3871,7 @@ update_lock_info_context_step (GTask *task)
 
     case UPDATE_LOCK_INFO_CONTEXT_STEP_LAST:
         if (ctx->saved_error) {
+            set_lock_status (self, ctx->skeleton, MM_MODEM_LOCK_UNKNOWN);
             /* Return saved error */
             g_task_return_error (task, ctx->saved_error);
             ctx->saved_error = NULL;
@@ -3474,9 +3899,6 @@ mm_iface_modem_update_lock_info (MMIfaceModem *self,
     GTask *task;
 
     ctx = g_slice_new0 (UpdateLockInfoContext);
-    g_object_get (self,
-                  MM_IFACE_MODEM_DBUS_SKELETON, &ctx->skeleton,
-                  NULL);
 
     /* If the given lock is known, we will avoid re-asking for it */
     ctx->lock = known_lock;
@@ -3484,255 +3906,308 @@ mm_iface_modem_update_lock_info (MMIfaceModem *self,
     task = g_task_new (self, NULL, callback, user_data);
     g_task_set_task_data (task, ctx, (GDestroyNotify)update_lock_info_context_free);
 
+    g_object_get (self,
+                  MM_IFACE_MODEM_DBUS_SKELETON, &ctx->skeleton,
+                  NULL);
+
+    if (!ctx->skeleton) {
+        g_task_return_new_error (task,
+                                 MM_CORE_ERROR,
+                                 MM_CORE_ERROR_FAILED,
+                                 "Couldn't get interface skeleton");
+        g_object_unref (task);
+        return;
+    }
+
     update_lock_info_context_step (task);
 }
 
 /*****************************************************************************/
 /* Set power state sequence */
 
+typedef enum {
+    SET_POWER_STATE_STEP_FIRST,
+    SET_POWER_STATE_STEP_LOAD,
+    SET_POWER_STATE_STEP_CHECK,
+    SET_POWER_STATE_STEP_UPDATE,
+    SET_POWER_STATE_STEP_FCC_UNLOCK,
+    SET_POWER_STATE_STEP_AFTER_UPDATE,
+    SET_POWER_STATE_STEP_LAST,
+} SetPowerStateStep;
+
 typedef struct {
-    MmGdbusModem *skeleton;
-    MMModemPowerState power_state;
-    MMModemPowerState previous_cached_power_state;
-    MMModemPowerState previous_real_power_state;
+    SetPowerStateStep  step;
+    MmGdbusModem      *skeleton;
+    GError            *saved_error;
+    gboolean           fcc_unlock_attempted;
+    MMModemPowerState  requested_power_state;
+    MMModemPowerState  previous_cached_power_state;
+    MMModemPowerState  previous_real_power_state;
+
+    void     (*requested_power_setup)        (MMIfaceModem         *self,
+                                              GAsyncReadyCallback   callback,
+                                              gpointer              user_data);
+    gboolean (*requested_power_setup_finish) (MMIfaceModem         *self,
+                                              GAsyncResult         *res,
+                                              GError              **error);
 } SetPowerStateContext;
 
 static void
 set_power_state_context_free (SetPowerStateContext *ctx)
 {
+    g_assert (!ctx->saved_error);
     if (ctx->skeleton)
         g_object_unref (ctx->skeleton);
     g_slice_free (SetPowerStateContext, ctx);
 }
 
 gboolean
-mm_iface_modem_set_power_state_finish (MMIfaceModem *self,
-                                       GAsyncResult *res,
-                                       GError **error)
+mm_iface_modem_set_power_state_finish (MMIfaceModem  *self,
+                                       GAsyncResult  *res,
+                                       GError       **error)
 {
     return g_task_propagate_boolean (G_TASK (res), error);
 }
 
+static void set_power_state_step (GTask *task);
+
 static void
 modem_after_power_up_ready (MMIfaceModem *self,
                             GAsyncResult *res,
-                            GTask *task)
-{
-    GError *error = NULL;
-
-    MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up_finish (self, res, &error);
-    if (error)
-        g_task_return_error (task, error);
-    else
-        g_task_return_boolean (task, TRUE);
-    g_object_unref (task);
-}
-
-static void
-modem_power_up_ready (MMIfaceModem *self,
-                      GAsyncResult *res,
-                      GTask *task)
+                            GTask        *task)
 {
     SetPowerStateContext *ctx;
-    GError *error = NULL;
 
     ctx = g_task_get_task_data (task);
+    g_assert (!ctx->saved_error);
+    MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up_finish (self, res, &ctx->saved_error);
+    if (ctx->saved_error)
+        mm_obj_info (self, "failure running after power up step: %s", ctx->saved_error->message);
 
-    MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_up_finish (self, res, &error);
-    if (error) {
-        /* If the real and cached ones are different, set the real one */
-        if (ctx->previous_cached_power_state != ctx->previous_real_power_state)
-            mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->previous_real_power_state);
-        g_task_return_error (task, error);
-        g_object_unref (task);
-        return;
-    }
-
-    mm_obj_dbg (self, "set in full-power mode...");
-    mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->power_state);
-
-    /* If we have something to do just after power-up, do it */
-    if (MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up &&
-        MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up_finish) {
-        MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up (
-            self,
-            (GAsyncReadyCallback)modem_after_power_up_ready,
-            task);
-        return;
-    }
-
-    /* Otherwise, we're done */
-    g_task_return_boolean (task, TRUE);
-    g_object_unref (task);
+    ctx->step++;
+    set_power_state_step (task);
 }
 
 static void
-modem_power_down_ready (MMIfaceModem *self,
-                        GAsyncResult *res,
-                        GTask *task)
+dispatcher_fcc_unlock_ready (MMDispatcherFccUnlock *dispatcher,
+                             GAsyncResult          *res,
+                             GTask                 *task)
 {
+    MMIfaceModem         *self;
     SetPowerStateContext *ctx;
-    GError *error = NULL;
-
-    ctx = g_task_get_task_data (task);
-
-    MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_down_finish (self, res, &error);
-    if (error) {
-        /* If the real and cached ones are different, set the real one */
-        if (ctx->previous_cached_power_state != ctx->previous_real_power_state)
-            mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->previous_real_power_state);
-        g_task_return_error (task, error);
-    } else {
-        mm_obj_dbg (self, "set in low-power mode...");
-        mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->power_state);
-        g_task_return_boolean (task, TRUE);
-    }
-
-    g_object_unref (task);
-}
-
-static void
-modem_power_off_ready (MMIfaceModem *self,
-                       GAsyncResult *res,
-                       GTask *task)
-{
-    SetPowerStateContext *ctx;
-    GError *error = NULL;
-
-    ctx = g_task_get_task_data (task);
-
-    MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_off_finish (self, res, &error);
-    if (error) {
-        /* If the real and cached ones are different, set the real one */
-        if (ctx->previous_cached_power_state != ctx->previous_real_power_state)
-            mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->previous_real_power_state);
-        g_task_return_error (task, error);
-    } else {
-        mm_obj_info (self, "powered off... may no longer be accessible");
-        mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->power_state);
-        g_task_return_boolean (task, TRUE);
-    }
-
-    g_object_unref (task);
-}
-
-static void
-set_power_state (GTask *task)
-{
-    MMIfaceModem *self;
-    SetPowerStateContext *ctx;
+    g_autoptr(GError)     error = NULL;
 
     self = g_task_get_source_object (task);
     ctx = g_task_get_task_data (task);
 
-    /* Already done if we're in the desired power state */
-    if (ctx->previous_real_power_state == ctx->power_state) {
-        mm_obj_dbg (self, "no need to change power state: already in '%s' power state",
-                    mm_modem_power_state_get_string (ctx->power_state));
-        /* If the real and cached ones are different, set the real one */
-        if (ctx->previous_cached_power_state != ctx->previous_real_power_state)
-            mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->previous_real_power_state);
-        g_task_return_boolean (task, TRUE);
-        g_object_unref (task);
-        return;
-    }
+    if (!mm_dispatcher_fcc_unlock_run_finish (dispatcher, res, &error))
+        mm_obj_dbg (self, "couldn't run FCC unlock: %s", error->message);
 
-    /* Fully powering off the modem? */
-    if (ctx->power_state == MM_MODEM_POWER_STATE_OFF) {
-        /* Error if unsupported */
-        if (!MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_off ||
-            !MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_off_finish) {
-            g_task_return_new_error (task,
-                                     MM_CORE_ERROR,
-                                     MM_CORE_ERROR_UNSUPPORTED,
-                                     "Powering off is not supported by this modem");
-            g_object_unref (task);
-            return;
+    /* always retry, even on reported error */
+    ctx->step = SET_POWER_STATE_STEP_UPDATE;
+    set_power_state_step (task);
+}
+
+static void
+fcc_unlock (GTask *task)
+{
+    MMIfaceModem          *self;
+    MMDispatcherFccUnlock *dispatcher;
+    MMModemPortInfo       *port_infos;
+    guint                  n_port_infos = 0;
+    guint                  i;
+    GPtrArray             *aux;
+    g_auto(GStrv)          modem_ports = NULL;
+
+    self = g_task_get_source_object (task);
+
+    dispatcher = mm_dispatcher_fcc_unlock_get ();
+
+    aux = g_ptr_array_new ();
+    port_infos = mm_base_modem_get_port_infos (MM_BASE_MODEM (self), &n_port_infos);
+    for (i = 0; i < n_port_infos; i++) {
+        switch (port_infos[i].type) {
+        case MM_MODEM_PORT_TYPE_AT:
+        case MM_MODEM_PORT_TYPE_QMI:
+        case MM_MODEM_PORT_TYPE_MBIM:
+            g_ptr_array_add (aux, g_strdup (port_infos[i].name));
+            break;
+        case MM_MODEM_PORT_TYPE_UNKNOWN:
+        case MM_MODEM_PORT_TYPE_NET:
+        case MM_MODEM_PORT_TYPE_QCDM:
+        case MM_MODEM_PORT_TYPE_GPS:
+        case MM_MODEM_PORT_TYPE_AUDIO:
+        case MM_MODEM_PORT_TYPE_IGNORED:
+        default:
+            break;
         }
-
-        MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_off (
-            MM_IFACE_MODEM (self),
-            (GAsyncReadyCallback)modem_power_off_ready,
-            task);
-        return;
     }
+    mm_modem_port_info_array_free (port_infos, n_port_infos);
+    g_ptr_array_add (aux, NULL);
+    modem_ports = (GStrv) g_ptr_array_free (aux, FALSE);
 
-    /* Going into low power mode? */
-    if (ctx->power_state == MM_MODEM_POWER_STATE_LOW) {
-        /* Error if unsupported */
-        if (!MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_down ||
-            !MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_down_finish) {
-            g_task_return_new_error (task,
-                                     MM_CORE_ERROR,
-                                     MM_CORE_ERROR_UNSUPPORTED,
-                                     "Going into low-power mode is not supported by this modem");
-            g_object_unref (task);
-            return;
-        }
+    mm_dispatcher_fcc_unlock_run (dispatcher,
+                                  mm_base_modem_get_vendor_id (MM_BASE_MODEM (self)),
+                                  mm_base_modem_get_product_id (MM_BASE_MODEM (self)),
+                                  g_dbus_object_get_object_path (G_DBUS_OBJECT (self)),
+                                  modem_ports,
+                                  g_task_get_cancellable (task),
+                                  (GAsyncReadyCallback)dispatcher_fcc_unlock_ready,
+                                  task);
+}
 
-        MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_down (
-            MM_IFACE_MODEM (self),
-            (GAsyncReadyCallback)modem_power_down_ready,
-            task);
-        return;
-    }
+static void
+requested_power_setup_ready (MMIfaceModem *self,
+                             GAsyncResult *res,
+                             GTask        *task)
+{
+    SetPowerStateContext *ctx;
 
-    /* Going out of low power mode? */
-    if (ctx->power_state == MM_MODEM_POWER_STATE_ON) {
-        /* Error if unsupported */
-        if (!MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_up ||
-            !MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_up_finish) {
-            g_task_return_new_error (task,
-                                     MM_CORE_ERROR,
-                                     MM_CORE_ERROR_UNSUPPORTED,
-                                     "Going into full-power mode is not supported by this modem");
-            g_object_unref (task);
-            return;
-        }
+    ctx = g_task_get_task_data (task);
+    g_assert (!ctx->saved_error);
+    if (!ctx->requested_power_setup_finish (self, res, &ctx->saved_error))
+        mm_obj_info (self, "couldn't update power state: %s", ctx->saved_error->message);
 
-        MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_up (
-            MM_IFACE_MODEM (self),
-            (GAsyncReadyCallback)modem_power_up_ready,
-            task);
-        return;
-    }
-
-    g_assert_not_reached ();
+    ctx->step++;
+    set_power_state_step (task);
 }
 
 static void
 set_power_state_load_ready (MMIfaceModem *self,
                             GAsyncResult *res,
-                            GTask *task)
+                            GTask        *task)
 {
     SetPowerStateContext *ctx;
-    GError *error = NULL;
+    g_autoptr(GError)     error = NULL;
 
     ctx = g_task_get_task_data (task);
 
     ctx->previous_real_power_state = MM_IFACE_MODEM_GET_INTERFACE (self)->load_power_state_finish (self, res, &error);
     if (error) {
         mm_obj_dbg (self, "couldn't reload current power state: %s", error->message);
-        g_error_free (error);
         /* Default to the cached one */
         ctx->previous_real_power_state = ctx->previous_cached_power_state;
     }
 
-    /* And keep on */
-    set_power_state (task);
+    ctx->step++;
+    set_power_state_step (task);
+}
+
+static void
+set_power_state_step (GTask *task)
+{
+    MMIfaceModem         *self;
+    SetPowerStateContext *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data     (task);
+
+    switch (ctx->step) {
+    case SET_POWER_STATE_STEP_FIRST:
+        ctx->step++;
+        /* fall-through */
+
+    case SET_POWER_STATE_STEP_LOAD:
+        /* We cannot really rely on the power state value that we had cached before,
+         * as the real power status of the modem may also be changed by rfkill. So,
+         * before updating the current power state, re-check which is the real power
+         * state. */
+        if (MM_IFACE_MODEM_GET_INTERFACE (self)->load_power_state &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_power_state_finish) {
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_power_state (self, (GAsyncReadyCallback)set_power_state_load_ready, task);
+            return;
+        }
+        /* If there is no way to load power state, just keep on assuming the cached
+         * one is also the real one */
+        ctx->previous_real_power_state = ctx->previous_cached_power_state;
+        ctx->step++;
+        /* fall-through */
+
+    case SET_POWER_STATE_STEP_CHECK:
+        /* Already done if we're in the desired power state */
+        if (ctx->previous_real_power_state == ctx->requested_power_state) {
+            mm_obj_dbg (self, "no need to change power state: already '%s'",
+                        mm_modem_power_state_get_string (ctx->requested_power_state));
+            ctx->step = SET_POWER_STATE_STEP_LAST;
+            set_power_state_step (task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case SET_POWER_STATE_STEP_UPDATE:
+        mm_obj_dbg (self, "updating power state: '%s'...", mm_modem_power_state_get_string (ctx->requested_power_state));
+
+        /* Error if unsupported */
+        if (!ctx->requested_power_setup || !ctx->requested_power_setup_finish) {
+            g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                     "Requested power transition is not supported by this modem");
+            g_object_unref (task);
+            return;
+        }
+
+        ctx->requested_power_setup (self, (GAsyncReadyCallback)requested_power_setup_ready, task);
+        return;
+
+    case SET_POWER_STATE_STEP_FCC_UNLOCK:
+        /* The FCC unlock operation and update retry should only be done
+         * if requested by the implementation with MM_CORE_ERROR_RETRY. */
+        if ((ctx->requested_power_state == MM_MODEM_POWER_STATE_ON) &&
+            ctx->saved_error &&
+            g_error_matches (ctx->saved_error, MM_CORE_ERROR, MM_CORE_ERROR_RETRY) &&
+            !ctx->fcc_unlock_attempted) {
+            mm_obj_dbg (self, "attempting FCC unlock...");
+            g_clear_error (&ctx->saved_error);
+            ctx->fcc_unlock_attempted = TRUE;
+            fcc_unlock (task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case SET_POWER_STATE_STEP_AFTER_UPDATE:
+        if ((ctx->requested_power_state == MM_MODEM_POWER_STATE_ON) &&
+            !ctx->saved_error &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up_finish) {
+            mm_obj_dbg (self, "running after power up operation...");
+            MM_IFACE_MODEM_GET_INTERFACE (self)->modem_after_power_up (self, (GAsyncReadyCallback)modem_after_power_up_ready, task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case SET_POWER_STATE_STEP_LAST:
+        if (ctx->saved_error) {
+            /* If the real and cached ones are different, set the real one */
+            if (ctx->previous_cached_power_state != ctx->previous_real_power_state)
+                mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->previous_real_power_state);
+            g_task_return_error (task, g_steal_pointer (&ctx->saved_error));
+        } else {
+            mm_obj_msg (self, "power state updated: %s", mm_modem_power_state_get_string (ctx->requested_power_state));
+            mm_gdbus_modem_set_power_state (ctx->skeleton, ctx->requested_power_state);
+            g_task_return_boolean (task, TRUE);
+        }
+        g_object_unref (task);
+        return;
+
+    default:
+        g_assert_not_reached ();
+    }
 }
 
 void
-mm_iface_modem_set_power_state (MMIfaceModem *self,
-                                MMModemPowerState power_state,
-                                GAsyncReadyCallback callback,
-                                gpointer user_data)
+mm_iface_modem_set_power_state (MMIfaceModem        *self,
+                                MMModemPowerState    power_state,
+                                GAsyncReadyCallback  callback,
+                                gpointer             user_data)
 {
     SetPowerStateContext *ctx;
-    GTask *task;
+    GTask                *task;
 
     ctx = g_slice_new0 (SetPowerStateContext);
-    ctx->power_state = power_state;
+    ctx->step = SET_POWER_STATE_STEP_FIRST;
+    ctx->requested_power_state = power_state;
 
     task = g_task_new (self, NULL, callback, user_data);
     g_task_set_task_data (task, ctx, (GDestroyNotify)set_power_state_context_free);
@@ -3748,26 +4223,28 @@ mm_iface_modem_set_power_state (MMIfaceModem *self,
         g_object_unref (task);
         return;
     }
-
     ctx->previous_cached_power_state = mm_gdbus_modem_get_power_state (ctx->skeleton);
 
-    /* We cannot really rely on the power state value that we had cached before,
-     * as the real power status of the modem may also be changed by rfkill. So,
-     * before updating the current power state, re-check which is the real power
-     * state. */
-    if (MM_IFACE_MODEM_GET_INTERFACE (self)->load_power_state &&
-        MM_IFACE_MODEM_GET_INTERFACE (self)->load_power_state_finish) {
-        MM_IFACE_MODEM_GET_INTERFACE (self)->load_power_state (
-            self,
-            (GAsyncReadyCallback)set_power_state_load_ready,
-            task);
-        return;
+    /* Setup requested operation */
+    switch (ctx->requested_power_state) {
+    case MM_MODEM_POWER_STATE_OFF:
+        ctx->requested_power_setup = MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_off;
+        ctx->requested_power_setup_finish = MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_off_finish;
+        break;
+    case MM_MODEM_POWER_STATE_LOW:
+        ctx->requested_power_setup = MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_down;
+        ctx->requested_power_setup_finish = MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_down_finish;
+        break;
+    case MM_MODEM_POWER_STATE_ON:
+        ctx->requested_power_setup = MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_up;
+        ctx->requested_power_setup_finish = MM_IFACE_MODEM_GET_INTERFACE (self)->modem_power_up_finish;
+        break;
+    case MM_MODEM_POWER_STATE_UNKNOWN:
+    default:
+        g_assert_not_reached ();
     }
 
-    /* If there is no way to load power state, just keep on assuming the cached
-     * one is also the real one */
-    ctx->previous_real_power_state = ctx->previous_cached_power_state;
-    set_power_state (task);
+    set_power_state_step (task);
 }
 
 /*****************************************************************************/
@@ -3786,7 +4263,23 @@ mm_iface_modem_disable (MMIfaceModem *self,
                         GAsyncReadyCallback callback,
                         gpointer user_data)
 {
-    GTask *task;
+    MmGdbusModem *skeleton = NULL;
+    GTask        *task;
+
+    g_object_get (self,
+                  MM_IFACE_MODEM_DBUS_SKELETON, &skeleton,
+                  NULL);
+
+    /*
+     * Set signal quality to 0% and access technologies to unknown since modem is disabled
+     */
+    if (skeleton) {
+        mm_gdbus_modem_set_signal_quality (MM_GDBUS_MODEM (skeleton),
+                                           g_variant_new ("(ub)", 0, TRUE));
+        mm_gdbus_modem_set_access_technologies (MM_GDBUS_MODEM (skeleton),
+                                                MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN);
+        g_object_unref (skeleton);
+    }
 
     /* Just complete, nothing to do */
     task = g_task_new (self, NULL, callback, user_data);
@@ -3852,15 +4345,13 @@ enabling_set_power_state_ready (MMIfaceModem *self,
 static void
 check_for_sim_swap_ready (MMIfaceModem *self,
                           GAsyncResult *res,
-                          GTask *task)
+                          GTask        *task)
 {
-    EnablingContext *ctx;
-    GError *error = NULL;
+    EnablingContext   *ctx;
+    g_autoptr(GError)  error = NULL;
 
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap_finish (self, res, &error)) {
-        mm_obj_warn (self, "failed to check if SIM was swapped: %s", error->message);
-        g_error_free (error);
-    }
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap_finish (self, res, &error))
+        mm_obj_dbg (self, "failed to check if SIM was swapped: %s", error->message);
 
     /* Go on to next step */
     ctx = g_task_get_task_data (task);
@@ -3930,6 +4421,8 @@ interface_enabling_step (GTask *task)
             MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap_finish) {
             MM_IFACE_MODEM_GET_INTERFACE (self)->check_for_sim_swap (
                 self,
+                NULL,
+                NULL,
                 (GAsyncReadyCallback)check_for_sim_swap_ready,
                 task);
             return;
@@ -3993,6 +4486,204 @@ mm_iface_modem_enable (MMIfaceModem *self,
 }
 
 /*****************************************************************************/
+/* MODEM SYNCHRONIZATION */
+
+#if defined WITH_SUSPEND_RESUME
+
+typedef struct _SyncingContext SyncingContext;
+static void interface_syncing_step (GTask *task);
+
+typedef enum {
+    SYNCING_STEP_FIRST,
+    SYNCING_STEP_DETECT_SIM_SWAP,
+    SYNCING_STEP_REFRESH_SIM_LOCK,
+    SYNCING_STEP_REFRESH_SIGNAL_STRENGTH,
+    SYNCING_STEP_REFRESH_BEARERS,
+    SYNCING_STEP_LAST
+} SyncingStep;
+
+struct _SyncingContext {
+    SyncingStep step;
+};
+
+gboolean
+mm_iface_modem_sync_finish (MMIfaceModem  *self,
+                            GAsyncResult  *res,
+                            GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+sync_all_bearers_ready (MMBearerList *bearer_list,
+                        GAsyncResult *res,
+                        GTask        *task)
+{
+    MMIfaceModem       *self;
+    SyncingContext     *ctx;
+    g_autoptr (GError)  error = NULL;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    if (!mm_bearer_list_sync_all_bearers_finish (bearer_list, res, &error))
+        mm_obj_warn (self, "synchronizing all bearer status failed: %s", error->message);
+
+    /* Go on to next step */
+    ctx->step++;
+    interface_syncing_step (task);
+}
+
+static void
+reload_bearers (GTask *task)
+{
+    MMIfaceModem            *self;
+    SyncingContext          *ctx;
+    g_autoptr(MMBearerList)  bearer_list = NULL;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    g_object_get (self,
+                  MM_IFACE_MODEM_BEARER_LIST, &bearer_list,
+                  NULL);
+
+    /* If no bearer list (e.g. none created or modem disabled),
+     * go on to next step */
+    if (!bearer_list) {
+        ctx->step++;
+        interface_syncing_step (task);
+        return;
+    }
+
+    mm_bearer_list_sync_all_bearers (bearer_list,
+                                     (GAsyncReadyCallback)sync_all_bearers_ready,
+                                     task);
+}
+
+static void
+sync_sim_lock_ready (MMIfaceModem *self,
+                     GAsyncResult *res,
+                     GTask        *task)
+{
+    SyncingContext     *ctx;
+    g_autoptr (GError)  error = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->load_unlock_required_finish (self, res, &error))
+        mm_obj_warn (self, "checking sim lock status failed: %s", error->message);
+
+    /* Go on to next step */
+    ctx->step++;
+    interface_syncing_step (task);
+}
+
+static void
+sync_detect_sim_swap_ready (MMIfaceModem *self,
+                            GAsyncResult *res,
+                            GTask        *task)
+{
+    SyncingContext     *ctx;
+    g_autoptr (GError)  error = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    if (!mm_iface_modem_check_for_sim_swap_finish (self, res, &error))
+        mm_obj_warn (self, "checking sim swap failed: %s", error->message);
+
+    /* Go on to next step */
+    ctx->step++;
+    interface_syncing_step (task);
+}
+
+static void
+interface_syncing_step (GTask *task)
+{
+    MMIfaceModem   *self;
+    SyncingContext *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx = g_task_get_task_data (task);
+
+    switch (ctx->step) {
+    case SYNCING_STEP_FIRST:
+        ctx->step++;
+        /* fall through */
+
+    case SYNCING_STEP_DETECT_SIM_SWAP:
+        /*
+         * Detect possible SIM swaps.
+         * Checking lock status in all cases after possible SIM swaps are detected.
+         */
+        mm_iface_modem_check_for_sim_swap (
+            self,
+            NULL,
+            NULL,
+            (GAsyncReadyCallback)sync_detect_sim_swap_ready,
+            task);
+        return;
+
+    case SYNCING_STEP_REFRESH_SIM_LOCK:
+        /*
+         * Refresh SIM lock status and wait until complete.
+         */
+        MM_IFACE_MODEM_GET_INTERFACE (self)->load_unlock_required (
+            self,
+            FALSE,
+            (GAsyncReadyCallback)sync_sim_lock_ready,
+            task);
+        return;
+
+    case SYNCING_STEP_REFRESH_SIGNAL_STRENGTH:
+        /*
+         * Restart the signal strength and access technologies refresh sequence.
+         */
+        mm_iface_modem_refresh_signal (self);
+        ctx->step++;
+        /* fall through */
+
+    case SYNCING_STEP_REFRESH_BEARERS:
+        /*
+         * Refresh bearers.
+         */
+        reload_bearers (task);
+        return;
+
+    case SYNCING_STEP_LAST:
+        /* We are done without errors! */
+        g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+        return;
+
+    default:
+        break;
+    }
+
+    g_assert_not_reached ();
+}
+
+void
+mm_iface_modem_sync (MMIfaceModem        *self,
+                     GAsyncReadyCallback  callback,
+                     gpointer             user_data)
+{
+    SyncingContext *ctx;
+    GTask          *task;
+
+    /* Create SyncingContext */
+    ctx = g_new0 (SyncingContext, 1);
+    ctx->step = SYNCING_STEP_FIRST;
+
+    /* Create sync steps task and execute it */
+    task = g_task_new (self, NULL, callback, user_data);
+    g_task_set_task_data (task, ctx, (GDestroyNotify)g_free);
+    interface_syncing_step (task);
+}
+
+#endif
+
+/*****************************************************************************/
 /* MODEM INITIALIZATION */
 
 typedef struct _InitializationContext InitializationContext;
@@ -4016,13 +4707,15 @@ typedef enum {
     INITIALIZATION_STEP_SUPPORTED_BANDS,
     INITIALIZATION_STEP_SUPPORTED_IP_FAMILIES,
     INITIALIZATION_STEP_POWER_STATE,
+    INITIALIZATION_STEP_CURRENT_MODES,
+    INITIALIZATION_STEP_CURRENT_BANDS,
     INITIALIZATION_STEP_SIM_HOT_SWAP,
+    INITIALIZATION_STEP_SIM_SLOTS,
     INITIALIZATION_STEP_UNLOCK_REQUIRED,
     INITIALIZATION_STEP_SIM,
     INITIALIZATION_STEP_SETUP_CARRIER_CONFIG,
     INITIALIZATION_STEP_OWN_NUMBERS,
-    INITIALIZATION_STEP_CURRENT_MODES,
-    INITIALIZATION_STEP_CURRENT_BANDS,
+    INITIALIZATION_STEP_VALIDATE_ESIM_STATUS,
     INITIALIZATION_STEP_LAST
 } InitializationStep;
 
@@ -4047,22 +4740,19 @@ initialization_context_free (InitializationContext *ctx)
     static void                                                         \
     load_##NAME##_ready (MMIfaceModem *self,                            \
                          GAsyncResult *res,                             \
-                         GTask *task)                                   \
+                         GTask        *task)                            \
     {                                                                   \
         InitializationContext *ctx;                                     \
-        GError *error = NULL;                                           \
-        gchar *val;                                                     \
+        g_autoptr(GError)      error = NULL;                            \
+        g_autofree gchar      *val = NULL;                              \
                                                                         \
         ctx = g_task_get_task_data (task);                              \
                                                                         \
         val = MM_IFACE_MODEM_GET_INTERFACE (self)->load_##NAME##_finish (self, res, &error); \
         mm_gdbus_modem_set_##NAME (ctx->skeleton, val);                 \
-        g_free (val);                                                   \
                                                                         \
-        if (error) {                                                    \
-            mm_obj_warn (self, "couldn't load %s: %s", DISPLAY, error->message); \
-            g_error_free (error);                                       \
-        }                                                               \
+        if (error)                                                      \
+            mm_obj_dbg (self, "couldn't load %s: %s", DISPLAY, error->message); \
                                                                         \
         /* Go on to next step */                                        \
         ctx->step++;                                                    \
@@ -4074,10 +4764,10 @@ initialization_context_free (InitializationContext *ctx)
     static void                                                         \
     load_##NAME##_ready (MMIfaceModem *self,                            \
                          GAsyncResult *res,                             \
-                         GTask *task)                                   \
+                         GTask        *task)                            \
     {                                                                   \
         InitializationContext *ctx;                                     \
-        GError *error = NULL;                                           \
+        g_autoptr(GError)      error = NULL;                            \
                                                                         \
         ctx = g_task_get_task_data (task);                              \
                                                                         \
@@ -4085,57 +4775,13 @@ initialization_context_free (InitializationContext *ctx)
             ctx->skeleton,                                              \
             MM_IFACE_MODEM_GET_INTERFACE (self)->load_##NAME##_finish (self, res, &error)); \
                                                                         \
-        if (error) {                                                    \
-            mm_obj_warn (self, "couldn't load %s: %s", DISPLAY, error->message); \
-            g_error_free (error);                                       \
-        }                                                               \
+        if (error)                                                      \
+            mm_obj_dbg (self, "couldn't load %s: %s", DISPLAY, error->message); \
                                                                         \
         /* Go on to next step */                                        \
         ctx->step++;                                                    \
         interface_initialization_step (task);                           \
     }
-
-static void
-current_capabilities_internal_load_unlock_required_ready (MMIfaceModem *self,
-                                                          GAsyncResult *res,
-                                                          GTask *task)
-{
-    InitializationContext *ctx;
-    GError *error = NULL;
-
-    ctx = g_task_get_task_data (task);
-
-    internal_load_unlock_required_finish (self, res, &error);
-    if (error) {
-        /* These SIM errors indicate that there is NO valid SIM available. So,
-         * remove all 3GPP caps from the current capabilities */
-        if (g_error_matches (error,
-                             MM_MOBILE_EQUIPMENT_ERROR,
-                             MM_MOBILE_EQUIPMENT_ERROR_SIM_NOT_INSERTED) ||
-            g_error_matches (error,
-                             MM_MOBILE_EQUIPMENT_ERROR,
-                             MM_MOBILE_EQUIPMENT_ERROR_SIM_FAILURE) ||
-            g_error_matches (error,
-                             MM_MOBILE_EQUIPMENT_ERROR,
-                             MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG)) {
-            MMModemCapability caps;
-
-            mm_obj_dbg (self, "multimode device without SIM, no 3GPP capabilities");
-            caps = mm_gdbus_modem_get_current_capabilities (ctx->skeleton);
-            caps &= ~MM_MODEM_CAPABILITY_3GPP;
-
-            /* CDMA-EVDO must still be around */
-            g_assert (caps & MM_MODEM_CAPABILITY_CDMA_EVDO);
-            mm_gdbus_modem_set_current_capabilities (ctx->skeleton, caps);
-        }
-
-        g_error_free (error);
-    }
-
-    /* Keep on */
-    ctx->step++;
-    interface_initialization_step (task);
-}
 
 static void
 load_current_capabilities_ready (MMIfaceModem *self,
@@ -4144,14 +4790,15 @@ load_current_capabilities_ready (MMIfaceModem *self,
 {
     InitializationContext *ctx;
     MMModemCapability caps;
-    GError *error = NULL;
+    g_autoptr(GError) error = NULL;
 
     ctx = g_task_get_task_data (task);
 
     caps = MM_IFACE_MODEM_GET_INTERFACE (self)->load_current_capabilities_finish (self, res, &error);
     if (error) {
-        g_propagate_error (&ctx->fatal_error, error);
-        g_prefix_error (&ctx->fatal_error, "couldn't load current capabilities: ");
+        ctx->fatal_error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                        "Failed to load current capabilities: %s",
+                                        error->message);
         /* Jump to the last step */
         ctx->step = INITIALIZATION_STEP_LAST;
         interface_initialization_step (task);
@@ -4188,21 +4835,7 @@ load_current_capabilities_ready (MMIfaceModem *self,
                       NULL);
     }
 
-    /* Update current caps right away, even if we may fix them during the
-     * multimode device check. No big deal in updating them twice, as we're not
-     * exposed in DBus yet. */
     mm_gdbus_modem_set_current_capabilities (ctx->skeleton, caps);
-
-    /* If the device is a multimode device (3GPP+3GPP2) check whether we have a
-     * SIM or not. */
-    if ((caps & MM_MODEM_CAPABILITY_CDMA_EVDO) && (caps & MM_MODEM_CAPABILITY_3GPP)) {
-        mm_obj_dbg (self, "checking if multimode device has a SIM...");
-        internal_load_unlock_required (
-            self,
-            (GAsyncReadyCallback)current_capabilities_internal_load_unlock_required_ready,
-            task);
-        return;
-    }
 
     ctx->step++;
     interface_initialization_step (task);
@@ -4215,14 +4848,15 @@ load_supported_capabilities_ready (MMIfaceModem *self,
 {
     InitializationContext *ctx;
     GArray *supported_capabilities;
-    GError *error = NULL;
+    g_autoptr(GError) error = NULL;
 
     ctx = g_task_get_task_data (task);
 
     supported_capabilities = MM_IFACE_MODEM_GET_INTERFACE (self)->load_supported_capabilities_finish (self, res, &error);
     if (error) {
-        g_propagate_error (&ctx->fatal_error, error);
-        g_prefix_error (&ctx->fatal_error, "couldn't load supported capabilities: ");
+        ctx->fatal_error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                                        "Failed to load supported capabilities: %s",
+                                        error->message);
         /* Jump to the last step */
         ctx->step = INITIALIZATION_STEP_LAST;
         interface_initialization_step (task);
@@ -4248,19 +4882,16 @@ STR_REPLY_READY_FN (device_identifier, "device identifier")
 static void
 load_supported_charsets_ready (MMIfaceModem *self,
                                GAsyncResult *res,
-                               GTask *task)
+                               GTask        *task)
 {
     InitializationContext *ctx;
-    GError *error = NULL;
+    g_autoptr(GError)      error = NULL;
 
     ctx = g_task_get_task_data (task);
 
-    ctx->supported_charsets =
-        MM_IFACE_MODEM_GET_INTERFACE (self)->load_supported_charsets_finish (self, res, &error);
-    if (error) {
-        mm_obj_warn (self, "couldn't load supported charsets: %s", error->message);
-        g_error_free (error);
-    }
+    ctx->supported_charsets = MM_IFACE_MODEM_GET_INTERFACE (self)->load_supported_charsets_finish (self, res, &error);
+    if (error)
+        mm_obj_dbg (self, "couldn't load supported charsets: %s", error->message);
 
     /* Go on to next step */
     ctx->step++;
@@ -4270,22 +4901,20 @@ load_supported_charsets_ready (MMIfaceModem *self,
 static void
 setup_charset_ready (MMIfaceModem *self,
                      GAsyncResult *res,
-                     GTask *task)
+                     GTask        *task)
 {
     InitializationContext *ctx;
-    GError *error = NULL;
+    g_autoptr(GError)      error = NULL;
 
     ctx = g_task_get_task_data (task);
 
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->setup_charset_finish (self, res, &error)) {
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->setup_charset_finish (self, res, &error))
         mm_obj_dbg (self, "couldn't set charset '%s': %s",
                     mm_modem_charset_to_string (*ctx->current_charset),
                     error->message);
-        g_error_free (error);
-
         /* Will retry step with some other charset type */
-    } else
-        /* Done, Go on to next step */
+    else
+        /* Done, go on to next step */
         ctx->step++;
 
     interface_initialization_step (task);
@@ -4294,11 +4923,11 @@ setup_charset_ready (MMIfaceModem *self,
 static void
 load_supported_modes_ready (MMIfaceModem *self,
                             GAsyncResult *res,
-                            GTask *task)
+                            GTask        *task)
 {
     InitializationContext *ctx;
-    GError *error = NULL;
-    GArray *modes_array;
+    g_autoptr(GError)      error = NULL;
+    GArray                *modes_array;
 
     ctx = g_task_get_task_data (task);
 
@@ -4309,10 +4938,8 @@ load_supported_modes_ready (MMIfaceModem *self,
         g_array_unref (modes_array);
     }
 
-    if (error) {
-        mm_obj_warn (self, "couldn't load supported modes: %s", error->message);
-        g_error_free (error);
-    }
+    if (error)
+        mm_obj_dbg (self, "couldn't load supported modes: %s", error->message);
 
     /* Go on to next step */
     ctx->step++;
@@ -4322,11 +4949,11 @@ load_supported_modes_ready (MMIfaceModem *self,
 static void
 load_supported_bands_ready (MMIfaceModem *self,
                             GAsyncResult *res,
-                            GTask *task)
+                            GTask        *task)
 {
     InitializationContext *ctx;
-    GError *error = NULL;
-    GArray *bands_array;
+    g_autoptr(GError)      error = NULL;
+    GArray                *bands_array;
 
     ctx = g_task_get_task_data (task);
 
@@ -4338,10 +4965,8 @@ load_supported_bands_ready (MMIfaceModem *self,
         g_array_unref (bands_array);
     }
 
-    if (error) {
-        mm_obj_warn (self, "couldn't load supported bands: %s", error->message);
-        g_error_free (error);
-    }
+    if (error)
+        mm_obj_dbg (self, "couldn't load supported bands: %s", error->message);
 
     /* Go on to next step */
     ctx->step++;
@@ -4351,11 +4976,11 @@ load_supported_bands_ready (MMIfaceModem *self,
 static void
 load_supported_ip_families_ready (MMIfaceModem *self,
                                   GAsyncResult *res,
-                                  GTask *task)
+                                  GTask        *task)
 {
     InitializationContext *ctx;
-    GError *error = NULL;
-    MMBearerIpFamily ip_families;
+    g_autoptr(GError)      error = NULL;
+    MMBearerIpFamily       ip_families;
 
     ctx = g_task_get_task_data (task);
 
@@ -4364,10 +4989,8 @@ load_supported_ip_families_ready (MMIfaceModem *self,
     if (ip_families != MM_BEARER_IP_FAMILY_NONE)
         mm_gdbus_modem_set_supported_ip_families (ctx->skeleton, ip_families);
 
-    if (error) {
-        mm_obj_warn (self, "couldn't load supported IP families: %s", error->message);
-        g_error_free (error);
-    }
+    if (error)
+        mm_obj_dbg (self, "couldn't load supported IP families: %s", error->message);
 
     /* Go on to next step */
     ctx->step++;
@@ -4377,22 +5000,156 @@ load_supported_ip_families_ready (MMIfaceModem *self,
 UINT_REPLY_READY_FN (power_state, "power state")
 
 static void
-setup_sim_hot_swap_ready (MMIfaceModem *self,
+load_current_modes_ready (MMIfaceModem *self,
                           GAsyncResult *res,
                           GTask        *task)
 {
     InitializationContext *ctx;
+    MMModemMode            allowed = MM_MODEM_MODE_NONE;
+    MMModemMode            preferred = MM_MODEM_MODE_NONE;
     g_autoptr(GError)      error = NULL;
 
     ctx = g_task_get_task_data (task);
 
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->load_current_modes_finish (self,
+                                                                         res,
+                                                                         &allowed,
+                                                                         &preferred,
+                                                                         &error))
+        /* Errors when getting allowed/preferred won't be critical */
+        mm_obj_dbg (self, "couldn't load current allowed/preferred modes: %s", error->message);
+    else
+        mm_gdbus_modem_set_current_modes (ctx->skeleton, g_variant_new ("(uu)", allowed, preferred));
+
+    /* Done, Go on to next step */
+    ctx->step++;
+    interface_initialization_step (task);
+}
+
+static void
+load_current_bands_ready (MMIfaceModem *self,
+                          GAsyncResult *res,
+                          GTask *task)
+{
+    InitializationContext *ctx;
+    GArray                *current_bands;
+    g_autoptr(GError)      error = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    current_bands = MM_IFACE_MODEM_GET_INTERFACE (self)->load_current_bands_finish (self, res, &error);
+    if (!current_bands) {
+        /* Errors when getting current bands won't be critical */
+        mm_obj_dbg (self, "couldn't load current bands: %s", error->message);
+    } else {
+        GArray *filtered_bands;
+        GArray *supported_bands;
+
+        supported_bands = (mm_common_bands_variant_to_garray (
+                               mm_gdbus_modem_get_supported_bands (ctx->skeleton)));
+        filtered_bands = mm_filter_current_bands (supported_bands, current_bands);
+
+        g_array_unref (current_bands);
+        if (supported_bands)
+            g_array_unref (supported_bands);
+
+        if (filtered_bands) {
+            mm_common_bands_garray_sort (filtered_bands);
+            mm_gdbus_modem_set_current_bands (ctx->skeleton,
+                                              mm_common_bands_garray_to_variant (filtered_bands));
+            g_array_unref (filtered_bands);
+        }
+    }
+
+    /* Done, Go on to next step */
+    ctx->step++;
+    interface_initialization_step (task);
+}
+
+static void
+setup_sim_hot_swap_ready (MMIfaceModem *self,
+                          GAsyncResult *res,
+                          GTask        *task)
+{
+    Private               *priv;
+    InitializationContext *ctx;
+    g_autoptr(GError)      error = NULL;
+
+    priv = get_private (self);
+    ctx  = g_task_get_task_data (task);
+
     MM_IFACE_MODEM_GET_INTERFACE (self)->setup_sim_hot_swap_finish (self, res, &error);
     if (error)
-        mm_obj_warn (self, "SIM hot swap setup failed: %s", error->message);
+        mm_obj_info (self, "SIM hot swap setup failed: %s", error->message);
     else {
-        mm_obj_dbg (self, "SIM hot swap setup succeeded");
+        mm_obj_info (self, "SIM hot swap setup succeeded");
+        priv->sim_hot_swap_configured = TRUE;
+    }
+
+    /* Go on to next step */
+    ctx->step++;
+    interface_initialization_step (task);
+}
+
+static void
+load_sim_slots_ready (MMIfaceModem *self,
+                      GAsyncResult *res,
+                      GTask        *task)
+{
+    InitializationContext *ctx;
+    g_autoptr(GPtrArray)   sim_slots = NULL;
+    g_autoptr(GError)      error = NULL;
+    guint                  primary_sim_slot = 0;
+
+    ctx  = g_task_get_task_data (task);
+
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->load_sim_slots_finish (self,
+                                                                     res,
+                                                                     &sim_slots,
+                                                                     &primary_sim_slot,
+                                                                     &error))
+        mm_obj_dbg (self, "couldn't query SIM slots: %s", error->message);
+
+    if (sim_slots) {
+        MMBaseSim     *primary_sim = NULL;
+        GPtrArray     *sim_slot_paths_array;
+        g_auto(GStrv)  sim_slot_paths = NULL;
+        guint          i;
+
+        g_assert (primary_sim_slot);
+        g_assert_cmpuint (primary_sim_slot, <=, sim_slots->len);
+
+        sim_slot_paths_array = g_ptr_array_new ();
+        for (i = 0; i < sim_slots->len; i++) {
+            MMBaseSim   *sim;
+            const gchar *sim_path;
+
+            sim = MM_BASE_SIM (g_ptr_array_index (sim_slots, i));
+            if (!sim) {
+                g_ptr_array_add (sim_slot_paths_array, g_strdup ("/"));
+                continue;
+            }
+
+            sim_path = mm_base_sim_get_path (sim);
+            g_ptr_array_add (sim_slot_paths_array, g_strdup (sim_path));
+        }
+        g_ptr_array_add (sim_slot_paths_array, NULL);
+        sim_slot_paths = (GStrv) g_ptr_array_free (sim_slot_paths_array, FALSE);
+
+        mm_gdbus_modem_set_sim_slots (ctx->skeleton, (const gchar *const *)sim_slot_paths);
+        mm_gdbus_modem_set_primary_sim_slot (ctx->skeleton, primary_sim_slot);
+
+        /* If loading SIM slots is supported, we also expose already the primary active SIM object */
+        if (primary_sim_slot) {
+            primary_sim = g_ptr_array_index (sim_slots, primary_sim_slot - 1);
+            if (primary_sim)
+                g_object_bind_property (primary_sim, MM_BASE_SIM_PATH,
+                                        ctx->skeleton, "sim",
+                                        G_BINDING_DEFAULT | G_BINDING_SYNC_CREATE);
+        }
         g_object_set (self,
-                      MM_IFACE_MODEM_SIM_HOT_SWAP_CONFIGURED, TRUE,
+                      MM_IFACE_MODEM_SIM,       primary_sim,
+                      MM_IFACE_MODEM_SIM_SLOTS, sim_slots,
                       NULL);
     }
 
@@ -4413,8 +5170,7 @@ modem_update_lock_info_ready (MMIfaceModem *self,
     /* NOTE: we already propagated the lock state, no need to do it again */
     mm_iface_modem_update_lock_info_finish (self, res, &ctx->fatal_error);
     if (ctx->fatal_error) {
-        g_prefix_error (&ctx->fatal_error,
-                        "Couldn't check unlock status: ");
+        g_prefix_error (&ctx->fatal_error, "Couldn't check unlock status: ");
         /* Jump to the last step */
         ctx->step = INITIALIZATION_STEP_LAST;
     } else
@@ -4464,22 +5220,20 @@ sim_new_ready (GAsyncInitable *initable,
 }
 
 static void
-sim_reinit_ready (MMBaseSim *sim,
+sim_reinit_ready (MMBaseSim    *sim,
                   GAsyncResult *res,
-                  GTask *task)
+                  GTask        *task)
 {
     MMIfaceModem          *self;
     InitializationContext *ctx;
-    GError                *error = NULL;
+    g_autoptr(GError)      error = NULL;
 
     self = g_task_get_source_object (task);
     ctx  = g_task_get_task_data (task);
 
-    if (!mm_base_sim_initialize_finish (sim, res, &error)) {
+    if (!mm_base_sim_initialize_finish (sim, res, &error))
         mm_obj_warn (self, "SIM re-initialization failed: %s",
-                     error ? error->message : "Unknown error");
-        g_clear_error (&error);
-    }
+                     error ? error->message : "unknown error");
 
     /* Go on to next step */
     ctx->step++;
@@ -4492,14 +5246,12 @@ setup_carrier_config_ready (MMIfaceModem *self,
                             GTask        *task)
 {
     InitializationContext *ctx;
-    GError                *error = NULL;
+    g_autoptr(GError)      error = NULL;
 
     ctx = g_task_get_task_data (task);
 
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config_finish (self, res, &error)) {
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config_finish (self, res, &error))
         mm_obj_warn (self, "couldn't setup carrier config: %s", error->message);
-        g_error_free (error);
-    }
 
     /* Go on to next step */
     ctx->step++;
@@ -4512,40 +5264,22 @@ load_carrier_config_ready (MMIfaceModem *self,
                            GTask        *task)
 {
     InitializationContext *ctx;
-    GError                *error = NULL;
-    gchar                 *name = NULL;
-    gchar                 *revision = NULL;
+    g_autoptr(GError)      error = NULL;
+    g_autofree gchar      *name = NULL;
+    g_autofree gchar      *revision = NULL;
 
     ctx = g_task_get_task_data (task);
 
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->load_carrier_config_finish (self, res, &name, &revision, &error)) {
-        mm_obj_warn (self, "couldn't load carrier config: %s", error->message);
-        g_error_free (error);
-    } else {
+    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->load_carrier_config_finish (self, res, &name, &revision, &error))
+        mm_obj_dbg (self, "couldn't load carrier config: %s", error->message);
+    else {
         mm_gdbus_modem_set_carrier_configuration          (ctx->skeleton, name);
         mm_gdbus_modem_set_carrier_configuration_revision (ctx->skeleton, revision);
-        g_free (name);
-        g_free (revision);
     }
 
     /* Go on to next step */
     ctx->step++;
     interface_initialization_step (task);
-}
-
-void
-mm_iface_modem_update_own_numbers (MMIfaceModem *self,
-                                   const GStrv own_numbers)
-{
-    MmGdbusModem *skeleton = NULL;
-
-    g_object_get (self,
-                  MM_IFACE_MODEM_DBUS_SKELETON, &skeleton,
-                  NULL);
-    if (skeleton) {
-        mm_gdbus_modem_set_own_numbers (skeleton, (const gchar * const *)own_numbers);
-        g_object_unref (skeleton);
-    }
 }
 
 static void
@@ -4554,92 +5288,19 @@ load_own_numbers_ready (MMIfaceModem *self,
                         GTask *task)
 {
     InitializationContext *ctx;
-    GError *error = NULL;
-    GStrv str_list;
+    g_autoptr(GError)      error = NULL;
+    g_auto(GStrv)          str_list = NULL;
 
     ctx = g_task_get_task_data (task);
 
     str_list = MM_IFACE_MODEM_GET_INTERFACE (self)->load_own_numbers_finish (self, res, &error);
-    if (error) {
-        mm_obj_warn (self, "couldn't load list of own numbers: %s", error->message);
-        g_error_free (error);
-    }
+    if (error)
+        mm_obj_dbg (self, "couldn't load list of own numbers: %s", error->message);
 
-    if (str_list) {
+    if (str_list)
         mm_gdbus_modem_set_own_numbers (ctx->skeleton, (const gchar *const *) str_list);
-        g_strfreev (str_list);
-    }
 
     /* Go on to next step */
-    ctx->step++;
-    interface_initialization_step (task);
-}
-
-static void
-load_current_modes_ready (MMIfaceModem *self,
-                          GAsyncResult *res,
-                          GTask *task)
-{
-    InitializationContext *ctx;
-    MMModemMode allowed = MM_MODEM_MODE_NONE;
-    MMModemMode preferred = MM_MODEM_MODE_NONE;
-    GError *error = NULL;
-
-    ctx = g_task_get_task_data (task);
-
-    if (!MM_IFACE_MODEM_GET_INTERFACE (self)->load_current_modes_finish (self,
-                                                                         res,
-                                                                         &allowed,
-                                                                         &preferred,
-                                                                         &error)) {
-        /* Errors when getting allowed/preferred won't be critical */
-        mm_obj_warn (self, "couldn't load current allowed/preferred modes: %s", error->message);
-        g_error_free (error);
-    } else
-        mm_gdbus_modem_set_current_modes (ctx->skeleton, g_variant_new ("(uu)", allowed, preferred));
-
-    /* Done, Go on to next step */
-    ctx->step++;
-    interface_initialization_step (task);
-}
-
-static void
-load_current_bands_ready (MMIfaceModem *self,
-                          GAsyncResult *res,
-                          GTask *task)
-{
-    InitializationContext *ctx;
-    GArray *current_bands;
-    GError *error = NULL;
-
-    ctx = g_task_get_task_data (task);
-
-    current_bands = MM_IFACE_MODEM_GET_INTERFACE (self)->load_current_bands_finish (self, res, &error);
-    if (!current_bands) {
-        /* Errors when getting current bands won't be critical */
-        mm_obj_warn (self, "couldn't load current bands: %s", error->message);
-        g_error_free (error);
-    } else {
-        GArray *filtered_bands;
-        GArray *supported_bands;
-
-        supported_bands = (mm_common_bands_variant_to_garray (
-                               mm_gdbus_modem_get_supported_bands (ctx->skeleton)));
-        filtered_bands = mm_filter_current_bands (supported_bands, current_bands);
-
-        g_array_unref (current_bands);
-        if (supported_bands)
-            g_array_unref (supported_bands);
-
-        if (filtered_bands) {
-            mm_common_bands_garray_sort (filtered_bands);
-            mm_gdbus_modem_set_current_bands (ctx->skeleton,
-                                              mm_common_bands_garray_to_variant (filtered_bands));
-            g_array_unref (filtered_bands);
-        }
-    }
-
-    /* Done, Go on to next step */
     ctx->step++;
     interface_initialization_step (task);
 }
@@ -4656,10 +5317,7 @@ interface_initialization_step (GTask *task)
     /* Don't run new steps if we're cancelled */
     if (g_task_return_error_if_cancelled (task)) {
         /* Simply ignore any fatal error encountered as the initialization is cancelled anyway. */
-        if (ctx->fatal_error) {
-            g_error_free (ctx->fatal_error);
-            ctx->fatal_error = NULL;
-        }
+        g_clear_error (&ctx->fatal_error);
         g_object_unref (task);
         return;
     }
@@ -4675,6 +5333,16 @@ interface_initialization_step (GTask *task)
                           NULL);
             mm_gdbus_modem_set_device (ctx->skeleton, device);
             g_free (device);
+        }
+        /* Load physdev path if not done before */
+        if (!mm_gdbus_modem_get_physdev (ctx->skeleton)) {
+            gchar *physdev;
+
+            g_object_get (self,
+                          MM_BASE_MODEM_PHYSDEV, &physdev,
+                          NULL);
+            mm_gdbus_modem_set_physdev (ctx->skeleton, physdev);
+            g_free (physdev);
         }
         /* Load driver if not done before */
         if (!mm_gdbus_modem_get_drivers (ctx->skeleton)) {
@@ -4701,11 +5369,12 @@ interface_initialization_step (GTask *task)
             MMPort *primary = NULL;
 
 #if defined WITH_QMI
-            primary = MM_PORT (mm_base_modem_peek_port_qmi (MM_BASE_MODEM (self)));
+            if (MM_IS_BROADBAND_MODEM_QMI (self))
+                primary = MM_PORT (mm_broadband_modem_qmi_peek_port_qmi (MM_BROADBAND_MODEM_QMI (self)));
 #endif
 #if defined WITH_MBIM
-            if (!primary)
-                primary = MM_PORT (mm_base_modem_peek_port_mbim (MM_BASE_MODEM (self)));
+            if (!primary && MM_IS_BROADBAND_MODEM_MBIM (self))
+                primary = MM_PORT (mm_broadband_modem_mbim_peek_port_mbim (MM_BROADBAND_MODEM_MBIM (self)));
 #endif
             if (!primary)
                 primary = MM_PORT (mm_base_modem_peek_port_primary (MM_BASE_MODEM (self)));
@@ -4828,44 +5497,38 @@ interface_initialization_step (GTask *task)
         /* fall-through */
 
     case INITIALIZATION_STEP_BEARERS: {
-        MMBearerList *list = NULL;
+        g_autoptr(MMBearerList) list = NULL;
 
         /* Bearers setup is meant to be loaded only once during the whole
-         * lifetime of the modem. The list may have been created by the object
-         * implementing the interface; if so use it. */
+         * lifetime of the modem, so check if it exists; and if it doesn't,
+         * create it right away. */
         g_object_get (self,
                       MM_IFACE_MODEM_BEARER_LIST, &list,
                       NULL);
 
         if (!list) {
-            guint n;
-
-            /* The maximum number of available/connected modems is guessed from
-             * the size of the data ports list. */
-            n = g_list_length (mm_base_modem_peek_data_ports (MM_BASE_MODEM (self)));
-            mm_obj_dbg (self, "allowed up to %u bearers", n);
-
-            /* Create new default list */
-            list = mm_bearer_list_new (n, n);
+            list = MM_IFACE_MODEM_GET_INTERFACE (self)->create_bearer_list (self);
             g_signal_connect (list,
                               "notify::" MM_BEARER_LIST_NUM_BEARERS,
                               G_CALLBACK (bearer_list_updated),
                               self);
+
+            mm_gdbus_modem_set_max_active_bearers (
+                ctx->skeleton,
+                mm_bearer_list_get_max_active (list));
+            mm_gdbus_modem_set_max_active_multiplexed_bearers (
+                ctx->skeleton,
+                mm_bearer_list_get_max_active_multiplexed (list));
+
+            /* MaxBearers set equal to MaxActiveBearers */
+            mm_gdbus_modem_set_max_bearers (
+                ctx->skeleton,
+                mm_gdbus_modem_get_max_active_bearers (ctx->skeleton));
+
             g_object_set (self,
                           MM_IFACE_MODEM_BEARER_LIST, list,
                           NULL);
         }
-
-        if (mm_gdbus_modem_get_max_bearers (ctx->skeleton) == 0)
-            mm_gdbus_modem_set_max_bearers (
-                ctx->skeleton,
-                mm_bearer_list_get_max (list));
-        if (mm_gdbus_modem_get_max_active_bearers (ctx->skeleton) == 0)
-            mm_gdbus_modem_set_max_active_bearers (
-                ctx->skeleton,
-                mm_bearer_list_get_max_active (list));
-        g_object_unref (list);
-
         ctx->step++;
     } /* fall-through */
 
@@ -5074,121 +5737,6 @@ interface_initialization_step (GTask *task)
         ctx->step++;
         /* fall-through */
 
-    case INITIALIZATION_STEP_SIM_HOT_SWAP:
-        if (MM_IFACE_MODEM_GET_INTERFACE (self)->setup_sim_hot_swap &&
-            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_sim_hot_swap_finish) {
-            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_sim_hot_swap (
-                MM_IFACE_MODEM (self),
-                (GAsyncReadyCallback) setup_sim_hot_swap_ready,
-                task);
-                return;
-        }
-        ctx->step++;
-        /* fall-through */
-
-    case INITIALIZATION_STEP_UNLOCK_REQUIRED:
-        /* Only check unlock required if we were previously not unlocked */
-        if (mm_gdbus_modem_get_unlock_required (ctx->skeleton) != MM_MODEM_LOCK_NONE) {
-            mm_iface_modem_update_lock_info (self,
-                                             MM_MODEM_LOCK_UNKNOWN, /* ask */
-                                             (GAsyncReadyCallback)modem_update_lock_info_ready,
-                                             task);
-            return;
-        }
-        ctx->step++;
-        /* fall-through */
-
-    case INITIALIZATION_STEP_SIM:
-        /* If the modem doesn't need any SIM (not implemented by plugin, or not
-         * needed in CDMA-only modems) */
-        if (!mm_iface_modem_is_cdma_only (self) &&
-            MM_IFACE_MODEM_GET_INTERFACE (self)->create_sim &&
-            MM_IFACE_MODEM_GET_INTERFACE (self)->create_sim_finish) {
-            MMBaseSim *sim = NULL;
-
-            g_object_get (self,
-                          MM_IFACE_MODEM_SIM, &sim,
-                          NULL);
-            if (!sim) {
-                MM_IFACE_MODEM_GET_INTERFACE (self)->create_sim (
-                    MM_IFACE_MODEM (self),
-                    (GAsyncReadyCallback)sim_new_ready,
-                    task);
-                return;
-            }
-
-            /* If already available the sim object, relaunch initialization.
-             * This will try to load any missing property value that couldn't be
-             * retrieved before due to having the SIM locked. */
-            mm_base_sim_initialize (sim,
-                                    g_task_get_cancellable (task),
-                                    (GAsyncReadyCallback)sim_reinit_ready,
-                                    task);
-            g_object_unref (sim);
-            return;
-        }
-        ctx->step++;
-        /* fall-through */
-
-    case INITIALIZATION_STEP_SETUP_CARRIER_CONFIG:
-        /* Setup and perform automatic carrier config switching as soon as the
-         * SIM initialization has been performed, only applicable if there is
-         * actually a SIM found with a valid IMSI read */
-        if (!mm_iface_modem_is_cdma_only (self) &&
-            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config &&
-            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config_finish) {
-            MMBaseSim *sim = NULL;
-            gchar     *carrier_config_mapping = NULL;
-
-            g_object_get (self,
-                          MM_IFACE_MODEM_SIM, &sim,
-                          MM_IFACE_MODEM_CARRIER_CONFIG_MAPPING, &carrier_config_mapping,
-                          NULL);
-
-            /* If we have a SIM object, and carrier config switching is supported,
-             * validate whether we're already using the best config or not. */
-            if (!sim)
-                mm_obj_dbg (self, "not setting up carrier config: SIM not found");
-            else if (!carrier_config_mapping)
-                mm_obj_dbg (self, "not setting up carrier config: mapping file not configured");
-            else {
-                const gchar *imsi;
-
-                imsi = mm_gdbus_sim_get_imsi (MM_GDBUS_SIM (sim));
-                if (imsi) {
-                    MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config (self,
-                                                                               imsi,
-                                                                               carrier_config_mapping,
-                                                                               (GAsyncReadyCallback)setup_carrier_config_ready,
-                                                                               task);
-                    g_object_unref (sim);
-                    g_free (carrier_config_mapping);
-                    return;
-                }
-                mm_obj_warn (self, "couldn't setup carrier config: unknown IMSI");
-            }
-            g_clear_object (&sim);
-            g_free (carrier_config_mapping);
-        }
-        ctx->step++;
-        /* fall-through */
-
-    case INITIALIZATION_STEP_OWN_NUMBERS:
-        /* Own numbers is meant to be loaded only once during the whole
-         * lifetime of the modem. Therefore, if we already have them loaded,
-         * don't try to load them again. */
-        if (mm_gdbus_modem_get_own_numbers (ctx->skeleton) == NULL &&
-            MM_IFACE_MODEM_GET_INTERFACE (self)->load_own_numbers &&
-            MM_IFACE_MODEM_GET_INTERFACE (self)->load_own_numbers_finish) {
-            MM_IFACE_MODEM_GET_INTERFACE (self)->load_own_numbers (
-                self,
-                (GAsyncReadyCallback)load_own_numbers_ready,
-                task);
-            return;
-        }
-        ctx->step++;
-        /* fall-through */
-
     case INITIALIZATION_STEP_CURRENT_MODES: {
         MMModemMode allowed = MM_MODEM_MODE_ANY;
         MMModemMode preferred = MM_MODEM_MODE_NONE;
@@ -5260,6 +5808,169 @@ interface_initialization_step (GTask *task)
         ctx->step++;
     } /* fall-through */
 
+    case INITIALIZATION_STEP_SIM_HOT_SWAP: {
+        Private *priv;
+
+        priv = get_private (self);
+        if (!priv->sim_hot_swap_configured &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_sim_hot_swap &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_sim_hot_swap_finish) {
+            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_sim_hot_swap (
+                MM_IFACE_MODEM (self),
+                (GAsyncReadyCallback) setup_sim_hot_swap_ready,
+                task);
+                return;
+        }
+        ctx->step++;
+    } /* fall-through */
+
+    case INITIALIZATION_STEP_SIM_SLOTS:
+        /* If the modem doesn't need any SIM (not implemented by plugin, or not
+         * needed in CDMA-only modems), or if we don't know how to query
+         * for SIM slots */
+        if (!mm_gdbus_modem_get_sim_slots (ctx->skeleton) &&
+            !mm_iface_modem_is_cdma_only (self) &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_sim_slots &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_sim_slots_finish) {
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_sim_slots (MM_IFACE_MODEM (self),
+                                                                 (GAsyncReadyCallback)load_sim_slots_ready,
+                                                                 task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case INITIALIZATION_STEP_UNLOCK_REQUIRED: {
+        g_autoptr(MMBaseSim) sim = NULL;
+
+        g_object_get (self,
+                      MM_IFACE_MODEM_SIM, &sim,
+                      NULL);
+        /* If the current SIM is an eSIM without profiles, we ignore
+         * unlock required. */
+        if (sim && mm_base_sim_is_esim_without_profiles (sim))
+            mm_obj_dbg (self, "not unlock required: eSIM without profiles");
+        else {
+            /* Only check unlock required if we were previously not unlocked */
+            if (mm_gdbus_modem_get_unlock_required (ctx->skeleton) != MM_MODEM_LOCK_NONE) {
+                mm_iface_modem_update_lock_info (self,
+                                                 MM_MODEM_LOCK_UNKNOWN, /* ask */
+                                                 (GAsyncReadyCallback)modem_update_lock_info_ready,
+                                                 task);
+                return;
+            }
+        }
+        ctx->step++;
+    } /* fall-through */
+
+    case INITIALIZATION_STEP_SIM:
+        /* If the modem doesn't need any SIM (not implemented by plugin, or not
+         * needed in CDMA-only modems) */
+        if (!mm_iface_modem_is_cdma_only (self) &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->create_sim &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->create_sim_finish) {
+            MMBaseSim *sim = NULL;
+
+            g_object_get (self,
+                          MM_IFACE_MODEM_SIM, &sim,
+                          NULL);
+            if (!sim) {
+                MM_IFACE_MODEM_GET_INTERFACE (self)->create_sim (
+                    MM_IFACE_MODEM (self),
+                    (GAsyncReadyCallback)sim_new_ready,
+                    task);
+                return;
+            }
+
+            /* If already available the sim object, relaunch initialization.
+             * This will try to load any missing property value that couldn't be
+             * retrieved before due to having the SIM locked. */
+            mm_base_sim_initialize (sim,
+                                    g_task_get_cancellable (task),
+                                    (GAsyncReadyCallback)sim_reinit_ready,
+                                    task);
+            g_object_unref (sim);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case INITIALIZATION_STEP_SETUP_CARRIER_CONFIG:
+        /* Setup and perform automatic carrier config switching as soon as the
+         * SIM initialization has been performed, only applicable if there is
+         * actually a SIM found with a valid IMSI read */
+        if (!mm_iface_modem_is_cdma_only (self) &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config_finish) {
+            g_autoptr(MMBaseSim)  sim = NULL;
+            g_autofree gchar     *carrier_config_mapping = NULL;
+
+            g_object_get (self,
+                          MM_IFACE_MODEM_SIM, &sim,
+                          MM_IFACE_MODEM_CARRIER_CONFIG_MAPPING, &carrier_config_mapping,
+                          NULL);
+
+            /* If we have a SIM object, and carrier config switching is supported,
+             * validate whether we're already using the best config or not. */
+            if (!sim)
+                mm_obj_dbg (self, "not setting up carrier config: SIM not found");
+            else if (!mm_base_sim_is_esim_without_profiles (sim))
+                mm_obj_dbg (self, "not setting up carrier config: eSIM without profiles");
+            else if (!carrier_config_mapping)
+                mm_obj_dbg (self, "not setting up carrier config: mapping file not configured");
+            else {
+                const gchar *imsi;
+
+                imsi = mm_gdbus_sim_get_imsi (MM_GDBUS_SIM (sim));
+                if (!imsi)
+                    mm_obj_dbg (self, "not setting up carrier config: unknown IMSI");
+                else {
+                    MM_IFACE_MODEM_GET_INTERFACE (self)->setup_carrier_config (self,
+                                                                               imsi,
+                                                                               carrier_config_mapping,
+                                                                               (GAsyncReadyCallback)setup_carrier_config_ready,
+                                                                               task);
+                    return;
+                }
+            }
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case INITIALIZATION_STEP_OWN_NUMBERS:
+        /* Own numbers is meant to be loaded only once during the whole
+         * lifetime of the modem. Therefore, if we already have them loaded,
+         * don't try to load them again. */
+        if (mm_gdbus_modem_get_own_numbers (ctx->skeleton) == NULL &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_own_numbers &&
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_own_numbers_finish) {
+            MM_IFACE_MODEM_GET_INTERFACE (self)->load_own_numbers (
+                self,
+                (GAsyncReadyCallback)load_own_numbers_ready,
+                task);
+            return;
+        }
+        ctx->step++;
+        /* fall-through */
+
+    case INITIALIZATION_STEP_VALIDATE_ESIM_STATUS: {
+        g_autoptr(MMBaseSim) sim = NULL;
+
+        g_object_get (self,
+                      MM_IFACE_MODEM_SIM, &sim,
+                      NULL);
+
+        /* If the current SIM is an eSIM without profiles, we transition to FAILED
+         * status because the modem is really unusable. */
+        if (sim && mm_base_sim_is_esim_without_profiles (sim)) {
+            g_clear_error (&ctx->fatal_error);
+            ctx->fatal_error = g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_WRONG_SIM_STATE,
+                                            "eSIM without profiles detected");
+        }
+
+        ctx->step++;
+    } /* fall-through */
+
     case INITIALIZATION_STEP_LAST:
         /* Setup all method handlers */
         g_object_connect (ctx->skeleton,
@@ -5274,6 +5985,8 @@ interface_initialization_step (GTask *task)
                           "signal::handle-enable",                   G_CALLBACK (handle_enable),                   self,
                           "signal::handle-set-current-bands",        G_CALLBACK (handle_set_current_bands),        self,
                           "signal::handle-set-current-modes",        G_CALLBACK (handle_set_current_modes),        self,
+                          "signal::handle-set-primary-sim-slot",     G_CALLBACK (handle_set_primary_sim_slot),     self,
+                          "signal::handle-get-cell-info",            G_CALLBACK (handle_get_cell_info),            self,
                           NULL);
 
         /* Finally, export the new interface, even if we got errors, but only if not
@@ -5282,10 +5995,9 @@ interface_initialization_step (GTask *task)
             mm_gdbus_object_skeleton_set_modem (MM_GDBUS_OBJECT_SKELETON (self),
                                                 MM_GDBUS_MODEM (ctx->skeleton));
 
-        if (ctx->fatal_error) {
-            g_task_return_error (task, ctx->fatal_error);
-            ctx->fatal_error = NULL;
-        } else
+        if (ctx->fatal_error)
+            g_task_return_error (task, g_steal_pointer (&ctx->fatal_error));
+        else
             g_task_return_boolean (task, TRUE);
 
         g_object_unref (task);
@@ -5335,13 +6047,14 @@ mm_iface_modem_initialize (MMIfaceModem *self,
         mm_gdbus_modem_set_own_numbers (skeleton, NULL);
         mm_gdbus_modem_set_device_identifier (skeleton, NULL);
         mm_gdbus_modem_set_device (skeleton, NULL);
+        mm_gdbus_modem_set_physdev (skeleton, NULL);
         mm_gdbus_modem_set_drivers (skeleton, NULL);
         mm_gdbus_modem_set_plugin (skeleton, NULL);
         mm_gdbus_modem_set_equipment_identifier (skeleton, NULL);
         mm_gdbus_modem_set_unlock_required (skeleton, MM_MODEM_LOCK_UNKNOWN);
         mm_gdbus_modem_set_unlock_retries (skeleton, 0);
         mm_gdbus_modem_set_access_technologies (skeleton, MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN);
-        mm_gdbus_modem_set_signal_quality (skeleton, g_variant_new ("(ub)", 0, FALSE));
+        mm_gdbus_modem_set_signal_quality (skeleton, g_variant_new ("(ub)", 0, TRUE));
         mm_gdbus_modem_set_supported_modes (skeleton, mm_common_build_mode_combinations_default ());
         mm_gdbus_modem_set_current_modes (skeleton, g_variant_new ("(uu)", MM_MODEM_MODE_ANY, MM_MODEM_MODE_NONE));
         mm_gdbus_modem_set_supported_bands (skeleton, mm_common_build_bands_unknown ());
@@ -5378,19 +6091,15 @@ mm_iface_modem_shutdown (MMIfaceModem *self)
      * we're shutting down the interface anyway. */
     periodic_signal_check_disable (self, FALSE);
 
-    /* Remove SignalQualityUpdateContext object to make sure any pending
-     * invocation of expire_signal_quality is canceled before the DBus skeleton
-     * is removed. */
-    if (G_LIKELY (signal_quality_update_context_quark))
-        g_object_set_qdata (G_OBJECT (self),
-                            signal_quality_update_context_quark,
-                            NULL);
+    /* Make sure recent flag handling is disabled. */
+    signal_quality_recent_timeout_disable (self);
 
     /* Remove running restart initialization idle, if any */
-    if (G_LIKELY (restart_initialize_idle_quark))
-        g_object_set_qdata (G_OBJECT (self),
-                            restart_initialize_idle_quark,
-                            NULL);
+    restart_initialize_idle_disable (self);
+
+    /* Cleanup SIM hot swap, if any */
+    if (MM_IFACE_MODEM_GET_INTERFACE (self)->cleanup_sim_hot_swap)
+        MM_IFACE_MODEM_GET_INTERFACE (self)->cleanup_sim_hot_swap (self);
 
     /* Remove SIM object */
     g_object_set (self,
@@ -5682,6 +6391,14 @@ iface_modem_init (gpointer g_iface)
 
     g_object_interface_install_property
         (g_iface,
+         g_param_spec_boxed (MM_IFACE_MODEM_SIM_SLOTS,
+                             "SIM slots",
+                             "SIM objects in SIM slots",
+                             MM_TYPE_OBJECT_ARRAY,
+                             G_PARAM_READWRITE));
+
+    g_object_interface_install_property
+        (g_iface,
          g_param_spec_enum (MM_IFACE_MODEM_STATE,
                             "State",
                             "State of the modem",
@@ -5702,14 +6419,6 @@ iface_modem_init (gpointer g_iface)
          g_param_spec_boolean (MM_IFACE_MODEM_SIM_HOT_SWAP_SUPPORTED,
                                "Sim Hot Swap Supported",
                                "Whether the modem supports sim hot swap or not.",
-                               FALSE,
-                               G_PARAM_READWRITE));
-
-    g_object_interface_install_property
-        (g_iface,
-         g_param_spec_boolean (MM_IFACE_MODEM_SIM_HOT_SWAP_CONFIGURED,
-                               "Sim Hot Swap Configured",
-                               "Whether the sim hot swap support is configured correctly.",
                                FALSE,
                                G_PARAM_READWRITE));
 

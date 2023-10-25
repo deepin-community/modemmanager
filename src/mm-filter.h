@@ -47,63 +47,35 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMFilter, g_object_unref)
 
 typedef enum { /*< underscore_name=mm_filter_rule >*/
     MM_FILTER_RULE_NONE                  = 0,
-    MM_FILTER_RULE_EXPLICIT_WHITELIST    = 1 << 0,
-    MM_FILTER_RULE_EXPLICIT_BLACKLIST    = 1 << 1,
-    MM_FILTER_RULE_PLUGIN_WHITELIST      = 1 << 2,
-    MM_FILTER_RULE_VIRTUAL               = 1 << 3,
-    MM_FILTER_RULE_NET                   = 1 << 4,
-    MM_FILTER_RULE_CDC_WDM               = 1 << 5,
-    MM_FILTER_RULE_TTY                   = 1 << 6,
-    MM_FILTER_RULE_TTY_BLACKLIST         = 1 << 7,
-    MM_FILTER_RULE_TTY_MANUAL_SCAN_ONLY  = 1 << 8,
-    MM_FILTER_RULE_TTY_PLATFORM_DRIVER   = 1 << 9,
-    MM_FILTER_RULE_TTY_DEFAULT_ALLOWED   = 1 << 10,
+    MM_FILTER_RULE_EXPLICIT_ALLOWLIST    = 1 << 0,
+    MM_FILTER_RULE_EXPLICIT_BLOCKLIST    = 1 << 1,
+    MM_FILTER_RULE_PLUGIN_ALLOWLIST      = 1 << 2,
+    MM_FILTER_RULE_QRTR                  = 1 << 3,
+    MM_FILTER_RULE_VIRTUAL               = 1 << 4,
+    MM_FILTER_RULE_NET                   = 1 << 5,
+    MM_FILTER_RULE_USBMISC               = 1 << 6,
+    MM_FILTER_RULE_RPMSG                 = 1 << 7,
+    MM_FILTER_RULE_WWAN                  = 1 << 8,
+    MM_FILTER_RULE_TTY                   = 1 << 9,
+    MM_FILTER_RULE_TTY_PLATFORM_DRIVER   = 1 << 10,
     MM_FILTER_RULE_TTY_DRIVER            = 1 << 11,
     MM_FILTER_RULE_TTY_ACM_INTERFACE     = 1 << 12,
     MM_FILTER_RULE_TTY_WITH_NET          = 1 << 13,
     MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN = 1 << 14,
 } MMFilterRule;
 
-#define MM_FILTER_RULE_ALL                  \
-    (MM_FILTER_RULE_EXPLICIT_WHITELIST    | \
-     MM_FILTER_RULE_EXPLICIT_BLACKLIST    | \
-     MM_FILTER_RULE_PLUGIN_WHITELIST      | \
-     MM_FILTER_RULE_VIRTUAL               | \
-     MM_FILTER_RULE_NET                   | \
-     MM_FILTER_RULE_CDC_WDM               | \
-     MM_FILTER_RULE_TTY                   | \
-     MM_FILTER_RULE_TTY_BLACKLIST         | \
-     MM_FILTER_RULE_TTY_MANUAL_SCAN_ONLY  | \
-     MM_FILTER_RULE_TTY_PLATFORM_DRIVER   | \
-     MM_FILTER_RULE_TTY_DEFAULT_ALLOWED   | \
-     MM_FILTER_RULE_TTY_DRIVER            | \
-     MM_FILTER_RULE_TTY_ACM_INTERFACE     | \
-     MM_FILTER_RULE_TTY_WITH_NET          | \
-     MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)
-
-/* This is the legacy ModemManager policy that tries to automatically probe
- * device ports unless they're blacklisted in some way or another. */
-#define MM_FILTER_POLICY_LEGACY            \
-    (MM_FILTER_RULE_EXPLICIT_WHITELIST   | \
-     MM_FILTER_RULE_EXPLICIT_BLACKLIST   | \
-     MM_FILTER_RULE_VIRTUAL              | \
-     MM_FILTER_RULE_NET                  | \
-     MM_FILTER_RULE_CDC_WDM              | \
-     MM_FILTER_RULE_TTY                  | \
-     MM_FILTER_RULE_TTY_BLACKLIST        | \
-     MM_FILTER_RULE_TTY_MANUAL_SCAN_ONLY | \
-     MM_FILTER_RULE_TTY_PLATFORM_DRIVER  | \
-     MM_FILTER_RULE_TTY_DEFAULT_ALLOWED)
-
 /* This is a stricter policy which will only automatically probe device ports
- * if they are allowed by any of the automatic whitelist rules. */
+ * if they are allowed by any of the automatic allowlist rules. */
 #define MM_FILTER_POLICY_STRICT             \
-    (MM_FILTER_RULE_EXPLICIT_WHITELIST    | \
-     MM_FILTER_RULE_EXPLICIT_BLACKLIST    | \
-     MM_FILTER_RULE_PLUGIN_WHITELIST      | \
+    (MM_FILTER_RULE_EXPLICIT_ALLOWLIST    | \
+     MM_FILTER_RULE_EXPLICIT_BLOCKLIST    | \
+     MM_FILTER_RULE_PLUGIN_ALLOWLIST      | \
+     MM_FILTER_RULE_QRTR                  | \
      MM_FILTER_RULE_VIRTUAL               | \
      MM_FILTER_RULE_NET                   | \
-     MM_FILTER_RULE_CDC_WDM               | \
+     MM_FILTER_RULE_USBMISC               | \
+     MM_FILTER_RULE_RPMSG                 | \
+     MM_FILTER_RULE_WWAN                  | \
      MM_FILTER_RULE_TTY                   | \
      MM_FILTER_RULE_TTY_PLATFORM_DRIVER   | \
      MM_FILTER_RULE_TTY_DRIVER            | \
@@ -111,27 +83,12 @@ typedef enum { /*< underscore_name=mm_filter_rule >*/
      MM_FILTER_RULE_TTY_WITH_NET          | \
      MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)
 
-/* This is equivalent to the strict policy, but also applying the device
- * blacklists explicitly */
-#define MM_FILTER_POLICY_PARANOID           \
-    (MM_FILTER_RULE_EXPLICIT_WHITELIST    | \
-     MM_FILTER_RULE_EXPLICIT_BLACKLIST    | \
-     MM_FILTER_RULE_PLUGIN_WHITELIST      | \
-     MM_FILTER_RULE_VIRTUAL               | \
-     MM_FILTER_RULE_NET                   | \
-     MM_FILTER_RULE_CDC_WDM               | \
-     MM_FILTER_RULE_TTY                   | \
-     MM_FILTER_RULE_TTY_BLACKLIST         | \
-     MM_FILTER_RULE_TTY_MANUAL_SCAN_ONLY  | \
-     MM_FILTER_RULE_TTY_PLATFORM_DRIVER   | \
-     MM_FILTER_RULE_TTY_DRIVER            | \
-     MM_FILTER_RULE_TTY_ACM_INTERFACE     | \
-     MM_FILTER_RULE_TTY_WITH_NET          | \
-     MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)
-
-/* This policy only allows using device ports explicitly whitelisted via
+/* This policy only allows using device ports explicitly allowlisted via
  * udev rules. i.e. ModemManager won't do any kind of automatic probing. */
-#define MM_FILTER_POLICY_WHITELIST_ONLY MM_FILTER_RULE_EXPLICIT_WHITELIST
+#define MM_FILTER_POLICY_ALLOWLIST_ONLY MM_FILTER_RULE_EXPLICIT_ALLOWLIST
+
+/* The strict policy has all supported rules */
+#define MM_FILTER_RULE_ALL MM_FILTER_POLICY_STRICT
 
 MMFilter *mm_filter_new (MMFilterRule   enabled_rules,
                          GError       **error);
@@ -144,13 +101,16 @@ gboolean mm_filter_device_and_port (MMFilter       *self,
                                     MMDevice       *device,
                                     MMKernelDevice *port);
 
-void     mm_filter_register_plugin_whitelist_tag        (MMFilter    *self,
-                                                         const gchar *tag);
-void     mm_filter_register_plugin_whitelist_vendor_id  (MMFilter    *self,
-                                                         guint16      vid);
-void     mm_filter_register_plugin_whitelist_product_id (MMFilter    *self,
-                                                         guint16      vid,
-                                                         guint16      pid);
+void     mm_filter_register_plugin_allowlist_tag                 (MMFilter    *self,
+                                                                  const gchar *tag);
+void     mm_filter_register_plugin_allowlist_vendor_id           (MMFilter    *self,
+                                                                  guint16      vid);
+void     mm_filter_register_plugin_allowlist_product_id          (MMFilter    *self,
+                                                                  guint16      vid,
+                                                                  guint16      pid);
+void     mm_filter_register_plugin_allowlist_subsystem_vendor_id (MMFilter    *self,
+                                                                  guint16      vid,
+                                                                  guint16      subsystem_vid);
 
 gboolean mm_filter_check_rule_enabled (MMFilter     *self,
                                        MMFilterRule  rule);

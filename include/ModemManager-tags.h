@@ -68,8 +68,8 @@
  *
  * This is a device-specific tag that allows explicitly requesting the
  * processing of all ports exposed by the device. This tag is usually
- * used by users when the daemon runs with WHITELIST-ONLY filter policy
- * type, and is associated to the MM_FILTER_RULE_EXPLICIT_WHITELIST rule.
+ * used by users when the daemon runs with ALLOWLIST-ONLY filter policy
+ * type, and is associated to the MM_FILTER_RULE_EXPLICIT_ALLOWLIST rule.
  *
  * This tag may also be specified in specific ports, e.g. when the modem
  * exposes a single platform port without any parent device.
@@ -85,10 +85,9 @@
  * ignore all ports exposed by the device.
  *
  * This tag was originally applicable to TTY ports and only when running
- * in DEFAULT or PARANOID filter policy types. Since 1.12, this tag
- * applies to all filter types (including STRICT), and to all port types
- * (not only TTYs), and is associated to the
- * MM_FILTER_RULE_EXPLICIT_BLACKLIST rule.
+ * in certain filter policy types. Since 1.12, this tag applies to all
+ * filter types and to all port types (not only TTYs), and is associated
+ * to the MM_FILTER_RULE_EXPLICIT_BLOCKLIST rule.
  *
  * Since: 1.10
  */
@@ -105,41 +104,6 @@
  * Since: 1.10
  */
 #define ID_MM_PORT_IGNORE "ID_MM_PORT_IGNORE"
-
- /**
- * ID_MM_TTY_BLACKLIST:
- *
- * This is a device-specific tag that allows explicitly blacklisting
- * devices that expose TTY devices so that they are never probed.
- *
- * This tag is used when the daemon runs with DEFAULT or PARANOID
- * filter policy type, and is associated to the MM_FILTER_RULE_TTY_BLACKLIST
- * rule.
- *
- * This tag is ignored when the STRICT filter policy is used.
- *
- * Since: 1.12
- */
-#define ID_MM_TTY_BLACKLIST "ID_MM_TTY_BLACKLIST"
-
-/**
- * ID_MM_TTY_MANUAL_SCAN_ONLY:
- *
- * This is a device-specific tag that allows explicitly greylisting
- * devices that expose TTY devices so that they are never probed
- * automatically. Instead, an explicit manual scan request may be sent
- * to the daemon so that the TTY ports exposed by the device are
- * probed.
- *
- * This tag is used when the daemon runs with DEFAULT or PARANOID
- * filter policy type, and is associated to the MM_FILTER_RULE_TTY_MANUAL_SCAN_ONLY
- * rule.
- *
- * This tag is ignored when the STRICT filter policy is used.
- *
- * Since: 1.12
- */
-#define ID_MM_TTY_MANUAL_SCAN_ONLY "ID_MM_TTY_MANUAL_SCAN_ONLY"
 
 /**
  * ID_MM_PORT_TYPE_AT_PRIMARY:
@@ -164,6 +128,19 @@
  * Since: 1.10
  */
 #define ID_MM_PORT_TYPE_AT_SECONDARY "ID_MM_PORT_TYPE_AT_SECONDARY"
+
+/**
+ * ID_MM_PORT_TYPE_AT_GPS_CONTROL:
+ *
+ * This is a port-specific tag applied to TTYs that we know in advance
+ * are AT ports to be used for GPS control. Depending on the device,
+ * this may or may not mean the same port is also used fo GPS data.
+ *
+ * This tag will also prevent QCDM probing on the port.
+ *
+ * Since: 1.20
+ */
+#define ID_MM_PORT_TYPE_AT_GPS_CONTROL "ID_MM_PORT_TYPE_AT_GPS_CONTROL"
 
 /**
  * ID_MM_PORT_TYPE_AT_PPP:
@@ -214,6 +191,36 @@
 #define ID_MM_PORT_TYPE_AUDIO "ID_MM_PORT_TYPE_AUDIO"
 
 /**
+ * ID_MM_PORT_TYPE_QMI:
+ *
+ * This is a port-specific tag applied to generic ports that we know in advance
+ * are QMI ports.
+ *
+ * This tag will also prevent other types of probing (e.g. AT, MBIM) on the
+ * port.
+ *
+ * This tag is not required for QMI ports exposed by the qmi_wwan driver.
+ *
+ * Since: 1.16
+ */
+#define ID_MM_PORT_TYPE_QMI "ID_MM_PORT_TYPE_QMI"
+
+/**
+ * ID_MM_PORT_TYPE_MBIM:
+ *
+ * This is a port-specific tag applied to generic ports that we know in advance
+ * are MBIM ports.
+ *
+ * This tag will also prevent other types of probing (e.g. AT, QMI) on the
+ * port.
+ *
+ * This tag is not required for MBIM ports exposed by the cdc_mbim driver.
+ *
+ * Since: 1.16
+ */
+#define ID_MM_PORT_TYPE_MBIM "ID_MM_PORT_TYPE_MBIM"
+
+/**
  * ID_MM_TTY_BAUDRATE:
  *
  * This is a port-specific tag applied to TTYs that require a specific
@@ -244,5 +251,80 @@
  * Since: 1.10
  */
 #define ID_MM_TTY_FLOW_CONTROL "ID_MM_TTY_FLOW_CONTROL"
+
+/**
+ * ID_MM_REQUIRED:
+ *
+ * This is a port-specific tag that allows users to specify that the modem
+ * must be able to successfully probe and use the given control port.
+ *
+ * If this tag is set and the port probing procedure fails, the modem object
+ * will not be created, which is the same as if the port didn't exist in the
+ * first place.
+ *
+ * E.g. this tag may be set on a QMI control port if we want to make sure the
+ * modem object exposed by ModemManager is QMI-capable and never an AT-based
+ * modem created due to falling back on a failed QMI port probing procedure.
+ *
+ * Since: 1.22
+ */
+#define ID_MM_REQUIRED "ID_MM_REQUIRED"
+
+/**
+ * ID_MM_MAX_MULTIPLEXED_LINKS:
+ *
+ * This is a device-specific tag that allows users to specify the maximum amount
+ * of multiplexed links the modem supports.
+ *
+ * An integer value greater or equal than 0 must be given. The value 0 in this
+ * tag completely disables the multiplexing support in the device.
+ *
+ * This setting does nothing if the modem doesn't support multiplexing, or if the
+ * value configured is greater than the one specified by the modem itself (e.g.
+ * the control protocol in use also limits this value).
+ *
+ * Since: 1.22
+ */
+#define ID_MM_MAX_MULTIPLEXED_LINKS "ID_MM_MAX_MULTIPLEXED_LINKS"
+
+/*
+ * The following symbols are deprecated. We don't add them to -compat
+ * because this -tags file is not really part of the installed API.
+ */
+
+#ifndef MM_DISABLE_DEPRECATED
+
+ /**
+  * ID_MM_TTY_BLACKLIST:
+  *
+  * This was a device-specific tag that allowed explicitly blacklisting
+  * devices that exposed TTY devices so that they were never probed.
+  *
+  * This tag was applicable only when running in certain filter policy types,
+  * and is no longer used since 1.18.
+  *
+  * Since: 1.12
+  * Deprecated: 1.18.0
+  */
+#define ID_MM_TTY_BLACKLIST "ID_MM_TTY_BLACKLIST"
+
+/**
+ * ID_MM_TTY_MANUAL_SCAN_ONLY:
+ *
+ * This was a device-specific tag that allowed explicitly allowlisting
+ * devices that exposed TTY devices so that they were never probed
+ * automatically. Instead, an explicit manual scan request could
+ * be sent to the daemon so that the TTY ports exposed by the device
+ * were probed.
+ *
+ * This tag was applicable only when running in certain filter policy types,
+ * and is no longer used since 1.18.
+ *
+ * Since: 1.12
+ * Deprecated: 1.18.0
+ */
+#define ID_MM_TTY_MANUAL_SCAN_ONLY "ID_MM_TTY_MANUAL_SCAN_ONLY"
+
+#endif
 
 #endif /* MM_TAGS_H */

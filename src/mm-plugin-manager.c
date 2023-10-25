@@ -22,16 +22,23 @@
 #include <gmodule.h>
 #include <gio/gio.h>
 
+#include <config.h>
+
 #include <ModemManager.h>
 #include <mm-errors-types.h>
 
 #include "mm-plugin-manager.h"
 #include "mm-plugin.h"
 #include "mm-shared.h"
+#include "mm-utils.h"
 #include "mm-log-object.h"
 
-#define SHARED_PREFIX "libmm-shared"
-#define PLUGIN_PREFIX "libmm-plugin"
+#if defined WITH_BUILTIN_PLUGINS
+# include "mm-builtin-plugins.h"
+#else
+# define SHARED_PREFIX "libmm-shared"
+# define PLUGIN_PREFIX "libmm-plugin"
+#endif
 
 static void initable_iface_init   (GInitableIface *iface);
 static void log_object_iface_init (MMLogObjectInterface *iface);
@@ -42,14 +49,19 @@ G_DEFINE_TYPE_EXTENDED (MMPluginManager, mm_plugin_manager, G_TYPE_OBJECT, 0,
 
 enum {
     PROP_0,
+#if !defined WITH_BUILTIN_PLUGINS
     PROP_PLUGIN_DIR,
+#endif
     PROP_FILTER,
     LAST_PROP
 };
 
 struct _MMPluginManagerPrivate {
+#if !defined WITH_BUILTIN_PLUGINS
     /* Path to look for plugins */
     gchar *plugin_dir;
+#endif
+
     /* Device filter */
     MMFilter *filter;
 
@@ -62,6 +74,9 @@ struct _MMPluginManagerPrivate {
 
     /* List of ongoing device support checks */
     GList *device_contexts;
+
+    /* Full list of subsystems requested by the registered plugins */
+    gchar **subsystems;
 };
 
 /*****************************************************************************/
@@ -178,7 +193,7 @@ common_async_context_new (MMPluginManager *self,
 /*
  * Port context
  *
- * This structure hold all the probing information related to a single port.
+ * This structure holds all the probing information related to a single port.
  */
 struct _PortContext {
     /* Reference counting */
@@ -702,15 +717,21 @@ port_context_new (MMPluginManager *self,
 /* Device context */
 
 /* Time to wait for ports to appear before starting to probe the first one */
-#define MIN_WAIT_TIME_MSECS 1500
+#define MIN_WAIT_TIME_MSECS 2000
 
 /* Time to wait for other ports to appear once the first port is exposed
  * (needs to be > MIN_WAIT_TIME_MSECS!!) */
-#define MIN_PROBING_TIME_MSECS 2500
+#define MIN_PROBING_TIME_MSECS 4000
 
 /* Additional time to wait for other ports to appear after the last port is
- * exposed in the system. */
-#define EXTRA_PROBING_TIME_MSECS 1500
+ * exposed in the system. Longer time when not using udev, as we rely on
+ * mmcli --report-kernel-event events to report new port additions, e.g.
+ * via openwrt hotplug scripts. */
+#if defined WITH_UDEV
+# define EXTRA_PROBING_TIME_MSECS 2000
+#else
+# define EXTRA_PROBING_TIME_MSECS 4000
+#endif
 
 /* The wait time we define must always be less than the probing time */
 G_STATIC_ASSERT (MIN_WAIT_TIME_MSECS < MIN_PROBING_TIME_MSECS);
@@ -735,7 +756,7 @@ struct _DeviceContext {
 
     /* The operation task */
     GTask *task;
-    /* Internal ancellable */
+    /* Internal cancellable */
     GCancellable *cancellable;
 
     /* Timer tracking how much time is required for the device support check */
@@ -1601,54 +1622,158 @@ mm_plugin_manager_peek_plugin (MMPluginManager *self,
 
 /*****************************************************************************/
 
+const gchar **
+mm_plugin_manager_get_subsystems (MMPluginManager *self)
+{
+    return (const gchar **) self->priv->subsystems;
+}
+
+/*****************************************************************************/
+
 static void
-register_plugin_whitelist_tags (MMPluginManager *self,
+register_plugin_allowlist_tags (MMPluginManager *self,
                                 MMPlugin        *plugin)
 {
     const gchar **tags;
     guint         i;
 
-    if (!mm_filter_check_rule_enabled (self->priv->filter, MM_FILTER_RULE_PLUGIN_WHITELIST))
+    if (!mm_filter_check_rule_enabled (self->priv->filter, MM_FILTER_RULE_PLUGIN_ALLOWLIST))
         return;
 
     tags = mm_plugin_get_allowed_udev_tags (plugin);
     for (i = 0; tags && tags[i]; i++)
-        mm_filter_register_plugin_whitelist_tag (self->priv->filter, tags[i]);
+        mm_filter_register_plugin_allowlist_tag (self->priv->filter, tags[i]);
 }
 
 static void
-register_plugin_whitelist_vendor_ids (MMPluginManager *self,
+register_plugin_allowlist_vendor_ids (MMPluginManager *self,
                                        MMPlugin        *plugin)
 {
     const guint16 *vendor_ids;
     guint          i;
 
-    if (!mm_filter_check_rule_enabled (self->priv->filter, MM_FILTER_RULE_PLUGIN_WHITELIST))
+    if (!mm_filter_check_rule_enabled (self->priv->filter, MM_FILTER_RULE_PLUGIN_ALLOWLIST))
         return;
 
     vendor_ids = mm_plugin_get_allowed_vendor_ids (plugin);
     for (i = 0; vendor_ids && vendor_ids[i]; i++)
-        mm_filter_register_plugin_whitelist_vendor_id (self->priv->filter, vendor_ids[i]);
+        mm_filter_register_plugin_allowlist_vendor_id (self->priv->filter, vendor_ids[i]);
 }
 
 static void
-register_plugin_whitelist_product_ids (MMPluginManager *self,
+register_plugin_allowlist_product_ids (MMPluginManager *self,
                                        MMPlugin        *plugin)
 {
     const mm_uint16_pair *product_ids;
     guint                 i;
 
-    if (!mm_filter_check_rule_enabled (self->priv->filter, MM_FILTER_RULE_PLUGIN_WHITELIST))
+    if (!mm_filter_check_rule_enabled (self->priv->filter, MM_FILTER_RULE_PLUGIN_ALLOWLIST))
         return;
 
     product_ids = mm_plugin_get_allowed_product_ids (plugin);
     for (i = 0; product_ids && product_ids[i].l; i++)
-        mm_filter_register_plugin_whitelist_product_id (self->priv->filter, product_ids[i].l, product_ids[i].r);
+        mm_filter_register_plugin_allowlist_product_id (self->priv->filter, product_ids[i].l, product_ids[i].r);
 }
 
+static void
+register_plugin_allowlist_subsystem_vendor_ids (MMPluginManager *self,
+                                                MMPlugin        *plugin)
+{
+    const mm_uint16_pair *subsystem_vendor_ids;
+    guint                 i;
+
+    if (!mm_filter_check_rule_enabled (self->priv->filter, MM_FILTER_RULE_PLUGIN_ALLOWLIST))
+        return;
+
+    subsystem_vendor_ids = mm_plugin_get_allowed_subsystem_vendor_ids (plugin);
+    for (i = 0; subsystem_vendor_ids && subsystem_vendor_ids[i].l; i++)
+        mm_filter_register_plugin_allowlist_subsystem_vendor_id (self->priv->filter, subsystem_vendor_ids[i].l, subsystem_vendor_ids[i].r);
+}
+
+static gboolean
+track_plugin (MMPluginManager  *self,
+              MMPlugin         *plugin,
+              GPtrArray       **subsystems,
+              GError          **error)
+{
+    const gchar **plugin_subsystems;
+    guint         i;
+
+    /* Ignore plugins that don't specify subsystems */
+    plugin_subsystems = mm_plugin_get_allowed_subsystems (plugin);
+    if (!plugin_subsystems) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                     "Allowed subsystems not specified");
+        return FALSE;
+    }
+
+    /* Process generic plugin */
+    if (mm_plugin_is_generic (plugin)) {
+        if (self->priv->generic) {
+            g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                         "Another generic plugin already registered");
+            return FALSE;
+        }
+        self->priv->generic = g_object_ref (plugin);
+    } else
+        self->priv->plugins = g_list_append (self->priv->plugins, g_object_ref (plugin));
+
+    /* Track required subsystems, avoiding duplicates in the list */
+    for (i = 0; plugin_subsystems[i]; i++) {
+        if (!g_ptr_array_find_with_equal_func (*subsystems, plugin_subsystems[i], g_str_equal, NULL))
+            g_ptr_array_add (*subsystems, g_strdup (plugin_subsystems[i]));
+    }
+
+    /* Register plugin allowlist rules in filter, if any */
+    register_plugin_allowlist_tags                 (self, plugin);
+    register_plugin_allowlist_vendor_ids           (self, plugin);
+    register_plugin_allowlist_product_ids          (self, plugin);
+    register_plugin_allowlist_subsystem_vendor_ids (self, plugin);
+
+    return TRUE;
+}
+
+static gboolean
+validate_tracked_plugins (MMPluginManager  *self,
+                          GPtrArray        *subsystems_take,
+                          GError          **error)
+{
+    g_autofree gchar *subsystems_str = NULL;
+
+    /* Check the generic plugin once all looped */
+    if (!self->priv->generic)
+        mm_obj_dbg (self, "generic plugin not loaded");
+
+    /* Treat as error if we don't find any plugin */
+    if (!self->priv->plugins && !self->priv->generic) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_NO_PLUGINS, "no plugins found");
+        return FALSE;
+    }
+
+    /* Validate required subsystems */
+    if (!subsystems_take->len) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_NO_PLUGINS,
+                     "empty list of subsystems required by plugins");
+        return FALSE;
+    }
+
+    /* Add trailing NULL and store as GStrv */
+    g_ptr_array_add (subsystems_take, NULL);
+    self->priv->subsystems = (gchar **) g_ptr_array_free (subsystems_take, FALSE);
+    subsystems_str = g_strjoinv (", ", self->priv->subsystems);
+
+    mm_obj_dbg (self, "successfully loaded %u plugins registering %u subsystems: %s",
+                g_list_length (self->priv->plugins) + !!self->priv->generic,
+                g_strv_length (self->priv->subsystems), subsystems_str);
+
+    return TRUE;
+}
+
+#if !defined WITH_BUILTIN_PLUGINS
+
 static MMPlugin *
-load_plugin (MMPluginManager *self,
-             const gchar     *path)
+load_external_plugin (MMPluginManager *self,
+                      const gchar     *path)
 {
     MMPlugin           *plugin = NULL;
     GModule            *module;
@@ -1694,10 +1819,9 @@ load_plugin (MMPluginManager *self,
     }
 
     plugin = (*plugin_create_func) ();
-    if (plugin) {
+    if (plugin)
         mm_obj_dbg (self, "loaded plugin '%s' from '%s'", mm_plugin_get_name (plugin), path_display);
-        g_object_weak_ref (G_OBJECT (plugin), (GWeakNotify) g_module_close, module);
-    } else
+    else
         mm_obj_warn (self, "could not load plugin '%s': initialization failed", path_display);
 
 out:
@@ -1710,14 +1834,15 @@ out:
 }
 
 static void
-load_shared (MMPluginManager *self,
-             const gchar     *path)
+load_external_shared (MMPluginManager *self,
+                      const gchar     *path)
 {
     GModule      *module;
     gchar        *path_display;
     const gchar **shared_name = NULL;
     gint         *major_shared_version;
     gint         *minor_shared_version;
+    gboolean      success =  FALSE;
 
     /* Get printable UTF-8 string of the path */
     path_display = g_filename_display_name (path);
@@ -1756,24 +1881,27 @@ load_shared (MMPluginManager *self,
     }
 
     mm_obj_dbg (self, "loaded shared '%s' utils from '%s'", *shared_name, path_display);
+    success = TRUE;
 
 out:
-    if (module && !(*shared_name))
+    if (module && !success)
         g_module_close (module);
 
     g_free (path_display);
 }
 
 static gboolean
-load_plugins (MMPluginManager *self,
-              GError **error)
+load_external_plugins (MMPluginManager  *self,
+                       GError          **error)
 {
-    GDir *dir = NULL;
-    const gchar *fname;
-    gchar *plugindir_display = NULL;
-    GList *shared_paths = NULL;
-    GList *plugin_paths = NULL;
-    GList *l;
+    GDir             *dir = NULL;
+    const gchar      *fname;
+    GList            *shared_paths = NULL;
+    GList            *plugin_paths = NULL;
+    GList            *l;
+    GPtrArray        *subsystems = NULL;
+    g_autofree gchar *plugindir_display = NULL;
+    gboolean          valid_plugins = FALSE;
 
     if (!g_module_supported ()) {
         g_set_error (error,
@@ -1789,11 +1917,8 @@ load_plugins (MMPluginManager *self,
     mm_obj_dbg (self, "looking for plugins in '%s'", plugindir_display);
     dir = g_dir_open (self->priv->plugin_dir, 0, NULL);
     if (!dir) {
-        g_set_error (error,
-                     MM_CORE_ERROR,
-                     MM_CORE_ERROR_NO_PLUGINS,
-                     "plugin directory '%s' not found",
-                     plugindir_display);
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_NO_PLUGINS,
+                     "plugin directory '%s' not found", plugindir_display);
         goto out;
     }
 
@@ -1808,57 +1933,61 @@ load_plugins (MMPluginManager *self,
 
     /* Load all shared utils */
     for (l = shared_paths; l; l = g_list_next (l))
-        load_shared (self, (const gchar *)(l->data));
+        load_external_shared (self, (const gchar *)(l->data));
 
     /* Load all plugins */
+    subsystems = g_ptr_array_new ();
     for (l = plugin_paths; l; l = g_list_next (l)) {
-        MMPlugin *plugin;
+        g_autoptr(MMPlugin) plugin = NULL;
+        g_autoptr(GError)   inner_error = NULL;
 
-        plugin = load_plugin (self, (const gchar *)(l->data));
+        plugin = load_external_plugin (self, (const gchar *)(l->data));
         if (!plugin)
             continue;
 
-        if (mm_plugin_is_generic (plugin)) {
-            if (self->priv->generic)
-                mm_obj_warn (self, "cannot register more than one generic plugin");
-            else
-                self->priv->generic = plugin;
-        } else
-            self->priv->plugins = g_list_append (self->priv->plugins, plugin);
-
-        /* Register plugin whitelist rules in filter, if any */
-        register_plugin_whitelist_tags        (self, plugin);
-        register_plugin_whitelist_vendor_ids  (self, plugin);
-        register_plugin_whitelist_product_ids (self, plugin);
+        if (!track_plugin (self, plugin, &subsystems, &inner_error))
+            mm_obj_warn (self, "ignored plugin '%s': %s", mm_plugin_get_name (plugin), inner_error->message);
     }
 
-    /* Check the generic plugin once all looped */
-    if (!self->priv->generic)
-        mm_obj_dbg (self, "generic plugin not loaded");
-
-    /* Treat as error if we don't find any plugin */
-    if (!self->priv->plugins && !self->priv->generic) {
-        g_set_error (error,
-                     MM_CORE_ERROR,
-                     MM_CORE_ERROR_NO_PLUGINS,
-                     "no plugins found in plugin directory '%s'",
-                     plugindir_display);
-        goto out;
-    }
-
-    mm_obj_dbg (self, "successfully loaded %u plugins",
-                g_list_length (self->priv->plugins) + !!self->priv->generic);
+    valid_plugins = validate_tracked_plugins (self, subsystems, error);
 
 out:
     g_list_free_full (shared_paths, g_free);
     g_list_free_full (plugin_paths, g_free);
     if (dir)
         g_dir_close (dir);
-    g_free (plugindir_display);
 
-    /* Return TRUE if at least one plugin found */
-    return (self->priv->plugins || self->priv->generic);
+    return valid_plugins;
 }
+
+#else
+
+static gboolean
+load_builtin_plugins (MMPluginManager  *self,
+                      GError          **error)
+{
+    GList     *builtin_plugins;
+    GList     *l;
+    GPtrArray *subsystems = NULL;
+
+    subsystems = g_ptr_array_new ();
+
+    builtin_plugins = mm_builtin_plugins_load ();
+    for (l = builtin_plugins; l; l = g_list_next (l)) {
+        gboolean  tracked;
+        MMPlugin *plugin;
+
+        plugin = MM_PLUGIN (l->data);
+        mm_obj_dbg (self, "loaded builtin plugin '%s'", mm_plugin_get_name (plugin));
+        tracked = track_plugin (self, plugin, &subsystems, NULL);
+        g_assert (tracked);
+    }
+    g_list_free_full (builtin_plugins, (GDestroyNotify)g_object_unref);
+
+    return validate_tracked_plugins (self, subsystems, error);
+}
+
+#endif /* !WITH_BUILTIN_PLUGINS */
 
 /*****************************************************************************/
 
@@ -1871,40 +2000,46 @@ log_object_build_id (MMLogObject *_self)
 /*****************************************************************************/
 
 MMPluginManager *
-mm_plugin_manager_new (const gchar  *plugin_dir,
-                       MMFilter     *filter,
+mm_plugin_manager_new (MMFilter     *filter,
+#if !defined WITH_BUILTIN_PLUGINS
+                       const gchar  *plugin_dir,
+#endif
                        GError      **error)
 {
     return g_initable_new (MM_TYPE_PLUGIN_MANAGER,
                            NULL,
                            error,
+                           MM_PLUGIN_MANAGER_FILTER, filter,
+#if !defined WITH_BUILTIN_PLUGINS
                            MM_PLUGIN_MANAGER_PLUGIN_DIR, plugin_dir,
-                           MM_PLUGIN_MANAGER_FILTER,     filter,
+#endif
                            NULL);
 }
 
 static void
-mm_plugin_manager_init (MMPluginManager *manager)
+mm_plugin_manager_init (MMPluginManager *self)
 {
     /* Initialize opaque pointer to private data */
-    manager->priv = G_TYPE_INSTANCE_GET_PRIVATE (manager,
-                                                 MM_TYPE_PLUGIN_MANAGER,
-                                                 MMPluginManagerPrivate);
+    self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self,
+                                              MM_TYPE_PLUGIN_MANAGER,
+                                              MMPluginManagerPrivate);
 }
 
 static void
-set_property (GObject *object,
-              guint prop_id,
+set_property (GObject      *object,
+              guint         prop_id,
               const GValue *value,
-              GParamSpec *pspec)
+              GParamSpec   *pspec)
 {
     MMPluginManagerPrivate *priv = MM_PLUGIN_MANAGER (object)->priv;
 
     switch (prop_id) {
+#if !defined WITH_BUILTIN_PLUGINS
     case PROP_PLUGIN_DIR:
         g_free (priv->plugin_dir);
         priv->plugin_dir = g_value_dup_string (value);
         break;
+#endif
     case PROP_FILTER:
         priv->filter = g_value_dup_object (value);
         break;
@@ -1915,17 +2050,19 @@ set_property (GObject *object,
 }
 
 static void
-get_property (GObject *object,
-              guint prop_id,
-              GValue *value,
+get_property (GObject    *object,
+              guint       prop_id,
+              GValue     *value,
               GParamSpec *pspec)
 {
     MMPluginManagerPrivate *priv = MM_PLUGIN_MANAGER (object)->priv;
 
     switch (prop_id) {
+#if !defined WITH_BUILTIN_PLUGINS
     case PROP_PLUGIN_DIR:
         g_value_set_string (value, priv->plugin_dir);
         break;
+#endif
     case PROP_FILTER:
         g_value_set_object (value, priv->filter);
         break;
@@ -1936,12 +2073,16 @@ get_property (GObject *object,
 }
 
 static gboolean
-initable_init (GInitable *initable,
-               GCancellable *cancellable,
-               GError **error)
+initable_init (GInitable     *initable,
+               GCancellable  *cancellable,
+               GError       **error)
 {
-    /* Load the list of plugins */
-    return load_plugins (MM_PLUGIN_MANAGER (initable), error);
+#if defined WITH_BUILTIN_PLUGINS
+    return load_builtin_plugins (MM_PLUGIN_MANAGER (initable), error);
+#else
+    /* Load the list of plugins from the filesystem*/
+    return load_external_plugins (MM_PLUGIN_MANAGER (initable), error);
+#endif
 }
 
 static void
@@ -1949,17 +2090,13 @@ dispose (GObject *object)
 {
     MMPluginManager *self = MM_PLUGIN_MANAGER (object);
 
-    /* Cleanup list of plugins */
-    if (self->priv->plugins) {
-        g_list_free_full (self->priv->plugins, g_object_unref);
-        self->priv->plugins = NULL;
-    }
+    g_list_free_full (g_steal_pointer (&self->priv->plugins), g_object_unref);
     g_clear_object (&self->priv->generic);
-
-    g_free (self->priv->plugin_dir);
-    self->priv->plugin_dir = NULL;
-
     g_clear_object (&self->priv->filter);
+    g_clear_pointer (&self->priv->subsystems, g_strfreev);
+#if !defined WITH_BUILTIN_PLUGINS
+    g_clear_pointer (&self->priv->plugin_dir, g_free);
+#endif
 
     G_OBJECT_CLASS (mm_plugin_manager_parent_class)->dispose (object);
 }
@@ -1989,6 +2126,7 @@ mm_plugin_manager_class_init (MMPluginManagerClass *manager_class)
     object_class->get_property = get_property;
 
     /* Properties */
+#if !defined WITH_BUILTIN_PLUGINS
     g_object_class_install_property
         (object_class, PROP_PLUGIN_DIR,
          g_param_spec_string (MM_PLUGIN_MANAGER_PLUGIN_DIR,
@@ -1996,6 +2134,8 @@ mm_plugin_manager_class_init (MMPluginManagerClass *manager_class)
                               "Where to look for plugins",
                               NULL,
                               G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY));
+#endif
+
     g_object_class_install_property
         (object_class, PROP_FILTER,
          g_param_spec_object (MM_PLUGIN_MANAGER_FILTER,

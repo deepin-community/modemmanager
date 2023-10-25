@@ -70,7 +70,7 @@ static GOptionEntry entries[] = {
     },
     { "set-logging", 'G', 0, G_OPTION_ARG_STRING, &set_logging_str,
       "Set logging level in the ModemManager daemon",
-      "[ERR,WARN,INFO,DEBUG]",
+      "[ERR,WARN,MSG,INFO,DEBUG]",
     },
     { "list-modems", 'L', 0, G_OPTION_ARG_NONE, &list_modems_flag,
       "List available modems",
@@ -449,7 +449,7 @@ get_manager_ready (GObject      *source,
 
 #if defined WITH_UDEV
     if (report_kernel_event_auto_scan) {
-        const gchar *subsys[] = { "tty", "usbmisc", "net", NULL };
+        const gchar *subsys[] = { "tty", "usbmisc", "net", "rpmsg", "wwan", NULL };
         guint i;
 
         ctx->udev = g_udev_client_new (subsys);

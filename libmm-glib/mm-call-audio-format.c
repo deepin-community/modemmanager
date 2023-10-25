@@ -1,14 +1,21 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 /*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * libmm-glib -- Access modem status & information from glib applications
  *
- * This program is distributed in the hope that it will be useful,
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details:
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the
+ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+ * Boston, MA 02110-1301 USA.
  *
  * Copyright (C) 2017 Red Hat, Inc.
  */
@@ -160,25 +167,24 @@ mm_call_audio_format_get_dictionary (MMCallAudioFormat *self)
         return NULL;
 
     g_variant_builder_init (&builder, G_VARIANT_TYPE ("a{sv}"));
-    if (self) {
-        if (self->priv->encoding)
-            g_variant_builder_add (&builder,
-                                   "{sv}",
-                                   PROPERTY_ENCODING,
-                                   g_variant_new_string (self->priv->encoding));
 
-        if (self->priv->resolution)
-            g_variant_builder_add (&builder,
-                                   "{sv}",
-                                   PROPERTY_RESOLUTION,
-                                   g_variant_new_string (self->priv->resolution));
+    if (self->priv->encoding)
+        g_variant_builder_add (&builder,
+                               "{sv}",
+                               PROPERTY_ENCODING,
+                               g_variant_new_string (self->priv->encoding));
 
-        if (self->priv->rate)
-            g_variant_builder_add (&builder,
-                                   "{sv}",
-                                   PROPERTY_RATE,
-                                   g_variant_new_uint32 (self->priv->rate));
-    }
+    if (self->priv->resolution)
+        g_variant_builder_add (&builder,
+                               "{sv}",
+                               PROPERTY_RESOLUTION,
+                               g_variant_new_string (self->priv->resolution));
+
+    if (self->priv->rate)
+        g_variant_builder_add (&builder,
+                               "{sv}",
+                               PROPERTY_RATE,
+                               g_variant_new_uint32 (self->priv->rate));
 
     return g_variant_builder_end (&builder);
 }

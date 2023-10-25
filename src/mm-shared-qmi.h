@@ -11,6 +11,7 @@
  * GNU General Public License for more details:
  *
  * Copyright (C) 2018 Aleksander Morgado <aleksander@aleksander.es>
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc.
  */
 
 #ifndef MM_SHARED_QMI_H
@@ -64,14 +65,21 @@ gboolean   mm_shared_qmi_ensure_client (MMSharedQmi          *self,
 
 /* Shared QMI 3GPP operations */
 
-void     mm_shared_qmi_3gpp_register_in_network        (MMIfaceModem3gpp     *self,
-                                                        const gchar          *operator_id,
-                                                        GCancellable         *cancellable,
-                                                        GAsyncReadyCallback   callback,
-                                                        gpointer              user_data);
-gboolean mm_shared_qmi_3gpp_register_in_network_finish (MMIfaceModem3gpp     *self,
-                                                        GAsyncResult         *res,
-                                                        GError              **error);
+void     mm_shared_qmi_3gpp_register_in_network        (MMIfaceModem3gpp               *self,
+                                                        const gchar                    *operator_id,
+                                                        GCancellable                   *cancellable,
+                                                        GAsyncReadyCallback             callback,
+                                                        gpointer                        user_data);
+gboolean mm_shared_qmi_3gpp_register_in_network_finish (MMIfaceModem3gpp               *self,
+                                                        GAsyncResult                   *res,
+                                                        GError                        **error);
+void     mm_shared_qmi_set_packet_service_state        (MMIfaceModem3gpp               *self,
+                                                        MMModem3gppPacketServiceState   packet_service_state,
+                                                        GAsyncReadyCallback             callback,
+                                                        gpointer                        user_data);
+gboolean mm_shared_qmi_set_packet_service_state_finish (MMIfaceModem3gpp               *self,
+                                                        GAsyncResult                   *res,
+                                                        GError                        **error);
 
 /* Shared QMI device management support */
 
@@ -92,6 +100,12 @@ void               mm_shared_qmi_set_current_capabilities           (MMIfaceMode
                                                                      GAsyncReadyCallback   callback,
                                                                      gpointer              user_data);
 gboolean           mm_shared_qmi_set_current_capabilities_finish    (MMIfaceModem         *self,
+                                                                     GAsyncResult         *res,
+                                                                     GError              **error);
+void               mm_shared_qmi_load_model                         (MMIfaceModem         *self,
+                                                                     GAsyncReadyCallback   callback,
+                                                                     gpointer              user_data);
+gchar             *mm_shared_qmi_load_model_finish                  (MMIfaceModem         *self,
                                                                      GAsyncResult         *res,
                                                                      GError              **error);
 void               mm_shared_qmi_load_supported_modes               (MMIfaceModem         *self,
@@ -162,6 +176,27 @@ void               mm_shared_qmi_setup_carrier_config               (MMIfaceMode
                                                                      GAsyncReadyCallback   callback,
                                                                      gpointer              user_data);
 gboolean           mm_shared_qmi_setup_carrier_config_finish        (MMIfaceModem         *self,
+                                                                     GAsyncResult         *res,
+                                                                     GError              **error);
+void               mm_shared_qmi_load_sim_slots                     (MMIfaceModem         *self,
+                                                                     GAsyncReadyCallback   callback,
+                                                                     gpointer              user_data);
+gboolean           mm_shared_qmi_load_sim_slots_finish              (MMIfaceModem         *self,
+                                                                     GAsyncResult         *res,
+                                                                     GPtrArray           **sim_slots,
+                                                                     guint                *primary_sim_slot,
+                                                                     GError              **error);
+void               mm_shared_qmi_set_primary_sim_slot               (MMIfaceModem         *self,
+                                                                     guint                 sim_slot,
+                                                                     GAsyncReadyCallback   callback,
+                                                                     gpointer              user_data);
+gboolean           mm_shared_qmi_set_primary_sim_slot_finish        (MMIfaceModem         *self,
+                                                                     GAsyncResult         *res,
+                                                                     GError              **error);
+void               mm_shared_qmi_setup_sim_hot_swap                 (MMIfaceModem         *self,
+                                                                     GAsyncReadyCallback   callback,
+                                                                     gpointer              user_data);
+gboolean           mm_shared_qmi_setup_sim_hot_swap_finish          (MMIfaceModem         *self,
                                                                      GAsyncResult         *res,
                                                                      GError              **error);
 

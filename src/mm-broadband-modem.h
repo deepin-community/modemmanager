@@ -12,8 +12,8 @@
  *
  * Copyright (C) 2008 - 2009 Novell, Inc.
  * Copyright (C) 2009 - 2011 Red Hat, Inc.
- * Copyright (C) 2011 Google, Inc.
  * Copyright (C) 2015 - Marco Bascetta <marco.bascetta@sadel.it>
+ * Copyright (C) 2011 - 2022 Google, Inc.
  */
 
 #ifndef MM_BROADBAND_MODEM_H
@@ -41,6 +41,10 @@ typedef struct _MMBroadbandModemPrivate MMBroadbandModemPrivate;
 
 #define MM_BROADBAND_MODEM_FLOW_CONTROL        "broadband-modem-flow-control"
 #define MM_BROADBAND_MODEM_INDICATORS_DISABLED "broadband-modem-indicators-disabled"
+
+#if defined WITH_SUSPEND_RESUME
+# define MM_BROADBAND_MODEM_SIGNAL_SYNC_NEEDED  "broadband-modem-sync-needed"
+#endif
 
 struct _MMBroadbandModem {
     MMBaseModem parent;
@@ -85,40 +89,34 @@ struct _MMBroadbandModemClass {
                                              GAsyncResult *res,
                                              GError **error);
 
-
     /* Last disabling step */
     gboolean (* disabling_stopped) (MMBroadbandModem *self,
                                     GError **error);
+
+#if defined WITH_SUSPEND_RESUME
+    /* signals */
+    void (* sync_needed) (MMBroadbandModem *self);
+#endif
 };
 
 GType mm_broadband_modem_get_type (void);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMBroadbandModem, g_object_unref)
 
 MMBroadbandModem *mm_broadband_modem_new (const gchar *device,
+                                          const gchar *physdev,
                                           const gchar **drivers,
                                           const gchar *plugin,
                                           guint16 vendor_id,
                                           guint16 product_id);
 
-/* Convert the given string, which comes in the charset currently set in the
- * modem, to UTF-8. Given in the API so that subclasses can also use it directly.
- */
-gchar *mm_broadband_modem_take_and_convert_to_utf8 (MMBroadbandModem *self,
-                                                    gchar *str);
-
-/* Convert the given string, which comes in UTF-8, to the charset currently set
- * in the modem. Given in the API so that subclasses can also use it directly.
- */
-gchar *mm_broadband_modem_take_and_convert_to_current_charset (MMBroadbandModem *self,
-                                                               gchar *str);
-
 MMModemCharset mm_broadband_modem_get_current_charset (MMBroadbandModem *self);
 
 /* Create a unique device identifier string using the ATI and ATI1 replies and some
  * additional internal info */
-gchar *mm_broadband_modem_create_device_identifier (MMBroadbandModem *self,
-                                                    const gchar *ati,
-                                                    const gchar *ati1);
+gchar *mm_broadband_modem_create_device_identifier (MMBroadbandModem  *self,
+                                                    const gchar       *ati,
+                                                    const gchar       *ati1,
+                                                    GError           **error);
 
 /* Locking/unlocking SMS storages */
 void     mm_broadband_modem_lock_sms_storages        (MMBroadbandModem *self,
@@ -133,6 +131,14 @@ void     mm_broadband_modem_unlock_sms_storages      (MMBroadbandModem *self,
                                                       gboolean mem1,
                                                       gboolean mem2);
 /* Helper to update SIM hot swap */
-void mm_broadband_modem_sim_hot_swap_detected (MMBroadbandModem *self);
+gboolean mm_broadband_modem_sim_hot_swap_ports_context_init  (MMBroadbandModem  *self,
+                                                              GError           **error);
+void     mm_broadband_modem_sim_hot_swap_ports_context_reset (MMBroadbandModem  *self);
+
+/* Helper to manage multiplexed bearers */
+gboolean mm_broadband_modem_get_active_multiplexed_bearers (MMBroadbandModem  *self,
+                                                            guint             *out_current,
+                                                            guint             *out_max,
+                                                            GError           **error);
 
 #endif /* MM_BROADBAND_MODEM_H */

@@ -11,6 +11,7 @@
  * GNU General Public License for more details:
  *
  * Copyright (C) 2011-2012 Google, Inc.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc.
  */
 
 #ifndef MM_IFACE_MODEM_3GPP_H
@@ -37,6 +38,7 @@
 #define MM_IFACE_MODEM_3GPP_5GS_NETWORK_SUPPORTED   "iface-modem-3gpp-5gs-network-supported"
 #define MM_IFACE_MODEM_3GPP_IGNORED_FACILITY_LOCKS  "iface-modem-3gpp-ignored-facility-locks"
 #define MM_IFACE_MODEM_3GPP_INITIAL_EPS_BEARER      "iface-modem-3gpp-initial-eps-bearer"
+#define MM_IFACE_MODEM_3GPP_PACKET_SERVICE_STATE    "iface-modem-3gpp-packet-service-state"
 
 #define MM_IFACE_MODEM_3GPP_ALL_ACCESS_TECHNOLOGIES_MASK    \
     (MM_MODEM_ACCESS_TECHNOLOGY_GSM |                       \
@@ -165,6 +167,14 @@ struct _MMIfaceModem3gpp {
                                                                      GAsyncResult         *res,
                                                                      GError              **error);
 
+    /* Asynchronous 5GNR registration settings loading */
+    void                         (*load_nr5g_registration_settings)        (MMIfaceModem3gpp     *self,
+                                                                            GAsyncReadyCallback   callback,
+                                                                            gpointer              user_data);
+    MMNr5gRegistrationSettings * (*load_nr5g_registration_settings_finish) (MMIfaceModem3gpp     *self,
+                                                                            GAsyncResult         *res,
+                                                                            GError              **error);
+
     /* Create initial default EPS bearer object */
     MMBaseBearer * (*create_initial_eps_bearer) (MMIfaceModem3gpp   *self,
                                                  MMBearerProperties *properties);
@@ -234,6 +244,45 @@ struct _MMIfaceModem3gpp {
     gboolean (* set_initial_eps_bearer_settings_finish) (MMIfaceModem3gpp     *self,
                                                          GAsyncResult         *res,
                                                          GError              **error);
+
+    /* Remove modem personalization */
+    void     (* disable_facility_lock) (MMIfaceModem3gpp         *self,
+                                        MMModem3gppFacility       facility,
+                                        guint8                    slot,
+                                        const gchar              *control_key,
+                                        GAsyncReadyCallback       callback,
+                                        gpointer                  user_data);
+    gboolean (* disable_facility_lock_finish) (MMIfaceModem3gpp  *self,
+                                               GAsyncResult      *res,
+                                               GError           **error);
+
+    /* Set Packet service */
+    void     (*set_packet_service_state)        (MMIfaceModem3gpp              *self,
+                                                 MMModem3gppPacketServiceState  state,
+                                                 GAsyncReadyCallback            callback,
+                                                 gpointer                       user_data);
+    gboolean (*set_packet_service_state_finish) (MMIfaceModem3gpp              *self,
+                                                 GAsyncResult                  *res,
+                                                 GError                       **error);
+
+    /* Set 5GNR registration settings */
+    void     (* set_nr5g_registration_settings)        (MMIfaceModem3gpp             *self,
+                                                        MMNr5gRegistrationSettings   *settings,
+                                                        GAsyncReadyCallback           callback,
+                                                        gpointer                      user_data);
+    gboolean (* set_nr5g_registration_settings_finish) (MMIfaceModem3gpp             *self,
+                                                        GAsyncResult                 *res,
+                                                        GError                      **error);
+
+    /* Set carrier lock */
+    void     (* set_carrier_lock)       (MMIfaceModem3gpp    *self,
+                                         const guint8        *data,
+                                         gsize                data_size,
+                                         GAsyncReadyCallback  callback,
+                                         gpointer             user_data);
+    gboolean (*set_carrier_lock_finish) (MMIfaceModem3gpp    *self,
+                                         GAsyncResult        *res,
+                                         GError             **error);
 };
 
 GType mm_iface_modem_3gpp_get_type (void);
@@ -265,21 +314,47 @@ gboolean mm_iface_modem_3gpp_disable_finish (MMIfaceModem3gpp *self,
                                              GAsyncResult *res,
                                              GError **error);
 
+#if defined WITH_SUSPEND_RESUME
+
+/* Sync 3GPP interface (async) */
+void     mm_iface_modem_3gpp_sync           (MMIfaceModem3gpp *self,
+                                             GAsyncReadyCallback callback,
+                                             gpointer user_data);
+gboolean mm_iface_modem_3gpp_sync_finish    (MMIfaceModem3gpp *self,
+                                             GAsyncResult *res,
+                                             GError **error);
+
+#endif
+
 /* Shutdown Modem 3GPP interface */
 void mm_iface_modem_3gpp_shutdown (MMIfaceModem3gpp *self);
 
 /* Objects implementing this interface can report new registration info,
  * access technologies and location.
+ *
  * This may happen when handling unsolicited registration messages, or when
- * the interface asks to run registration state checks. */
-void mm_iface_modem_3gpp_update_cs_registration_state (MMIfaceModem3gpp *self,
-                                                       MMModem3gppRegistrationState state);
-void mm_iface_modem_3gpp_update_ps_registration_state (MMIfaceModem3gpp *self,
-                                                       MMModem3gppRegistrationState state);
-void mm_iface_modem_3gpp_update_eps_registration_state (MMIfaceModem3gpp *self,
-                                                        MMModem3gppRegistrationState state);
-void mm_iface_modem_3gpp_update_5gs_registration_state (MMIfaceModem3gpp *self,
-                                                        MMModem3gppRegistrationState state);
+ * the interface asks to run registration state checks.
+ *
+ * The registration updates may be "deferred" so that they are applied all at
+ * the same time.
+ */
+void mm_iface_modem_3gpp_update_cs_registration_state      (MMIfaceModem3gpp             *self,
+                                                            MMModem3gppRegistrationState  state,
+                                                            gboolean                      deferred);
+void mm_iface_modem_3gpp_update_ps_registration_state      (MMIfaceModem3gpp             *self,
+                                                            MMModem3gppRegistrationState  state,
+                                                            gboolean                      deferred);
+void mm_iface_modem_3gpp_update_eps_registration_state     (MMIfaceModem3gpp             *self,
+                                                            MMModem3gppRegistrationState  state,
+                                                            gboolean                      deferred);
+void mm_iface_modem_3gpp_update_5gs_registration_state     (MMIfaceModem3gpp             *self,
+                                                            MMModem3gppRegistrationState  state,
+                                                            gboolean                      deferred);
+void mm_iface_modem_3gpp_apply_deferred_registration_state (MMIfaceModem3gpp             *self);
+
+void mm_iface_modem_3gpp_update_packet_service_state (MMIfaceModem3gpp              *self,
+                                                      MMModem3gppPacketServiceState  state);
+
 void mm_iface_modem_3gpp_update_subscription_state (MMIfaceModem3gpp *self,
                                                     MMModem3gppSubscriptionState state);
 void mm_iface_modem_3gpp_update_access_technologies (MMIfaceModem3gpp *self,
@@ -292,6 +367,7 @@ void mm_iface_modem_3gpp_update_pco_list            (MMIfaceModem3gpp *self,
                                                      const GList *pco_list);
 void mm_iface_modem_3gpp_update_initial_eps_bearer  (MMIfaceModem3gpp *self,
                                                      MMBearerProperties *properties);
+void mm_iface_modem_3gpp_reload_initial_eps_bearer  (MMIfaceModem3gpp *self);
 
 /* Run all registration checks */
 void mm_iface_modem_3gpp_run_registration_checks (MMIfaceModem3gpp *self,
@@ -328,6 +404,25 @@ void     mm_iface_modem_3gpp_reregister_in_network        (MMIfaceModem3gpp     
 gboolean mm_iface_modem_3gpp_reregister_in_network_finish (MMIfaceModem3gpp     *self,
                                                            GAsyncResult         *res,
                                                            GError              **error);
+
+/* Allow requesting packet service explicitly */
+void     mm_iface_modem_3gpp_set_packet_service_state        (MMIfaceModem3gpp              *self,
+                                                              MMModem3gppPacketServiceState  packet_service_state,
+                                                              GAsyncReadyCallback            callback,
+                                                              gpointer                       user_data);
+gboolean mm_iface_modem_3gpp_set_packet_service_state_finish (MMIfaceModem3gpp              *self,
+                                                              GAsyncResult                  *res,
+                                                              GError                       **error);
+
+/* Allow waiting for packet service */
+void                          mm_iface_modem_3gpp_wait_for_packet_service_state        (MMIfaceModem3gpp              *self,
+                                                                                        MMModem3gppPacketServiceState  final_state,
+                                                                                        GCancellable                  *cancellable,
+                                                                                        GAsyncReadyCallback            callback,
+                                                                                        gpointer                       user_data);
+MMModem3gppPacketServiceState mm_iface_modem_3gpp_wait_for_packet_service_state_finish (MMIfaceModem3gpp  *self,
+                                                                                        GAsyncResult      *res,
+                                                                                        GError           **error);
 
 /* Bind properties for simple GetStatus() */
 void mm_iface_modem_3gpp_bind_simple_status (MMIfaceModem3gpp *self,

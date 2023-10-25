@@ -12,6 +12,7 @@
  *
  * Copyright (C) 2012-2018 Google, Inc.
  * Copyright (C) 2018 Aleksander Morgado <aleksander@aleksander.es>
+ * Copyright (c) 2021 Qualcomm Innovation Center, Inc.
  */
 
 #include <string.h>
@@ -21,7 +22,9 @@
 
 #include "mm-modem-helpers-qmi.h"
 #include "mm-modem-helpers.h"
+#include "mm-error-helpers.h"
 #include "mm-enums-types.h"
+#include "mm-flags-types.h"
 #include "mm-log-object.h"
 
 /*****************************************************************************/
@@ -41,6 +44,8 @@ mm_modem_capability_from_qmi_radio_interface (QmiDmsRadioInterface network,
         return MM_MODEM_CAPABILITY_GSM_UMTS;
     case QMI_DMS_RADIO_INTERFACE_LTE:
         return MM_MODEM_CAPABILITY_LTE;
+    case QMI_DMS_RADIO_INTERFACE_TDS:
+        return MM_MODEM_CAPABILITY_TDS;
     case QMI_DMS_RADIO_INTERFACE_5GNR:
         return MM_MODEM_CAPABILITY_5GNR;
     default:
@@ -68,6 +73,7 @@ mm_modem_mode_from_qmi_radio_interface (QmiDmsRadioInterface network,
         return MM_MODEM_MODE_4G;
     case QMI_DMS_RADIO_INTERFACE_5GNR:
         return MM_MODEM_MODE_5G;
+    case QMI_DMS_RADIO_INTERFACE_TDS:
     default:
         mm_obj_warn (log_object, "unhandled QMI radio interface '%u'", (guint)network);
         return MM_MODEM_MODE_NONE;
@@ -347,10 +353,43 @@ dms_add_extended_qmi_lte_bands (GArray   *mm_bands,
     }
 }
 
+static void
+dms_add_qmi_nr5g_bands (GArray   *mm_bands,
+                        GArray   *qmi_bands,
+                        gpointer  log_object)
+{
+    guint i;
+
+    g_assert (mm_bands != NULL);
+
+    if (!qmi_bands)
+        return;
+
+    for (i = 0; i < qmi_bands->len; i++) {
+        guint16 val;
+
+        val = g_array_index (qmi_bands, guint16, i);
+
+        /* MM_MODEM_BAND_NGRAN_1 = 301,
+         * ...
+         * MM_MODEM_BAND_NGRAN_261 = 561
+         */
+        if (val < 1 || val > 261)
+            mm_obj_dbg (log_object, "unexpected NR5G band supported by module: NGRAN %u", val);
+        else {
+            MMModemBand band;
+
+            band = (MMModemBand)(val + MM_MODEM_BAND_NGRAN_1 - 1);
+            g_array_append_val (mm_bands, band);
+        }
+    }
+}
+
 GArray *
 mm_modem_bands_from_qmi_band_capabilities (QmiDmsBandCapability     qmi_bands,
                                            QmiDmsLteBandCapability  qmi_lte_bands,
                                            GArray                  *extended_qmi_lte_bands,
+                                           GArray                  *qmi_nr5g_bands,
                                            gpointer                 log_object)
 {
     GArray *mm_bands;
@@ -362,6 +401,9 @@ mm_modem_bands_from_qmi_band_capabilities (QmiDmsBandCapability     qmi_bands,
         dms_add_extended_qmi_lte_bands (mm_bands, extended_qmi_lte_bands, log_object);
     else
         dms_add_qmi_lte_bands (mm_bands, qmi_lte_bands);
+
+    if (qmi_nr5g_bands)
+        dms_add_qmi_nr5g_bands (mm_bands, qmi_nr5g_bands, log_object);
 
     return mm_bands;
 }
@@ -558,11 +600,50 @@ nas_add_extended_qmi_lte_bands (GArray        *mm_bands,
     }
 }
 
+static void
+nas_add_qmi_nr5g_bands (GArray        *mm_bands,
+                        const guint64 *qmi_nr5g_bands,
+                        guint          qmi_nr5g_bands_size,
+                        gpointer       log_object)
+{
+    guint i;
+
+    g_assert (mm_bands != NULL);
+
+    for (i = 0; i < qmi_nr5g_bands_size; i++) {
+        guint j;
+
+        for (j = 0; j < 64; j++) {
+            guint val;
+
+            if (!(qmi_nr5g_bands[i] & (((guint64) 1) << j)))
+                continue;
+
+            val = 1 + j + (i * 64);
+
+            /* MM_MODEM_BAND_NGRAN_1 = 301,
+             * ...
+             * MM_MODEM_BAND_NGRAN_261 = 561
+             */
+            if (val < 1 || val > 261)
+                mm_obj_dbg (log_object, "unexpected NR5G band supported by module: NGRAN %u", val);
+            else {
+                MMModemBand band;
+
+                band = (val + MM_MODEM_BAND_NGRAN_1 - 1);
+                g_array_append_val (mm_bands, band);
+            }
+        }
+    }
+}
+
 GArray *
 mm_modem_bands_from_qmi_band_preference (QmiNasBandPreference     qmi_bands,
                                          QmiNasLteBandPreference  qmi_lte_bands,
                                          const guint64           *extended_qmi_lte_bands,
                                          guint                    extended_qmi_lte_bands_size,
+                                         const guint64           *qmi_nr5g_bands,
+                                         guint                    qmi_nr5g_bands_size,
                                          gpointer                 log_object)
 {
     GArray *mm_bands;
@@ -575,6 +656,9 @@ mm_modem_bands_from_qmi_band_preference (QmiNasBandPreference     qmi_bands,
     else
         nas_add_qmi_lte_bands (mm_bands, qmi_lte_bands);
 
+    if (qmi_nr5g_bands && qmi_nr5g_bands_size)
+        nas_add_qmi_nr5g_bands (mm_bands, qmi_nr5g_bands, qmi_nr5g_bands_size, log_object);
+
     return mm_bands;
 }
 
@@ -584,6 +668,8 @@ mm_modem_bands_to_qmi_band_preference (GArray                  *mm_bands,
                                        QmiNasLteBandPreference *qmi_lte_bands,
                                        guint64                 *extended_qmi_lte_bands,
                                        guint                    extended_qmi_lte_bands_size,
+                                       guint64                 *qmi_nr5g_bands,
+                                       guint                    qmi_nr5g_bands_size,
                                        gpointer                 log_object)
 {
     guint i;
@@ -592,6 +678,8 @@ mm_modem_bands_to_qmi_band_preference (GArray                  *mm_bands,
     *qmi_lte_bands = 0;
     if (extended_qmi_lte_bands)
         memset (extended_qmi_lte_bands, 0, extended_qmi_lte_bands_size * sizeof (guint64));
+    if (qmi_nr5g_bands)
+        memset (qmi_nr5g_bands, 0, qmi_nr5g_bands_size * sizeof (guint64));
 
     for (i = 0; i < mm_bands->len; i++) {
         MMModemBand band;
@@ -627,6 +715,22 @@ mm_modem_bands_to_qmi_band_preference (GArray                  *mm_bands,
                 if (j == G_N_ELEMENTS (nas_lte_bands_map))
                     mm_obj_dbg (log_object, "cannot add the following LTE band: '%s'",
                                 mm_modem_band_get_string (band));
+            }
+        } else if (band >= MM_MODEM_BAND_NGRAN_1 && band <= MM_MODEM_BAND_NGRAN_261) {
+            if (qmi_nr5g_bands && qmi_nr5g_bands_size) {
+                /* Add NR5G band preference */
+                guint val;
+                guint j;
+                guint k;
+
+                /* it's really (band - MM_MODEM_BAND_NGRAN_1 +1 -1), because
+                 * we want NGRAN1 in index 0 */
+                val = band - MM_MODEM_BAND_NGRAN_1;
+                j = val / 64;
+                g_assert (j < qmi_nr5g_bands_size);
+                k = val % 64;
+
+                qmi_nr5g_bands[j] |= ((guint64)1 << k);
             }
         } else {
             /* Add non-LTE band preference */
@@ -1106,66 +1210,74 @@ mm_modem_capability_to_qmi_acquisition_order_preference (MMModemCapability caps)
     return array;
 }
 
+static gboolean
+radio_interface_array_contains (GArray               *array,
+                                QmiNasRadioInterface  act)
+{
+    guint i;
+
+    for (i = 0; i < array->len; i++) {
+        QmiNasRadioInterface value;
+
+        value = g_array_index (array, QmiNasRadioInterface, i);
+        if (value == act)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void
+radio_interface_array_add_missing (GArray *array,
+                                   GArray *all)
+{
+    guint i;
+
+    for (i = 0; i < all->len; i++) {
+        QmiNasRadioInterface value;
+
+        value = g_array_index (all, QmiNasRadioInterface, i);
+        if (!radio_interface_array_contains (array, value))
+            g_array_append_val (array, value);
+    }
+}
+
 GArray *
-mm_modem_mode_to_qmi_acquisition_order_preference (MMModemMode allowed,
-                                                   MMModemMode preferred,
-                                                   gboolean    is_cdma,
-                                                   gboolean    is_3gpp)
+mm_modem_mode_to_qmi_acquisition_order_preference (MMModemMode  allowed,
+                                                   MMModemMode  preferred,
+                                                   GArray      *all)
 {
     GArray               *array;
+    QmiNasRadioInterface  preferred_radio = QMI_NAS_RADIO_INTERFACE_UNKNOWN;
     QmiNasRadioInterface  value;
 
-    array = g_array_new (FALSE, FALSE, sizeof (QmiNasRadioInterface));
+    array = g_array_sized_new (FALSE, FALSE, sizeof (QmiNasRadioInterface), all->len);
 
-    if (allowed & MM_MODEM_MODE_5G) {
-        value = QMI_NAS_RADIO_INTERFACE_5GNR;
-        if (preferred == MM_MODEM_MODE_5G)
-            g_array_prepend_val (array, value);
-        else
-            g_array_append_val (array, value);
+#define PROCESS_ALLOWED_PREFERRED_MODE(MODE,RADIO)                      \
+    if ((allowed & MODE) && (radio_interface_array_contains (all, RADIO))) { \
+        if ((preferred == MODE) && (preferred_radio == QMI_NAS_RADIO_INTERFACE_UNKNOWN)) \
+            preferred_radio = RADIO;                                    \
+        else {                                                          \
+            value = RADIO;                                              \
+            g_array_append_val (array, value);                          \
+        }                                                               \
     }
 
-    if (allowed & MM_MODEM_MODE_4G) {
-        value = QMI_NAS_RADIO_INTERFACE_LTE;
-        if (preferred == MM_MODEM_MODE_4G)
-            g_array_prepend_val (array, value);
-        else
-            g_array_append_val (array, value);
-    }
+    PROCESS_ALLOWED_PREFERRED_MODE (MM_MODEM_MODE_5G, QMI_NAS_RADIO_INTERFACE_5GNR);
+    PROCESS_ALLOWED_PREFERRED_MODE (MM_MODEM_MODE_4G, QMI_NAS_RADIO_INTERFACE_LTE);
+    PROCESS_ALLOWED_PREFERRED_MODE (MM_MODEM_MODE_3G, QMI_NAS_RADIO_INTERFACE_UMTS);
+    PROCESS_ALLOWED_PREFERRED_MODE (MM_MODEM_MODE_3G, QMI_NAS_RADIO_INTERFACE_CDMA_1XEVDO);
+    PROCESS_ALLOWED_PREFERRED_MODE (MM_MODEM_MODE_2G, QMI_NAS_RADIO_INTERFACE_GSM);
+    PROCESS_ALLOWED_PREFERRED_MODE (MM_MODEM_MODE_2G, QMI_NAS_RADIO_INTERFACE_CDMA_1X);
 
-    if (allowed & MM_MODEM_MODE_3G) {
-        if (is_cdma) {
-            value = QMI_NAS_RADIO_INTERFACE_CDMA_1XEVDO;
-            if (preferred == MM_MODEM_MODE_3G)
-                g_array_prepend_val (array, value);
-            else
-                g_array_append_val (array, value);
-        }
-        if (is_3gpp) {
-            value = QMI_NAS_RADIO_INTERFACE_UMTS;
-            if (preferred == MM_MODEM_MODE_3G)
-                g_array_prepend_val (array, value);
-            else
-                g_array_append_val (array, value);
-        }
-    }
+#undef PROCESS_ALLOWED_PREFERRED_MODE
 
-    if (allowed & MM_MODEM_MODE_2G) {
-        if (is_cdma) {
-            value = QMI_NAS_RADIO_INTERFACE_CDMA_1X;
-            if (preferred == MM_MODEM_MODE_2G)
-                g_array_prepend_val (array, value);
-            else
-                g_array_append_val (array, value);
-        }
-        if (is_3gpp) {
-            value = QMI_NAS_RADIO_INTERFACE_GSM;
-            if (preferred == MM_MODEM_MODE_2G)
-                g_array_prepend_val (array, value);
-            else
-                g_array_append_val (array, value);
-        }
-    }
+    if (preferred_radio != QMI_NAS_RADIO_INTERFACE_UNKNOWN)
+        g_array_prepend_val (array, preferred_radio);
+
+    /* the acquisition order preference is a TLV that must ALWAYS contain the
+     * same list of QmiNasRadioInterface values, just with a different order. */
+    radio_interface_array_add_missing (array, all);
+    g_assert_cmpuint (array->len, ==, all->len);
 
     return array;
 }
@@ -1406,6 +1518,628 @@ mm_modem_cdma_activation_state_from_qmi_activation_state (QmiDmsActivationState 
 
 /*****************************************************************************/
 
+static void
+process_common_info (const gchar                   *info_name,
+                     QmiNasServiceStatus            service_status,
+                     gboolean                       domain_valid,
+                     QmiNasNetworkServiceDomain     domain,
+                     gboolean                       roaming_status_valid,
+                     QmiNasRoamingStatus            roaming_status,
+                     gboolean                       forbidden_valid,
+                     gboolean                       forbidden,
+                     gboolean                       lac_valid,
+                     guint16                        lac,
+                     gboolean                       tac_valid,
+                     guint16                        tac,
+                     gboolean                       cid_valid,
+                     guint32                        cid,
+                     gboolean                       network_id_valid,
+                     const gchar                   *mcc,
+                     const gchar                   *mnc,
+                     MMModem3gppRegistrationState  *out_cs_registration_state,
+                     MMModem3gppRegistrationState  *out_ps_registration_state,
+                     guint16                       *out_lac,
+                     guint16                       *out_tac,
+                     guint32                       *out_cid,
+                     gchar                        **out_operator_id,
+                     gpointer                       log_object)
+{
+#define SET_OUTPUT(OUT, VAL) do { \
+        if (OUT)                  \
+            *(OUT) = (VAL);       \
+    } while (0)
+
+    /* If power save service status reported the modem is not actively searching
+     * for a network, therefore "idle". */
+    if (service_status == QMI_NAS_SERVICE_STATUS_POWER_SAVE) {
+        SET_OUTPUT (out_cs_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_IDLE);
+        SET_OUTPUT (out_ps_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_IDLE);
+        return;
+    }
+
+    /* If no service status reported, the modem is actively searching for a
+     * network, therefore "searching". */
+    if (service_status == QMI_NAS_SERVICE_STATUS_NONE) {
+        SET_OUTPUT (out_cs_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_SEARCHING);
+        SET_OUTPUT (out_ps_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_SEARCHING);
+        return;
+    }
+
+    /* When forbidden, the service status is usually reported as 'limited' or
+     * 'limited-regional', e.g. allowing only emergency calls. If the
+     * forbidden flag is explicitly reported, we report 'denied', otherwise
+     * 'emergency-services-only' */
+    if (forbidden_valid && forbidden) {
+        SET_OUTPUT (out_cs_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_DENIED);
+        SET_OUTPUT (out_ps_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_DENIED);
+    } else if (service_status == QMI_NAS_SERVICE_STATUS_LIMITED ||
+               service_status == QMI_NAS_SERVICE_STATUS_LIMITED_REGIONAL) {
+        SET_OUTPUT (out_cs_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_EMERGENCY_ONLY);
+        SET_OUTPUT (out_ps_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_EMERGENCY_ONLY);
+    }
+    /* On a successful registration (either home or roaming) we require a valid
+     * domain and "available" service status */
+    else if (domain_valid &&
+             domain != QMI_NAS_NETWORK_SERVICE_DOMAIN_UNKNOWN &&
+             domain != QMI_NAS_NETWORK_SERVICE_DOMAIN_NONE &&
+             service_status == QMI_NAS_SERVICE_STATUS_AVAILABLE) {
+        MMModem3gppRegistrationState tmp_registration_state;
+
+        if (roaming_status_valid && roaming_status == QMI_NAS_ROAMING_STATUS_ON)
+            tmp_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_ROAMING;
+        else
+            tmp_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_HOME;
+
+        if (domain == QMI_NAS_NETWORK_SERVICE_DOMAIN_CS) {
+            SET_OUTPUT (out_cs_registration_state, tmp_registration_state);
+            SET_OUTPUT (out_ps_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_IDLE);
+        } else if (domain == QMI_NAS_NETWORK_SERVICE_DOMAIN_PS) {
+            SET_OUTPUT (out_cs_registration_state, MM_MODEM_3GPP_REGISTRATION_STATE_IDLE);
+            SET_OUTPUT (out_ps_registration_state, tmp_registration_state);
+        } else if (domain == QMI_NAS_NETWORK_SERVICE_DOMAIN_CS_PS) {
+            SET_OUTPUT (out_cs_registration_state, tmp_registration_state);
+            SET_OUTPUT (out_ps_registration_state, tmp_registration_state);
+        }
+
+        /* If we're registered either at home or roaming, try to get LAC/CID */
+        if (lac_valid)
+            SET_OUTPUT (out_lac, lac);
+        if (tac_valid)
+            SET_OUTPUT (out_tac, tac);
+        if (cid_valid)
+            SET_OUTPUT (out_cid, cid);
+    } else {
+        /* Issue a warning in case this ever happens and this logic needs to be updated */
+        mm_obj_warn (log_object, "unexpected %s system info: domain valid %s, domain %s, service status %s",
+                     info_name,
+                     domain_valid ? "yes" : "no",
+                     qmi_nas_network_service_domain_get_string (domain),
+                     qmi_nas_service_status_get_string (service_status));
+        return;
+    }
+
+    /* Network ID report also in the case of registration denial */
+    if (network_id_valid) {
+        *out_operator_id = g_malloc0 (7);
+        memcpy (*out_operator_id, mcc, 3);
+        if ((guint8)mnc[2] == 0xFF)
+            memcpy (&((*out_operator_id)[3]), mnc, 2);
+         else
+            memcpy (&((*out_operator_id)[3]), mnc, 3);
+    }
+}
+
+static void
+process_gsm_info (QmiMessageNasGetSystemInfoOutput *response_output,
+                  QmiIndicationNasSystemInfoOutput *indication_output,
+                  MMModem3gppRegistrationState     *out_cs_registration_state,
+                  MMModem3gppRegistrationState     *out_ps_registration_state,
+                  guint16                          *out_lac,
+                  guint32                          *out_cid,
+                  gchar                           **out_operator_id,
+                  gpointer                          log_object)
+{
+    QmiNasServiceStatus         service_status = QMI_NAS_SERVICE_STATUS_NONE;
+    gboolean                    domain_valid = FALSE;
+    QmiNasNetworkServiceDomain  domain = QMI_NAS_NETWORK_SERVICE_DOMAIN_UNKNOWN;
+    gboolean                    roaming_status_valid = FALSE;
+    QmiNasRoamingStatus         roaming_status = QMI_NAS_ROAMING_STATUS_OFF;
+    gboolean                    forbidden_valid = FALSE;
+    gboolean                    forbidden = FALSE;
+    gboolean                    lac_valid = FALSE;
+    guint16                     lac = 0;
+    gboolean                    cid_valid = FALSE;
+    guint32                     cid = 0;
+    gboolean                    network_id_valid = FALSE;
+    const gchar                *mcc = NULL;
+    const gchar                *mnc = NULL;
+
+    if (response_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_message_nas_get_system_info_output_get_gsm_service_status (
+                response_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_message_nas_get_system_info_output_get_gsm_system_info_v2 (
+            response_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            &lac_valid,            &lac,
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            NULL, NULL, /* egprs support */
+            NULL, NULL, /* dtm_support */
+            NULL);
+    } else if (indication_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_indication_nas_system_info_output_get_gsm_service_status (
+                indication_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_indication_nas_system_info_output_get_gsm_system_info_v2 (
+            indication_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            &lac_valid,            &lac,
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            NULL, NULL, /* egprs support */
+            NULL, NULL, /* dtm_support */
+            NULL);
+    } else
+        g_assert_not_reached ();
+
+    process_common_info ("GSM",
+                         service_status,
+                         domain_valid,         domain,
+                         roaming_status_valid, roaming_status,
+                         forbidden_valid,      forbidden,
+                         lac_valid,            lac,
+                         FALSE,                0,
+                         cid_valid,            cid,
+                         network_id_valid,     mcc, mnc,
+                         out_cs_registration_state,
+                         out_ps_registration_state,
+                         out_lac,
+                         NULL, /* out_tac */
+                         out_cid,
+                         out_operator_id,
+                         log_object);
+}
+
+static void
+process_wcdma_info (QmiMessageNasGetSystemInfoOutput *response_output,
+                    QmiIndicationNasSystemInfoOutput *indication_output,
+                    MMModem3gppRegistrationState     *out_cs_registration_state,
+                    MMModem3gppRegistrationState     *out_ps_registration_state,
+                    guint16                          *out_lac,
+                    guint32                          *out_cid,
+                    gchar                           **out_operator_id,
+                    gpointer                          log_object)
+{
+    QmiNasServiceStatus         service_status = QMI_NAS_SERVICE_STATUS_NONE;
+    gboolean                    domain_valid = FALSE;
+    QmiNasNetworkServiceDomain  domain = QMI_NAS_NETWORK_SERVICE_DOMAIN_UNKNOWN;
+    gboolean                    roaming_status_valid = FALSE;
+    QmiNasRoamingStatus         roaming_status = QMI_NAS_ROAMING_STATUS_OFF;
+    gboolean                    forbidden_valid = FALSE;
+    gboolean                    forbidden = FALSE;
+    gboolean                    lac_valid = FALSE;
+    guint16                     lac = 0;
+    gboolean                    cid_valid = FALSE;
+    guint32                     cid = 0;
+    gboolean                    network_id_valid = FALSE;
+    const gchar                *mcc = NULL;
+    const gchar                *mnc = NULL;
+
+    if (response_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_message_nas_get_system_info_output_get_wcdma_service_status (
+                response_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_message_nas_get_system_info_output_get_wcdma_system_info_v2 (
+            response_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            &lac_valid,            &lac,
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            NULL, NULL, /* hs_call_status */
+            NULL, NULL, /* hs_service */
+            NULL, NULL, /* primary_scrambling_code */
+            NULL);
+    } else if (indication_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_indication_nas_system_info_output_get_wcdma_service_status (
+                indication_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_indication_nas_system_info_output_get_wcdma_system_info_v2 (
+            indication_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            &lac_valid,            &lac,
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            NULL, NULL, /* hs_call_status */
+            NULL, NULL, /* hs_service */
+            NULL, NULL, /* primary_scrambling_code */
+            NULL);
+    } else
+        g_assert_not_reached ();
+
+    process_common_info ("WCDMA",
+                         service_status,
+                         domain_valid,         domain,
+                         roaming_status_valid, roaming_status,
+                         forbidden_valid,      forbidden,
+                         lac_valid,            lac,
+                         FALSE,                0,
+                         cid_valid,            cid,
+                         network_id_valid,     mcc, mnc,
+                         out_cs_registration_state,
+                         out_ps_registration_state,
+                         out_lac,
+                         NULL, /* out_tac */
+                         out_cid,
+                         out_operator_id,
+                         log_object);
+}
+
+static void
+process_lte_info (QmiMessageNasGetSystemInfoOutput *response_output,
+                  QmiIndicationNasSystemInfoOutput *indication_output,
+                  MMModem3gppRegistrationState     *out_eps_registration_state,
+                  guint16                          *out_tac,
+                  guint32                          *out_cid,
+                  gchar                           **out_operator_id,
+                  gboolean                         *out_endc_available,
+                  gpointer                          log_object)
+{
+    QmiNasServiceStatus         service_status = QMI_NAS_SERVICE_STATUS_NONE;
+    gboolean                    domain_valid = FALSE;
+    QmiNasNetworkServiceDomain  domain = QMI_NAS_NETWORK_SERVICE_DOMAIN_UNKNOWN;
+    gboolean                    roaming_status_valid = FALSE;
+    QmiNasRoamingStatus         roaming_status = QMI_NAS_ROAMING_STATUS_OFF;
+    gboolean                    forbidden_valid = FALSE;
+    gboolean                    forbidden = FALSE;
+    gboolean                    tac_valid = FALSE;
+    guint16                     tac = 0;
+    gboolean                    cid_valid = FALSE;
+    guint32                     cid = 0;
+    gboolean                    network_id_valid = FALSE;
+    const gchar                *mcc = NULL;
+    const gchar                *mnc = NULL;
+
+    if (response_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_message_nas_get_system_info_output_get_lte_service_status (
+                response_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_message_nas_get_system_info_output_get_lte_system_info_v2 (
+            response_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            NULL, NULL, /* lac */
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            &tac_valid,            &tac,
+            NULL);
+
+        qmi_message_nas_get_system_info_output_get_eutra_with_nr5g_availability (
+            response_output,
+            out_endc_available,
+            NULL);
+    } else if (indication_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_indication_nas_system_info_output_get_lte_service_status (
+                indication_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_indication_nas_system_info_output_get_lte_system_info_v2 (
+            indication_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            NULL, NULL, /* lac */
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            &tac_valid,            &tac,
+            NULL);
+
+        qmi_indication_nas_system_info_output_get_eutra_with_nr5g_availability (
+            indication_output,
+            out_endc_available,
+            NULL);
+    } else
+        g_assert_not_reached ();
+
+    process_common_info ("LTE",
+                         service_status,
+                         domain_valid,         domain,
+                         roaming_status_valid, roaming_status,
+                         forbidden_valid,      forbidden,
+                         FALSE,                0,
+                         tac_valid,            tac,
+                         cid_valid,            cid,
+                         network_id_valid,     mcc, mnc,
+                         NULL, /* out_cs_registration_state */
+                         out_eps_registration_state,
+                         NULL, /* out_lac */
+                         out_tac,
+                         out_cid,
+                         out_operator_id,
+                         log_object);
+}
+
+static void
+process_nr5g_info (QmiMessageNasGetSystemInfoOutput *response_output,
+                   QmiIndicationNasSystemInfoOutput *indication_output,
+                   MMModem3gppRegistrationState     *out_5gs_registration_state,
+                   guint16                          *out_tac,
+                   guint32                          *out_cid,
+                   gchar                           **out_operator_id,
+                   gpointer                          log_object)
+{
+    QmiNasServiceStatus         service_status = QMI_NAS_SERVICE_STATUS_NONE;
+    gboolean                    domain_valid = FALSE;
+    QmiNasNetworkServiceDomain  domain = QMI_NAS_NETWORK_SERVICE_DOMAIN_UNKNOWN;
+    gboolean                    roaming_status_valid = FALSE;
+    QmiNasRoamingStatus         roaming_status = QMI_NAS_ROAMING_STATUS_OFF;
+    gboolean                    forbidden_valid = FALSE;
+    gboolean                    forbidden = FALSE;
+    gboolean                    tac_valid = FALSE;
+    guint16                     tac = 0;
+    gboolean                    cid_valid = FALSE;
+    guint32                     cid = 0;
+    gboolean                    network_id_valid = FALSE;
+    const gchar                *mcc = NULL;
+    const gchar                *mnc = NULL;
+
+    if (response_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_message_nas_get_system_info_output_get_nr5g_service_status_info (
+                response_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_message_nas_get_system_info_output_get_nr5g_system_info (
+            response_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            NULL, NULL, /* lac */
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            &tac_valid,            &tac,
+            NULL);
+    } else if (indication_output) {
+        /* if service status info not given, ACT is unsupported */
+        if (!qmi_indication_nas_system_info_output_get_nr5g_service_status_info (
+                indication_output,
+                &service_status,
+                NULL, /* true_service_status */
+                NULL, /* preferred_data_path */
+                NULL))
+            return;
+
+        qmi_indication_nas_system_info_output_get_nr5g_system_info (
+            indication_output,
+            &domain_valid,         &domain,
+            NULL, NULL, /* service_capability */
+            &roaming_status_valid, &roaming_status,
+            &forbidden_valid,      &forbidden,
+            NULL, NULL, /* lac */
+            &cid_valid,            &cid,
+            NULL, NULL, NULL, /* registration_reject_info */
+            &network_id_valid,     &mcc, &mnc,
+            &tac_valid,            &tac,
+            NULL);
+    } else
+        g_assert_not_reached ();
+
+    process_common_info ("NR5G",
+                         service_status,
+                         domain_valid,         domain,
+                         roaming_status_valid, roaming_status,
+                         forbidden_valid,      forbidden,
+                         FALSE,                0,
+                         tac_valid,            tac,
+                         cid_valid,            cid,
+                         network_id_valid,     mcc, mnc,
+                         NULL, /* cs_registration_state */
+                         out_5gs_registration_state,
+                         NULL, /* out_lac */
+                         out_tac,
+                         out_cid,
+                         out_operator_id,
+                         log_object);
+}
+
+static MMModem3gppRegistrationState
+unregistered_state_fallback (MMModem3gppRegistrationState umts_state,
+                             MMModem3gppRegistrationState gsm_state)
+{
+    /* For 3G and 2G unregistered states, we will select SEARCHING if one of them
+     * reports it, otherwise DENIED if one of the reports it, and otherwise
+     * the 3G one if not unknown and finally the 2G one otherwise. */
+    if (umts_state == MM_MODEM_3GPP_REGISTRATION_STATE_SEARCHING || gsm_state == MM_MODEM_3GPP_REGISTRATION_STATE_SEARCHING)
+        return MM_MODEM_3GPP_REGISTRATION_STATE_SEARCHING;
+    if (umts_state == MM_MODEM_3GPP_REGISTRATION_STATE_DENIED || gsm_state == MM_MODEM_3GPP_REGISTRATION_STATE_DENIED)
+        return MM_MODEM_3GPP_REGISTRATION_STATE_DENIED;
+    if (umts_state != MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN)
+        return umts_state;
+    return gsm_state;
+}
+
+void
+mm_modem_registration_state_from_qmi_system_info (QmiMessageNasGetSystemInfoOutput *response_output,
+                                                  QmiIndicationNasSystemInfoOutput *indication_output,
+                                                  MMModem3gppRegistrationState     *out_cs_registration_state,
+                                                  MMModem3gppRegistrationState     *out_ps_registration_state,
+                                                  MMModem3gppRegistrationState     *out_eps_registration_state,
+                                                  MMModem3gppRegistrationState     *out_5gs_registration_state,
+                                                  guint16                          *out_lac,
+                                                  guint16                          *out_tac,
+                                                  guint32                          *out_cid,
+                                                  gchar                           **out_operator_id,
+                                                  MMModemAccessTechnology          *out_act,
+                                                  gpointer                          log_object)
+{
+    MMModem3gppRegistrationState  gsm_cs_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    MMModem3gppRegistrationState  gsm_ps_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    MMModem3gppRegistrationState  wcdma_cs_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    MMModem3gppRegistrationState  wcdma_ps_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    MMModem3gppRegistrationState  lte_eps_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    MMModem3gppRegistrationState  nr5g_5gs_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    g_autofree gchar             *gsm_operator_id = NULL;
+    g_autofree gchar             *wcdma_operator_id = NULL;
+    g_autofree gchar             *lte_operator_id = NULL;
+    g_autofree gchar             *nr5g_operator_id = NULL;
+    guint16                       gsm_lac = 0;
+    guint32                       gsm_cid = 0;
+    guint16                       wcdma_lac = 0;
+    guint32                       wcdma_cid = 0;
+    guint16                       lte_tac = 0;
+    guint32                       lte_cid = 0;
+    guint16                       nr5g_tac = 0;
+    guint32                       nr5g_cid = 0;
+    gboolean                      endc_available = FALSE;
+    gboolean                      reg_info_set = FALSE;
+
+    /* Reset outputs */
+    *out_cs_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    *out_ps_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    *out_eps_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    *out_5gs_registration_state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    *out_lac = 0;
+    *out_tac = 0;
+    *out_cid = 0;
+    *out_operator_id = NULL;
+    *out_act = MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN;
+
+    process_nr5g_info (response_output, indication_output,
+                       &nr5g_5gs_registration_state,
+                       &nr5g_tac, &nr5g_cid, &nr5g_operator_id,
+                       log_object);
+
+    process_lte_info (response_output, indication_output,
+                      &lte_eps_registration_state,
+                      &lte_tac, &lte_cid, &lte_operator_id,
+                      &endc_available, log_object);
+
+    process_wcdma_info (response_output, indication_output,
+                        &wcdma_cs_registration_state, &wcdma_ps_registration_state,
+                        &wcdma_lac, &wcdma_cid, &wcdma_operator_id,
+                        log_object);
+
+    process_gsm_info (response_output, indication_output,
+                      &gsm_cs_registration_state, &gsm_ps_registration_state,
+                      &gsm_lac, &gsm_cid, &gsm_operator_id,
+                      log_object);
+
+#define REG_INFO_SET(TAC,LAC,CID,OPERATOR_ID)                \
+    if (!reg_info_set) {                                     \
+        reg_info_set = TRUE;                                 \
+        *out_tac = (TAC);                                    \
+        *out_lac = (LAC);                                    \
+        *out_cid = (CID);                                    \
+        *out_operator_id = g_steal_pointer (&(OPERATOR_ID)); \
+    }
+
+    /* Process 5G data */
+    *out_5gs_registration_state = nr5g_5gs_registration_state;
+    if (mm_modem_3gpp_registration_state_is_registered (nr5g_5gs_registration_state)) {
+        REG_INFO_SET (nr5g_tac, 0, nr5g_cid, nr5g_operator_id)
+        *out_act |= MM_MODEM_ACCESS_TECHNOLOGY_5GNR;
+    }
+
+    /* Process 4G data */
+    *out_eps_registration_state = lte_eps_registration_state;
+    if (mm_modem_3gpp_registration_state_is_registered (lte_eps_registration_state)) {
+        REG_INFO_SET (lte_tac, 0, lte_cid, lte_operator_id)
+        *out_act |= MM_MODEM_ACCESS_TECHNOLOGY_LTE;
+        if (endc_available)
+            *out_act |= MM_MODEM_ACCESS_TECHNOLOGY_5GNR;
+    }
+
+    /* Process 2G/3G data */
+    if (mm_modem_3gpp_registration_state_is_registered (wcdma_ps_registration_state)) {
+        *out_ps_registration_state = wcdma_ps_registration_state;
+        *out_act |= MM_MODEM_ACCESS_TECHNOLOGY_UMTS;
+        REG_INFO_SET (0, wcdma_lac, wcdma_cid, wcdma_operator_id)
+    } else if (mm_modem_3gpp_registration_state_is_registered (gsm_ps_registration_state)) {
+        *out_ps_registration_state = gsm_ps_registration_state;
+        *out_act |= MM_MODEM_ACCESS_TECHNOLOGY_GPRS;
+        REG_INFO_SET (0, gsm_lac, gsm_cid, gsm_operator_id)
+    } else {
+        *out_ps_registration_state = unregistered_state_fallback (wcdma_ps_registration_state, gsm_ps_registration_state);
+    }
+    if (mm_modem_3gpp_registration_state_is_registered (wcdma_cs_registration_state)) {
+        *out_cs_registration_state = wcdma_cs_registration_state;
+        *out_act |= MM_MODEM_ACCESS_TECHNOLOGY_UMTS;
+        REG_INFO_SET (0, wcdma_lac, wcdma_cid, wcdma_operator_id)
+    } else if (mm_modem_3gpp_registration_state_is_registered (gsm_cs_registration_state)) {
+        *out_cs_registration_state = gsm_cs_registration_state;
+        *out_act |= MM_MODEM_ACCESS_TECHNOLOGY_GSM;
+        REG_INFO_SET (0, gsm_lac, gsm_cid, gsm_operator_id)
+    } else {
+        *out_cs_registration_state = unregistered_state_fallback (wcdma_cs_registration_state, gsm_cs_registration_state);
+    }
+
+#undef REG_INFO_SET
+}
+
+/*****************************************************************************/
+
 QmiWmsStorageType
 mm_sms_storage_to_qmi_storage_type (MMSmsStorage storage)
 {
@@ -1459,17 +2193,244 @@ mm_sms_state_from_qmi_message_tag (QmiWmsMessageTagType tag)
 /*****************************************************************************/
 
 QmiWdsAuthentication
-mm_bearer_allowed_auth_to_qmi_authentication (MMBearerAllowedAuth auth)
+mm_bearer_allowed_auth_to_qmi_authentication (MMBearerAllowedAuth   auth,
+                                              gpointer              log_object,
+                                              GError              **error)
 {
     QmiWdsAuthentication out;
 
+    if (auth == MM_BEARER_ALLOWED_AUTH_UNKNOWN) {
+        mm_obj_dbg (log_object, "using default (CHAP) authentication method");
+        return QMI_WDS_AUTHENTICATION_CHAP;
+    }
+
+    if (auth == MM_BEARER_ALLOWED_AUTH_NONE)
+        return QMI_WDS_AUTHENTICATION_NONE;
+
+    /* otherwise find a bitmask that matches the input bitmask */
     out = QMI_WDS_AUTHENTICATION_NONE;
     if (auth & MM_BEARER_ALLOWED_AUTH_PAP)
         out |= QMI_WDS_AUTHENTICATION_PAP;
     if (auth & MM_BEARER_ALLOWED_AUTH_CHAP)
         out |= QMI_WDS_AUTHENTICATION_CHAP;
 
+    /* and if the bitmask cannot be built, error out */
+    if (out == QMI_WDS_AUTHENTICATION_NONE) {
+        g_autofree gchar *str = NULL;
+
+        str = mm_bearer_allowed_auth_build_string_from_mask (auth);
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
+                     "Unsupported authentication methods (%s)",
+                     str);
+    }
     return out;
+}
+
+MMBearerAllowedAuth
+mm_bearer_allowed_auth_from_qmi_authentication (QmiWdsAuthentication auth)
+{
+    MMBearerAllowedAuth out = 0;
+
+    /* Exact match for NONE */
+    if (auth == QMI_WDS_AUTHENTICATION_NONE)
+        return MM_BEARER_ALLOWED_AUTH_NONE;
+
+    if (auth & QMI_WDS_AUTHENTICATION_PAP)
+        out |= MM_BEARER_ALLOWED_AUTH_PAP;
+    if (auth & QMI_WDS_AUTHENTICATION_CHAP)
+        out |= MM_BEARER_ALLOWED_AUTH_CHAP;
+
+    return out;
+}
+
+MMBearerIpFamily
+mm_bearer_ip_family_from_qmi_ip_support_type (QmiWdsIpSupportType ip_support_type)
+{
+    switch (ip_support_type) {
+    case QMI_WDS_IP_SUPPORT_TYPE_IPV4:
+        return MM_BEARER_IP_FAMILY_IPV4;
+    case QMI_WDS_IP_SUPPORT_TYPE_IPV6:
+        return MM_BEARER_IP_FAMILY_IPV6;
+    case QMI_WDS_IP_SUPPORT_TYPE_IPV4V6:
+        return MM_BEARER_IP_FAMILY_IPV4V6;
+    default:
+        return MM_BEARER_IP_FAMILY_NONE;
+    }
+}
+
+MMBearerIpFamily
+mm_bearer_ip_family_from_qmi_pdp_type (QmiWdsPdpType pdp_type)
+{
+    switch (pdp_type) {
+    case QMI_WDS_PDP_TYPE_IPV4:
+        return MM_BEARER_IP_FAMILY_IPV4;
+    case QMI_WDS_PDP_TYPE_IPV6:
+        return MM_BEARER_IP_FAMILY_IPV6;
+    case QMI_WDS_PDP_TYPE_IPV4_OR_IPV6:
+        return MM_BEARER_IP_FAMILY_IPV4V6;
+    case QMI_WDS_PDP_TYPE_PPP:
+    default:
+        return MM_BEARER_IP_FAMILY_NONE;
+    }
+}
+
+gboolean
+mm_bearer_ip_family_to_qmi_pdp_type (MMBearerIpFamily  ip_family,
+                                     QmiWdsPdpType    *out_pdp_type)
+{
+    switch (ip_family) {
+    case MM_BEARER_IP_FAMILY_IPV4:
+        *out_pdp_type = QMI_WDS_PDP_TYPE_IPV4;
+        return TRUE;
+    case MM_BEARER_IP_FAMILY_IPV6:
+        *out_pdp_type =  QMI_WDS_PDP_TYPE_IPV6;
+        return TRUE;
+    case MM_BEARER_IP_FAMILY_IPV4V6:
+        *out_pdp_type =  QMI_WDS_PDP_TYPE_IPV4_OR_IPV6;
+        return TRUE;
+    case MM_BEARER_IP_FAMILY_NON_IP:
+    case MM_BEARER_IP_FAMILY_NONE:
+    case MM_BEARER_IP_FAMILY_ANY:
+    default:
+        /* there is no valid conversion, so just return FALSE to indicate it */
+        return FALSE;
+    }
+}
+
+QmiWdsApnTypeMask
+mm_bearer_apn_type_to_qmi_apn_type (MMBearerApnType apn_type,
+                                    gpointer        log_object)
+{
+    guint64 value = 0;
+
+    if (apn_type == MM_BEARER_APN_TYPE_NONE) {
+        mm_obj_dbg (log_object, "using default (internet) APN type");
+        return QMI_WDS_APN_TYPE_MASK_DEFAULT;
+    }
+
+    if (apn_type & MM_BEARER_APN_TYPE_DEFAULT)
+        value |= QMI_WDS_APN_TYPE_MASK_DEFAULT;
+    if (apn_type & MM_BEARER_APN_TYPE_IMS)
+        value |= QMI_WDS_APN_TYPE_MASK_IMS;
+    if (apn_type & MM_BEARER_APN_TYPE_MMS)
+        value |= QMI_WDS_APN_TYPE_MASK_MMS;
+    if (apn_type & MM_BEARER_APN_TYPE_MANAGEMENT)
+        value |= QMI_WDS_APN_TYPE_MASK_FOTA;
+    if (apn_type & MM_BEARER_APN_TYPE_INITIAL)
+        value |= QMI_WDS_APN_TYPE_MASK_IA;
+    if (apn_type & MM_BEARER_APN_TYPE_EMERGENCY)
+        value |= QMI_WDS_APN_TYPE_MASK_EMERGENCY;
+    return value;
+}
+
+MMBearerApnType
+mm_bearer_apn_type_from_qmi_apn_type (QmiWdsApnTypeMask apn_type)
+{
+    MMBearerApnType value = MM_BEARER_APN_TYPE_NONE;
+
+    if (apn_type & QMI_WDS_APN_TYPE_MASK_DEFAULT)
+        value |= MM_BEARER_APN_TYPE_DEFAULT;
+    if (apn_type & QMI_WDS_APN_TYPE_MASK_IMS)
+        value |= MM_BEARER_APN_TYPE_IMS;
+    if (apn_type & QMI_WDS_APN_TYPE_MASK_MMS)
+        value |= MM_BEARER_APN_TYPE_MMS;
+    if (apn_type & QMI_WDS_APN_TYPE_MASK_FOTA)
+        value |= MM_BEARER_APN_TYPE_MANAGEMENT;
+    if (apn_type & QMI_WDS_APN_TYPE_MASK_IA)
+        value |= MM_BEARER_APN_TYPE_INITIAL;
+    if (apn_type & QMI_WDS_APN_TYPE_MASK_EMERGENCY)
+        value |= MM_BEARER_APN_TYPE_EMERGENCY;
+    return value;
+}
+
+/*****************************************************************************/
+
+static const MMMobileEquipmentError qmi_vcer_3gpp_errors[] = {
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_OPERATOR_DETERMINED_BARRING] = MM_MOBILE_EQUIPMENT_ERROR_OPERATOR_DETERMINED_BARRING,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_INSUFFICIENT_RESOURCES] = MM_MOBILE_EQUIPMENT_ERROR_INSUFFICIENT_RESOURCES,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_UNKNOWN_APN] = MM_MOBILE_EQUIPMENT_ERROR_MISSING_OR_UNKNOWN_APN,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_UNKNOWN_PDP] = MM_MOBILE_EQUIPMENT_ERROR_UNKNOWN_PDP_ADDRESS_OR_TYPE,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_AUTHENTICATION_FAILED] = MM_MOBILE_EQUIPMENT_ERROR_USER_AUTHENTICATION_FAILED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_GGSN_REJECT] = MM_MOBILE_EQUIPMENT_ERROR_ACTIVATION_REJECTED_BY_GGSN_OR_GW,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_ACTIVATION_REJECT] = MM_MOBILE_EQUIPMENT_ERROR_ACTIVATION_REJECTED_UNSPECIFIED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_OPTION_NOT_SUPPORTED] = MM_MOBILE_EQUIPMENT_ERROR_SERVICE_OPTION_NOT_SUPPORTED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_OPTION_UNSUBSCRIBED] = MM_MOBILE_EQUIPMENT_ERROR_SERVICE_OPTION_NOT_SUBSCRIBED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_OPTION_TEMPORARILY_OUT_OF_ORDER] = MM_MOBILE_EQUIPMENT_ERROR_SERVICE_OPTION_OUT_OF_ORDER,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_NSAPI_ALREADY_USED] = MM_MOBILE_EQUIPMENT_ERROR_NSAPI_OR_PTI_ALREADY_IN_USE,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_REGULAR_DEACTIVATION] =  MM_MOBILE_EQUIPMENT_ERROR_REGULAR_DEACTIVATION,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_QOS_NOT_ACCEPTED] = MM_MOBILE_EQUIPMENT_ERROR_QOS_NOT_ACCEPTED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_NETWORK_FAILURE] = MM_MOBILE_EQUIPMENT_ERROR_NETWORK_FAILURE_ATTACH,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_REATTACH_REQUIRED] = MM_MOBILE_EQUIPMENT_ERROR_NETWORK_FAILURE_ATTACH,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_FEATURE_NOT_SUPPORTED] = MM_MOBILE_EQUIPMENT_ERROR_FEATURE_NOT_SUPPORTED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_TFT_SEMANTIC_ERROR] = MM_MOBILE_EQUIPMENT_ERROR_SEMANTIC_ERROR_IN_TFT_OPERATION,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_TFT_SYNTAX_ERROR] = MM_MOBILE_EQUIPMENT_ERROR_SYNTACTICAL_ERROR_IN_TFT_OPERATION,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_UNKNOWN_PDP_CONTEXT] = MM_MOBILE_EQUIPMENT_ERROR_UNKNOWN_PDP_CONTEXT,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_FILTER_SEMANTIC_ERROR] = MM_MOBILE_EQUIPMENT_ERROR_SEMANTIC_ERRORS_IN_PACKET_FILTER,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_FILTER_SYNTAX_ERROR] = MM_MOBILE_EQUIPMENT_ERROR_SYNTACTICAL_ERROR_IN_PACKET_FILTER,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_PDP_WITHOUT_ACTIVE_TFT] = MM_MOBILE_EQUIPMENT_ERROR_PDP_CONTEXT_WITHOUT_TFT_ALREADY_ACTIVATED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_IPV4_ONLY_ALLOWED] = MM_MOBILE_EQUIPMENT_ERROR_IPV4_ONLY_ALLOWED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_IPV6_ONLY_ALLOWED] = MM_MOBILE_EQUIPMENT_ERROR_IPV6_ONLY_ALLOWED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_SINGLE_ADDRESS_BEARER_ONLY] = MM_MOBILE_EQUIPMENT_ERROR_SINGLE_ADDRESS_BEARERS_ONLY_ALLOWED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_ESM_INFO_NOT_RECEIVED] = MM_MOBILE_EQUIPMENT_ERROR_ESM_INFORMATION_NOT_RECEIVED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_PDN_CONNECTION_DOES_NOT_EXIST] = MM_MOBILE_EQUIPMENT_ERROR_PDN_CONNECTION_NONEXISTENT,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_MULTIPLE_CONNECTION_TO_SAME_PDN_NOT_ALLOWED] = MM_MOBILE_EQUIPMENT_ERROR_MULTIPLE_PDN_CONNECTION_SAME_APN_NOT_ALLOWED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_INVALID_TRANSACTION_ID] = MM_MOBILE_EQUIPMENT_ERROR_INVALID_TRANSACTION_ID_VALUE,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_MESSAGE_INCORRECT_SEMANTIC] = MM_MOBILE_EQUIPMENT_ERROR_SEMANTICALLY_INCORRECT_MESSAGE,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_INVALID_MANDATORY_INFO] = MM_MOBILE_EQUIPMENT_ERROR_INVALID_MANDATORY_INFORMATION,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_MESSAGE_TYPE_UNSUPPORTED] = MM_MOBILE_EQUIPMENT_ERROR_MESSAGE_TYPE_NOT_IMPLEMENTED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_MESSAGE_TYPE_NONCOMPATIBLE_STATE] = MM_MOBILE_EQUIPMENT_ERROR_MESSAGE_TYPE_NOT_COMPATIBLE_WITH_PROTOCOL_STATE,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_UNKNOWN_INFO_ELEMENT] = MM_MOBILE_EQUIPMENT_ERROR_IE_NOT_IMPLEMENTED,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_CONDITIONAL_IE_ERROR] = MM_MOBILE_EQUIPMENT_ERROR_CONDITIONAL_IE_ERROR,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_MESSAGE_AND_PROTOCOL_STATE_UNCOMPATIBLE] = MM_MOBILE_EQUIPMENT_ERROR_MESSAGE_NOT_COMPATIBLE_WITH_PROTOCOL_STATE,
+    [QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_PROTOCOL_ERROR] = MM_MOBILE_EQUIPMENT_ERROR_UNSPECIFIED_PROTOCOL_ERROR,
+    /* unmapped errors */
+    /* QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_LLC_SNDCP_FAILURE */
+    /* QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_APN_TYPE_CONFLICT */
+    /* QMI_WDS_VERBOSE_CALL_END_REASON_3GPP_INVALID_PROXY_CALL_SESSION_CONTROL_FUNCTION_ADDRESS */
+};
+
+GError *
+qmi_mobile_equipment_error_from_verbose_call_end_reason_3gpp (QmiWdsVerboseCallEndReason3gpp vcer_3gpp,
+                                                              gpointer                       log_object)
+{
+    MMMobileEquipmentError  error_code;
+    const gchar            *msg;
+
+    /* convert to mobile equipment error */
+    error_code = qmi_vcer_3gpp_errors[vcer_3gpp];
+    if (error_code)
+        return mm_mobile_equipment_error_for_code (error_code, log_object);
+
+    /* provide a nicer error message on unmapped errors */
+    msg = qmi_wds_verbose_call_end_reason_3gpp_get_string (vcer_3gpp);
+    if (msg)
+        return g_error_new (MM_MOBILE_EQUIPMENT_ERROR,
+                            MM_MOBILE_EQUIPMENT_ERROR_UNKNOWN,
+                            "Unsupported error (%u): %s",
+                            vcer_3gpp, msg);
+
+    /* fallback */
+    return g_error_new_literal (MM_MOBILE_EQUIPMENT_ERROR,
+                                MM_MOBILE_EQUIPMENT_ERROR_UNKNOWN,
+                                "Unknown error");
+}
+
+/*****************************************************************************/
+/* QMI/WDA to MM translations */
+
+QmiDataEndpointType
+mm_port_net_driver_to_qmi_endpoint_type (const gchar *net_driver)
+{
+    if (!g_strcmp0 (net_driver, "qmi_wwan"))
+        return QMI_DATA_ENDPOINT_TYPE_HSUSB;
+    if (!g_strcmp0 (net_driver, "mhi_net"))
+        return QMI_DATA_ENDPOINT_TYPE_PCIE;
+    if (!g_strcmp0 (net_driver, "ipa"))
+        return QMI_DATA_ENDPOINT_TYPE_EMBEDDED;
+    if (!g_strcmp0 (net_driver, "bam-dmux"))
+        return QMI_DATA_ENDPOINT_TYPE_BAM_DMUX;
+
+    return QMI_DATA_ENDPOINT_TYPE_UNKNOWN;
 }
 
 /*****************************************************************************/
@@ -1484,8 +2445,8 @@ mm_bearer_allowed_auth_to_qmi_authentication (MMBearerAllowedAuth auth)
  * as there would be no capability switching support.
  */
 MMModemCapability
-mm_modem_capability_from_qmi_capabilities_context (MMQmiCapabilitiesContext *ctx,
-                                                   gpointer                  log_object)
+mm_current_capability_from_qmi_current_capabilities_context (MMQmiCurrentCapabilitiesContext *ctx,
+                                                             gpointer                         log_object)
 {
     MMModemCapability tmp = MM_MODEM_CAPABILITY_NONE;
     g_autofree gchar *nas_ssp_mode_preference_str = NULL;
@@ -1494,10 +2455,17 @@ mm_modem_capability_from_qmi_capabilities_context (MMQmiCapabilitiesContext *ctx
     g_autofree gchar *tmp_str = NULL;
 
     /* If not a multimode device, we're done */
-#define MULTIMODE (MM_MODEM_CAPABILITY_GSM_UMTS | MM_MODEM_CAPABILITY_CDMA_EVDO)
-    if ((ctx->dms_capabilities & MULTIMODE) != MULTIMODE)
-        tmp = ctx->dms_capabilities;
-    else {
+    if (!ctx->multimode) {
+        if (ctx->dms_capabilities != MM_MODEM_CAPABILITY_NONE)
+            tmp = ctx->dms_capabilities;
+        /* SSP logic to gather capabilities uses the Mode Preference TLV if available */
+        else if (ctx->nas_ssp_mode_preference_mask)
+            tmp = mm_modem_capability_from_qmi_rat_mode_preference (ctx->nas_ssp_mode_preference_mask);
+        /* If no value retrieved from SSP, check TP. We only process TP
+         * values if not 'auto' (0). */
+        else if (ctx->nas_tp_mask != QMI_NAS_RADIO_TECHNOLOGY_PREFERENCE_AUTO)
+            tmp = mm_modem_capability_from_qmi_radio_technology_preference (ctx->nas_tp_mask);
+    } else {
         /* We have a multimode CDMA/EVDO+GSM/UMTS device, check SSP and TP */
 
         /* SSP logic to gather capabilities uses the Mode Preference TLV if available */
@@ -1508,15 +2476,15 @@ mm_modem_capability_from_qmi_capabilities_context (MMQmiCapabilitiesContext *ctx
         else if (ctx->nas_tp_mask != QMI_NAS_RADIO_TECHNOLOGY_PREFERENCE_AUTO)
             tmp = mm_modem_capability_from_qmi_radio_technology_preference (ctx->nas_tp_mask);
 
-        /* Final capabilities are the intersection between the Technology
-         * Preference or SSP and the device's capabilities.
+        /* Final capabilities are the union of the active multimode capability
+         * (GSM/UMTS or CDMA/EVDO or both or none) in TP or SSP and other supported device's capabilities.
          * If the Technology Preference was "auto" or unknown we just fall back
          * to the Get Capabilities response.
          */
         if (tmp == MM_MODEM_CAPABILITY_NONE)
             tmp = ctx->dms_capabilities;
         else
-            tmp &= ctx->dms_capabilities;
+            tmp = (tmp & MM_MODEM_CAPABILITY_MULTIMODE) | (MM_MODEM_CAPABILITY_MULTIMODE ^ ctx->dms_capabilities);
     }
 
     /* Log about the logic applied */
@@ -1535,6 +2503,147 @@ mm_modem_capability_from_qmi_capabilities_context (MMQmiCapabilitiesContext *ctx
                 dms_capabilities_str);
 
     return tmp;
+}
+
+/*****************************************************************************/
+/* Utility to build list of supported capabilities */
+
+GArray *
+mm_supported_capabilities_from_qmi_supported_capabilities_context (MMQmiSupportedCapabilitiesContext *ctx,
+                                                                   gpointer                           log_object)
+{
+    GArray *supported_combinations;
+
+    supported_combinations = g_array_sized_new (FALSE, FALSE, sizeof (MMModemCapability), 4);
+
+    /* Add all possible supported capability combinations.
+     * In order to avoid unnecessary modem reboots, we will only implement capabilities
+     * switching only when switching GSM/UMTS+CDMA/EVDO multimode devices, and only if
+     * we have support for the commands doing it.
+     */
+    if ((ctx->nas_tp_supported || ctx->nas_ssp_supported) && ctx->multimode) {
+        MMModemCapability single;
+
+        /* Multimode GSM/UMTS+CDMA/EVDO+(LTE/5GNR) device switched to GSM/UMTS+(LTE/5GNR) device */
+        single = MM_MODEM_CAPABILITY_GSM_UMTS | (MM_MODEM_CAPABILITY_MULTIMODE ^ ctx->dms_capabilities);
+        g_array_append_val (supported_combinations, single);
+        /* Multimode GSM/UMTS+CDMA/EVDO+(LTE/5GNR) device switched to CDMA/EVDO+(LTE/5GNR) device */
+        single = MM_MODEM_CAPABILITY_CDMA_EVDO | (MM_MODEM_CAPABILITY_MULTIMODE ^ ctx->dms_capabilities);
+        g_array_append_val (supported_combinations, single);
+        /*
+         * Multimode GSM/UMTS+CDMA/EVDO+(LTE/5GNR) device switched to (LTE/5GNR) device
+         *
+         * This case is required because we use the same methods and operations to
+         * switch capabilities and modes.
+         */
+        if ((single = (MM_MODEM_CAPABILITY_MULTIMODE ^ ctx->dms_capabilities)))
+            g_array_append_val (supported_combinations, single);
+    }
+
+    /* Add the full mask itself */
+    g_array_append_val (supported_combinations, ctx->dms_capabilities);
+
+    return supported_combinations;
+}
+
+/*****************************************************************************/
+/* Utility to build list of supported modes */
+
+GArray *
+mm_supported_modes_from_qmi_supported_modes_context (MMQmiSupportedModesContext *ctx,
+                                                     gpointer                    log_object)
+{
+    g_autoptr(GArray)       combinations = NULL;
+    g_autoptr(GArray)       all = NULL;
+    MMModemModeCombination  mode;
+
+    /* Start with a mode including ALL */
+    mode.allowed = ctx->all;
+    mode.preferred = MM_MODEM_MODE_NONE;
+    all = g_array_sized_new (FALSE, FALSE, sizeof (MMModemModeCombination), 1);
+    g_array_append_val (all, mode);
+
+    /* If SSP and TP are not supported, ignore supported mode management */
+    if (!ctx->nas_ssp_supported && !ctx->nas_tp_supported)
+        return g_steal_pointer (&all);
+
+    combinations = g_array_new (FALSE, FALSE, sizeof (MMModemModeCombination));
+
+#define ADD_MODE_PREFERENCE(MODE1, MODE2, MODE3, MODE4) do {            \
+        mode.allowed = MODE1;                                           \
+        if (MODE2 != MM_MODEM_MODE_NONE) {                              \
+            mode.allowed |= MODE2;                                      \
+            if (MODE3 != MM_MODEM_MODE_NONE) {                          \
+                mode.allowed |= MODE3;                                  \
+                if (MODE4 != MM_MODEM_MODE_NONE)                        \
+                    mode.allowed |= MODE4;                              \
+            }                                                           \
+            if (ctx->nas_ssp_supported) {                               \
+                if (MODE3 != MM_MODEM_MODE_NONE) {                      \
+                    if (MODE4 != MM_MODEM_MODE_NONE) {                  \
+                        mode.preferred = MODE4;                         \
+                        g_array_append_val (combinations, mode);        \
+                    }                                                   \
+                    mode.preferred = MODE3;                             \
+                    g_array_append_val (combinations, mode);            \
+                }                                                       \
+                mode.preferred = MODE2;                                 \
+                g_array_append_val (combinations, mode);                \
+                mode.preferred = MODE1;                                 \
+                g_array_append_val (combinations, mode);                \
+            } else {                                                    \
+                mode.preferred = MM_MODEM_MODE_NONE;                    \
+                g_array_append_val (combinations, mode);                \
+            }                                                           \
+        } else {                                                        \
+            mode.allowed = MODE1;                                       \
+            mode.preferred = MM_MODEM_MODE_NONE;                        \
+            g_array_append_val (combinations, mode);                    \
+        }                                                               \
+    } while (0)
+
+    /* 2G-only, 3G-only */
+    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+    ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+
+    /*
+     * This case is required because we use the same methods and operations to
+     * switch capabilities and modes. For the LTE capability there is a direct
+     * related 4G mode, and so we cannot select a '4G only' mode in this device
+     * because we wouldn't be able to know the full list of current capabilities
+     * if the device was rebooted, as we would only see LTE capability. So,
+     * handle this special case so that the LTE/4G-only mode can exclusively be
+     * selected as capability switching in this kind of devices.
+     */
+    if (!ctx->multimode || !(ctx->current_capabilities & MM_MODEM_CAPABILITY_MULTIMODE)) {
+        /* 4G-only */
+        ADD_MODE_PREFERENCE (MM_MODEM_MODE_4G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+    }
+
+    /* 2G, 3G, 4G combinations */
+    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_4G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+    ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_4G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+    ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G, MM_MODEM_MODE_4G,   MM_MODEM_MODE_NONE);
+
+    /* 5G related mode combinations are only supported when NAS SSP is supported,
+     * as there is no 5G support in NAS TP. */
+    if (ctx->nas_ssp_supported) {
+        /* Same reasoning as for the special 4G-only case above */
+        if (!ctx->multimode || !(ctx->current_capabilities & MM_MODEM_CAPABILITY_MULTIMODE)) {
+            ADD_MODE_PREFERENCE (MM_MODEM_MODE_5G, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+            ADD_MODE_PREFERENCE (MM_MODEM_MODE_4G, MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+        }
+        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+        ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE, MM_MODEM_MODE_NONE);
+        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G,   MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE);
+        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_4G,   MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE);
+        ADD_MODE_PREFERENCE (MM_MODEM_MODE_3G, MM_MODEM_MODE_4G,   MM_MODEM_MODE_5G,   MM_MODEM_MODE_NONE);
+        ADD_MODE_PREFERENCE (MM_MODEM_MODE_2G, MM_MODEM_MODE_3G,   MM_MODEM_MODE_4G,   MM_MODEM_MODE_5G);
+    }
+
+    /* Filter out unsupported modes */
+    return mm_filter_supported_modes (all, combinations, log_object);
 }
 
 /*****************************************************************************/
@@ -1745,25 +2854,19 @@ mm_firmware_unique_id_to_qmi_unique_id (const gchar  *unique_id,
 
     /* The length will be exactly EXPECTED_QMI_UNIQUE_ID_LENGTH*2 if given in HEX */
     if (len == (2 * EXPECTED_QMI_UNIQUE_ID_LENGTH)) {
-        guint8 *tmp;
-        gsize   tmp_len;
-        guint   i;
-
-        for (i = 0; i < len; i++) {
-            if (!g_ascii_isxdigit (unique_id[i])) {
-                g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
-                             "Unexpected character found in unique id (not HEX): %c", unique_id[i]);
-                return NULL;
-            }
-        }
+        g_autofree guint8 *tmp = NULL;
+        gsize              tmp_len;
 
         tmp_len = 0;
-        tmp = (guint8 *) mm_utils_hexstr2bin (unique_id, &tmp_len);
+        tmp = mm_utils_hexstr2bin (unique_id, -1, &tmp_len, error);
+        if (!tmp) {
+            g_prefix_error (error, "Unexpected character found in unique id: ");
+            return NULL;
+        }
         g_assert (tmp_len == EXPECTED_QMI_UNIQUE_ID_LENGTH);
 
         qmi_unique_id = g_array_sized_new (FALSE, FALSE, sizeof (guint8), tmp_len);
         g_array_insert_vals (qmi_unique_id, 0, tmp, tmp_len);
-        g_free (tmp);
         return qmi_unique_id;
     }
 
@@ -1790,4 +2893,401 @@ mm_firmware_unique_id_to_qmi_unique_id (const gchar  *unique_id,
     g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
                  "Unexpected unique id length: %u", len);
     return NULL;
+}
+
+/*****************************************************************************/
+
+gboolean
+mm_qmi_uim_get_card_status_output_parse (gpointer                           log_object,
+                                         QmiMessageUimGetCardStatusOutput  *output,
+                                         MMModemLock                       *o_lock,
+                                         QmiUimPinState                    *o_pin1_state,
+                                         guint                             *o_pin1_retries,
+                                         guint                             *o_puk1_retries,
+                                         QmiUimPinState                    *o_pin2_state,
+                                         guint                             *o_pin2_retries,
+                                         guint                             *o_puk2_retries,
+                                         guint                             *o_pers_retries,
+                                         GError                           **error)
+{
+    QmiMessageUimGetCardStatusOutputCardStatusCardsElement                      *card;
+    QmiMessageUimGetCardStatusOutputCardStatusCardsElementApplicationsElementV2 *app;
+    GArray      *cards;
+    guint16      index_gw_primary = 0xFFFF;
+    guint8       gw_primary_slot_i = 0;
+    guint8       gw_primary_application_i = 0;
+    MMModemLock  lock = MM_MODEM_LOCK_UNKNOWN;
+
+    /* This command supports MULTIPLE cards with MULTIPLE applications each. For our
+     * purposes, we're going to consider as the SIM to use the one identified as
+     * 'primary GW' exclusively. We don't really support Dual Sim Dual Standby yet. */
+
+    qmi_message_uim_get_card_status_output_get_card_status (
+        output,
+        &index_gw_primary,
+        NULL, /* index_1x_primary */
+        NULL, /* index_gw_secondary */
+        NULL, /* index_1x_secondary */
+        &cards,
+        NULL);
+
+    if (cards->len == 0) {
+        g_set_error (error, QMI_CORE_ERROR, QMI_CORE_ERROR_FAILED,
+                     "No cards reported");
+        return FALSE;
+    }
+
+    /* Look for the primary GW slot and application.
+     * If we don't have valid GW primary slot index and application index, assume
+     * we're missing the SIM altogether */
+    gw_primary_slot_i        = ((index_gw_primary & 0xFF00) >> 8);
+    gw_primary_application_i = ((index_gw_primary & 0x00FF));
+
+    if (gw_primary_slot_i == 0xFF) {
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_NOT_INSERTED,
+                     "GW primary session index unknown");
+        return FALSE;
+    }
+    mm_obj_dbg (log_object, "GW primary session index: %u",     gw_primary_slot_i);
+
+    if (gw_primary_application_i == 0xFF) {
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_NOT_INSERTED,
+                     "GW primary application index unknown");
+        return FALSE;
+    }
+    mm_obj_dbg (log_object, "GW primary application index: %u", gw_primary_application_i);
+
+    /* Validate slot index */
+    if (gw_primary_slot_i >= cards->len) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                     "Invalid GW primary session index: %u",
+                     gw_primary_slot_i);
+        return FALSE;
+    }
+
+    /* Get card at slot */
+    card = &g_array_index (cards, QmiMessageUimGetCardStatusOutputCardStatusCardsElement, gw_primary_slot_i);
+
+    if (card->card_state == QMI_UIM_CARD_STATE_ABSENT) {
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_NOT_INSERTED,
+                     "No card found");
+        return FALSE;
+    }
+
+    if (card->card_state == QMI_UIM_CARD_STATE_ERROR) {
+        const gchar *card_error;
+
+        card_error = qmi_uim_card_error_get_string (card->error_code);
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG,
+                     "Card error: %s", card_error ? card_error : "unknown error");
+        return FALSE;
+    }
+
+    if (card->card_state != QMI_UIM_CARD_STATE_PRESENT) {
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG,
+                     "Card error: unexpected card state: 0x%x", card->card_state);
+        return FALSE;
+    }
+
+    /* Card is present */
+
+    if (card->applications->len == 0) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                     "No applications reported in card");
+        return FALSE;
+    }
+
+    /* Validate application index */
+    if (gw_primary_application_i >= card->applications->len) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                     "Invalid GW primary application index: %u",
+                     gw_primary_application_i);
+        return FALSE;
+    }
+
+    app = &g_array_index (card->applications, QmiMessageUimGetCardStatusOutputCardStatusCardsElementApplicationsElementV2, gw_primary_application_i);
+    if ((app->type != QMI_UIM_CARD_APPLICATION_TYPE_SIM) && (app->type != QMI_UIM_CARD_APPLICATION_TYPE_USIM)) {
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                     "Unsupported application type found in GW primary application index: %s",
+                     qmi_uim_card_application_type_get_string (app->type));
+        return FALSE;
+    }
+
+    /* Illegal application state is fatal, consider it as a failed SIM right
+     * away and don't even attempt to retry */
+    if (app->state == QMI_UIM_CARD_APPLICATION_STATE_ILLEGAL) {
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG,
+                     "Illegal SIM/USIM application state");
+        return FALSE;
+    }
+
+    /* If card not ready yet, return RETRY error.
+     * If the application state reports needing PIN/PUk, consider that ready as
+     * well, and let the logic fall down to check PIN1/PIN2. */
+    if (app->state != QMI_UIM_CARD_APPLICATION_STATE_READY &&
+        app->state != QMI_UIM_CARD_APPLICATION_STATE_PIN1_OR_UPIN_PIN_REQUIRED &&
+        app->state != QMI_UIM_CARD_APPLICATION_STATE_PUK1_OR_UPIN_PUK_REQUIRED &&
+        app->state != QMI_UIM_CARD_APPLICATION_STATE_CHECK_PERSONALIZATION_STATE &&
+        app->state != QMI_UIM_CARD_APPLICATION_STATE_PIN1_BLOCKED) {
+        mm_obj_dbg (log_object, "neither SIM nor USIM are ready");
+        g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_RETRY,
+                     "SIM not ready yet (retry)");
+        return FALSE;
+    }
+
+    /* Report state and retries if requested to do so */
+    if (o_pin1_state)
+        *o_pin1_state = app->pin1_state;
+    if (o_pin1_retries)
+        *o_pin1_retries = app->pin1_retries;
+    if (o_puk1_retries)
+        *o_puk1_retries = app->puk1_retries;
+    if (o_pin2_state)
+        *o_pin2_state = app->pin2_state;
+    if (o_pin2_retries)
+        *o_pin2_retries = app->pin2_retries;
+    if (o_puk2_retries)
+        *o_puk2_retries = app->puk2_retries;
+
+    /* Early bail out if lock status isn't wanted at this point, so that we
+     * don't fail with an error the unlock retries check */
+    if (!o_lock)
+        return TRUE;
+
+    /* Card is ready, what's the lock status? */
+
+    /* PIN1 */
+    switch (app->pin1_state) {
+    case QMI_UIM_PIN_STATE_NOT_INITIALIZED:
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG,
+                     "SIM PIN/PUK status not known yet");
+        return FALSE;
+
+    case QMI_UIM_PIN_STATE_PERMANENTLY_BLOCKED:
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG,
+                     "SIM PIN/PUK permanently blocked");
+        return FALSE;
+
+    case QMI_UIM_PIN_STATE_ENABLED_NOT_VERIFIED:
+        lock = MM_MODEM_LOCK_SIM_PIN;
+        break;
+
+    case QMI_UIM_PIN_STATE_BLOCKED:
+        lock = MM_MODEM_LOCK_SIM_PUK;
+        break;
+
+    case QMI_UIM_PIN_STATE_DISABLED:
+    case QMI_UIM_PIN_STATE_ENABLED_VERIFIED:
+        lock = MM_MODEM_LOCK_NONE;
+        break;
+
+    default:
+        g_set_error (error,
+                     MM_MOBILE_EQUIPMENT_ERROR,
+                     MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG,
+                     "Unknown SIM PIN/PUK status");
+        return FALSE;
+    }
+
+    /* Personalization */
+    if (lock == MM_MODEM_LOCK_NONE &&
+        app->state == QMI_UIM_CARD_APPLICATION_STATE_CHECK_PERSONALIZATION_STATE) {
+        if (app->personalization_state == QMI_UIM_CARD_APPLICATION_PERSONALIZATION_STATE_IN_PROGRESS ||
+            app->personalization_state == QMI_UIM_CARD_APPLICATION_PERSONALIZATION_STATE_UNKNOWN) {
+            g_set_error (error,
+                         MM_CORE_ERROR,
+                         MM_CORE_ERROR_RETRY,
+                         "Personalization check in progress");
+            return FALSE;
+        }
+        if (app->personalization_state == QMI_UIM_CARD_APPLICATION_PERSONALIZATION_STATE_CODE_REQUIRED ||
+            app->personalization_state == QMI_UIM_CARD_APPLICATION_PERSONALIZATION_STATE_PUK_CODE_REQUIRED) {
+            gboolean pin;
+
+            pin = app->personalization_state == QMI_UIM_CARD_APPLICATION_PERSONALIZATION_STATE_CODE_REQUIRED;
+
+            switch (app->personalization_feature) {
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_NETWORK:
+                lock = (pin ? MM_MODEM_LOCK_PH_NET_PIN : MM_MODEM_LOCK_PH_NET_PUK);
+                break;
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_NETWORK_SUBSET:
+                lock = (pin ? MM_MODEM_LOCK_PH_NETSUB_PIN : MM_MODEM_LOCK_PH_NETSUB_PUK);
+                break;
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_SERVICE_PROVIDER:
+                lock = (pin ? MM_MODEM_LOCK_PH_SP_PIN : MM_MODEM_LOCK_PH_SP_PUK);
+                break;
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_CORPORATE:
+                lock = (pin ? MM_MODEM_LOCK_PH_CORP_PIN : MM_MODEM_LOCK_PH_CORP_PUK);
+                break;
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_UIM:
+                if (pin) {
+                    lock = MM_MODEM_LOCK_PH_SIM_PIN;
+                    break;
+                }
+                /* fall through */
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_1X_NETWORK_TYPE_1:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_1X_NETWORK_TYPE_2:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_1X_HRPD:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_1X_SERVICE_PROVIDER:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_1X_CORPORATE:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_1X_RUIM:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_UNKNOWN:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_SERVICE_PROVIDER_NAME:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_SP_EHPLMN:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_ICCID:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_IMPI:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_NETWORK_SUBSET_SERVICE_PROVIDER:
+            case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_STATUS_GW_CARRIER:
+            default:
+                g_set_error (error,
+                             MM_MOBILE_EQUIPMENT_ERROR,
+                             MM_MOBILE_EQUIPMENT_ERROR_SIM_WRONG,
+                             "Unsupported personalization feature");
+                return FALSE;
+            }
+
+            if (o_pers_retries)
+                *o_pers_retries = app->personalization_retries;
+        }
+    }
+
+    /* PIN2 */
+    if (lock == MM_MODEM_LOCK_NONE) {
+        switch (app->pin2_state) {
+        case QMI_UIM_PIN_STATE_NOT_INITIALIZED:
+            mm_obj_warn (log_object, "SIM PIN2/PUK2 status not known yet");
+            break;
+
+        case QMI_UIM_PIN_STATE_ENABLED_NOT_VERIFIED:
+            lock = MM_MODEM_LOCK_SIM_PIN2;
+            break;
+
+        case QMI_UIM_PIN_STATE_PERMANENTLY_BLOCKED:
+            mm_obj_warn (log_object, "PUK2 permanently blocked");
+            /* Fall through */
+        case QMI_UIM_PIN_STATE_BLOCKED:
+            lock = MM_MODEM_LOCK_SIM_PUK2;
+            break;
+
+        case QMI_UIM_PIN_STATE_DISABLED:
+        case QMI_UIM_PIN_STATE_ENABLED_VERIFIED:
+            break;
+
+        default:
+            mm_obj_warn (log_object, "unknown SIM PIN2/PUK2 status");
+            break;
+        }
+    }
+
+    *o_lock = lock;
+    return TRUE;
+}
+
+/*****************************************************************************/
+
+gboolean
+mm_qmi_uim_get_configuration_output_parse (gpointer                              log_object,
+                                           QmiMessageUimGetConfigurationOutput  *output,
+                                           MMModem3gppFacility                  *o_lock,
+                                           GError                              **error)
+{
+    QmiMessageUimGetConfigurationOutputPersonalizationStatusElement *element;
+    GArray *elements;
+    guint idx;
+
+    *o_lock = MM_MODEM_3GPP_FACILITY_NONE;
+
+    if (!qmi_message_uim_get_configuration_output_get_personalization_status (output, &elements, error)) {
+        g_prefix_error (error, "UIM Get Personalization Status failed: ");
+        return FALSE;
+    }
+
+    for (idx = 0; idx < elements->len; idx++) {
+        element = &g_array_index (elements,
+                                  QmiMessageUimGetConfigurationOutputPersonalizationStatusElement,
+                                  idx);
+        switch (element->feature) {
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_NETWORK:
+            *o_lock |= MM_MODEM_3GPP_FACILITY_NET_PERS;
+            break;
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_NETWORK_SUBSET:
+            *o_lock |= MM_MODEM_3GPP_FACILITY_NET_SUB_PERS;
+            break;
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_SERVICE_PROVIDER:
+            *o_lock |= MM_MODEM_3GPP_FACILITY_PROVIDER_PERS;
+            break;
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_CORPORATE:
+            *o_lock |= MM_MODEM_3GPP_FACILITY_CORP_PERS;
+            break;
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_UIM:
+            *o_lock |= MM_MODEM_3GPP_FACILITY_PH_SIM;
+            break;
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_1X_NETWORK_TYPE_1:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_1X_NETWORK_TYPE_2:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_1X_HRPD:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_1X_SERVICE_PROVIDER:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_1X_CORPORATE:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_1X_RUIM:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_SERVICE_PROVIDER_NAME:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_SP_EHPLMN:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_ICCID:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_IMPI:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_NETWORK_SUBSET_SERVICE_PROVIDER:
+        case QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_CARRIER:
+            mm_obj_dbg (log_object, "ignoring lock in UIM feature: %s",
+                        qmi_uim_card_application_personalization_feature_get_string (element->feature));
+            break;
+        default:
+            mm_obj_dbg (log_object, "ignoring lock in unhandled UIM feature: 0x%x",
+                        (guint)element->feature);
+        }
+    }
+    return TRUE;
+}
+
+/*****************************************************************************/
+
+gboolean
+qmi_personalization_feature_from_mm_modem_3gpp_facility (MMModem3gppFacility                          facility,
+                                                         QmiUimCardApplicationPersonalizationFeature *o_feature)
+{
+    switch (facility) {
+    case MM_MODEM_3GPP_FACILITY_NET_PERS:
+        *o_feature = QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_NETWORK;
+        return TRUE;
+    case MM_MODEM_3GPP_FACILITY_NET_SUB_PERS:
+        *o_feature = QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_NETWORK_SUBSET;
+        return TRUE;
+    case MM_MODEM_3GPP_FACILITY_PROVIDER_PERS:
+        *o_feature = QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_SERVICE_PROVIDER;
+        return TRUE;
+    case MM_MODEM_3GPP_FACILITY_CORP_PERS:
+        *o_feature = QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_CORPORATE;
+        return TRUE;
+    case MM_MODEM_3GPP_FACILITY_PH_SIM:
+        *o_feature = QMI_UIM_CARD_APPLICATION_PERSONALIZATION_FEATURE_GW_UIM;
+        return TRUE;
+    case MM_MODEM_3GPP_FACILITY_NONE:
+    case MM_MODEM_3GPP_FACILITY_SIM:
+    case MM_MODEM_3GPP_FACILITY_FIXED_DIALING:
+    case MM_MODEM_3GPP_FACILITY_PH_FSIM:
+    default:
+        return FALSE;
+    }
 }

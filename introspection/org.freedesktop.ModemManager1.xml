@@ -24,14 +24,19 @@
         ScanDevices:
 
         Start a new scan for connected modem devices.
+
+        Since: 1.0
     -->
     <method name="ScanDevices" />
 
     <!--
         SetLogging:
-        @level: One of <literal>"ERR"</literal>, <literal>"WARN"</literal>, <literal>"INFO"</literal>, <literal>"DEBUG"</literal>.
+        @level: One of <literal>"ERR"</literal>, <literal>"WARN"</literal>,
+          <literal>"MSG"</literal> (since 1.22), <literal>"INFO"</literal>, <literal>"DEBUG"</literal>.
 
         Set logging verbosity.
+
+        Since: 1.0
     -->
     <method name="SetLogging">
       <arg name="level" type="s" direction="in" />
@@ -101,6 +106,8 @@
             </listitem>
           </varlistentry>
         </variablelist>
+
+        Since: 1.8
     -->
     <method name="ReportKernelEvent">
       <arg name="properties" type="a{sv}" direction="in" />
@@ -121,6 +128,8 @@
         This operation binds the inhibition request to the existence of the
         caller in the DBus bus. If the caller disappears from the bus, the
         inhibition will automatically removed.
+
+        Since: 1.10
     -->
     <method name="InhibitDevice">
       <arg name="uid"     type="s" direction="in" />
@@ -131,6 +140,8 @@
         Version:
 
         The runtime version of the ModemManager daemon.
+
+        Since: 1.10
     -->
     <property name="Version" type="s" access="read" />
 

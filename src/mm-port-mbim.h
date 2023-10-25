@@ -10,7 +10,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details:
  *
- * Copyright (C) 2013 Aleksander Morgado <aleksander@gnu.org>
+ * Copyright (C) 2013-2021 Aleksander Morgado <aleksander@gnu.org>
  */
 
 #ifndef MM_PORT_MBIM_H
@@ -37,6 +37,8 @@
 #define MM_IS_PORT_MBIM_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_PORT_MBIM))
 #define MM_PORT_MBIM_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_PORT_MBIM, MMPortMbimClass))
 
+#define MM_PORT_MBIM_SIGNAL_NOTIFICATION "notification"
+
 typedef struct _MMPortMbim MMPortMbim;
 typedef struct _MMPortMbimClass MMPortMbimClass;
 typedef struct _MMPortMbimPrivate MMPortMbimPrivate;
@@ -48,12 +50,17 @@ struct _MMPortMbim {
 
 struct _MMPortMbimClass {
     MMPortClass parent;
+
+    /* signals */
+    void (* notification) (MMPortMbim  *port,
+                           MbimMessage *notification);
 };
 
 GType mm_port_mbim_get_type (void);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMPortMbim, g_object_unref)
 
-MMPortMbim *mm_port_mbim_new (const gchar *name);
+MMPortMbim *mm_port_mbim_new (const gchar  *name,
+                              MMPortSubsys  subsys);
 
 void     mm_port_mbim_open         (MMPortMbim *self,
 #if defined WITH_QMI && QMI_MBIM_QMUX_SUPPORTED
@@ -90,5 +97,31 @@ gboolean   mm_port_mbim_allocate_qmi_client_finish (MMPortMbim           *self,
 #endif
 
 MbimDevice *mm_port_mbim_peek_device (MMPortMbim *self);
+
+void   mm_port_mbim_setup_link        (MMPortMbim            *self,
+                                       MMPort                *data,
+                                       const gchar           *link_prefix_hint,
+                                       GAsyncReadyCallback    callback,
+                                       gpointer               user_data);
+gchar *mm_port_mbim_setup_link_finish (MMPortMbim            *self,
+                                       GAsyncResult          *res,
+                                       guint                 *session_id,
+                                       GError               **error);
+
+void   mm_port_mbim_cleanup_link          (MMPortMbim           *self,
+                                           const gchar          *link_name,
+                                           GAsyncReadyCallback   callback,
+                                           gpointer              user_data);
+gboolean mm_port_mbim_cleanup_link_finish (MMPortMbim           *self,
+                                           GAsyncResult         *res,
+                                           GError              **error);
+
+void     mm_port_mbim_reset        (MMPortMbim           *self,
+                                    MMPort               *data,
+                                    GAsyncReadyCallback   callback,
+                                    gpointer              user_data);
+gboolean mm_port_mbim_reset_finish (MMPortMbim           *self,
+                                    GAsyncResult         *res,
+                                    GError              **error);
 
 #endif /* MM_PORT_MBIM_H */

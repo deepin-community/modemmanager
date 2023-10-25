@@ -126,7 +126,7 @@ test_ws46_response (const gchar       *str,
     GArray *modes;
     GError *error = NULL;
 
-    modes = mm_3gpp_parse_ws46_test_response (str, &error);
+    modes = mm_3gpp_parse_ws46_test_response (str, NULL, &error);
     g_assert_no_error (error);
     g_assert (modes != NULL);
     g_assert_cmpuint (modes->len, ==, n_expected);
@@ -626,9 +626,10 @@ test_cops_response_motoc (void *f, gpointer d)
 static void
 test_cops_response_mf627a (void *f, gpointer d)
 {
+    /* The '@' in this string is ASCII 0x40, and 0x40 is a valid GSM-7 char: '¡' (which is 0xc2,0xa1 in UTF-8) */
     const char *reply = "+COPS: (2,\"AT&T@\",\"AT&TD\",\"310410\",0),(3,\"Vstream Wireless\",\"VSTREAM\",\"31026\",0),";
     static MM3gppNetworkInfo expected[] = {
-        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_CURRENT,   (gchar *) "AT&T@",            (gchar *) "AT&TD",   (gchar *) "310410", MM_MODEM_ACCESS_TECHNOLOGY_GSM },
+        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_CURRENT,   (gchar *) "AT&T¡",            (gchar *) "AT&TD",   (gchar *) "310410", MM_MODEM_ACCESS_TECHNOLOGY_GSM },
         { MM_MODEM_3GPP_NETWORK_AVAILABILITY_FORBIDDEN, (gchar *) "Vstream Wireless", (gchar *) "VSTREAM", (gchar *) "31026",  MM_MODEM_ACCESS_TECHNOLOGY_GSM },
     };
 
@@ -638,9 +639,10 @@ test_cops_response_mf627a (void *f, gpointer d)
 static void
 test_cops_response_mf627b (void *f, gpointer d)
 {
+    /* The '@' in this string is ASCII 0x40, and 0x40 is a valid GSM-7 char: '¡' (which is 0xc2,0xa1 in UTF-8) */
     const char *reply = "+COPS: (2,\"AT&Tp\",\"AT&T@\",\"310410\",0),(3,\"\",\"\",\"31026\",0),";
     static MM3gppNetworkInfo expected[] = {
-        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_CURRENT,   (gchar *) "AT&Tp", (gchar *) "AT&T@", (gchar *) "310410", MM_MODEM_ACCESS_TECHNOLOGY_GSM },
+        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_CURRENT,   (gchar *) "AT&Tp", (gchar *) "AT&T¡", (gchar *) "310410", MM_MODEM_ACCESS_TECHNOLOGY_GSM },
         { MM_MODEM_3GPP_NETWORK_AVAILABILITY_FORBIDDEN, NULL,              NULL,              (gchar *) "31026",  MM_MODEM_ACCESS_TECHNOLOGY_GSM },
     };
 
@@ -910,6 +912,28 @@ test_cops_response_ublox_lara (void *f, gpointer d)
 }
 
 static void
+test_cops_response_em9191 (void *f, gpointer d)
+{
+    const char *reply =
+        "+COPS: "
+        "(1,\"Telekom.de\",\"TDG\",\"26201\",12),"
+        "(1,\"Telekom.de\",\"Telekom.\",\"26201\",7),"
+        "(1,\"o2 - de\",\"o2 - de\",\"26203\",7),"
+        "(1,\"vodafone.de\",\"Vodafone\",\"26202\",7)"
+        /* these next ones will be ignored */
+        "(0,1,2,3,4),"
+        "(0,1,2)";
+    static MM3gppNetworkInfo expected[] = {
+        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_AVAILABLE, (gchar *) "Telekom.de",  (gchar *) "TDG",      (gchar *) "26201", MM_MODEM_ACCESS_TECHNOLOGY_5GNR },
+        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_AVAILABLE, (gchar *) "Telekom.de",  (gchar *) "Telekom.", (gchar *) "26201", MM_MODEM_ACCESS_TECHNOLOGY_LTE  },
+        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_AVAILABLE, (gchar *) "o2 - de",     (gchar *) "o2 - de",  (gchar *) "26203", MM_MODEM_ACCESS_TECHNOLOGY_LTE  },
+        { MM_MODEM_3GPP_NETWORK_AVAILABILITY_AVAILABLE, (gchar *) "vodafone.de", (gchar *) "Vodafone", (gchar *) "26202", MM_MODEM_ACCESS_TECHNOLOGY_LTE  },
+    };
+
+    test_cops_results ("EM9191", reply, MM_MODEM_CHARSET_GSM, &expected[0], G_N_ELEMENTS (expected));
+}
+
+static void
 test_cops_response_gsm_invalid (void *f, gpointer d)
 {
     const gchar *reply = "+COPS: (0,1,2,3),(1,2,3,4)";
@@ -959,6 +983,7 @@ test_cops_query_data (const CopsQueryData *item)
                                                &format,
                                                &operator,
                                                &act,
+                                               NULL,
                                                &error);
     g_assert_no_error (error);
     g_assert (result);
@@ -1041,7 +1066,7 @@ common_test_normalize_operator (const NormalizeOperatorTest *t)
     gchar *str;
 
     str = g_strdup (t->input);
-    mm_3gpp_normalize_operator (&str, t->charset);
+    mm_3gpp_normalize_operator (&str, t->charset, NULL);
     if (!t->normalized)
         g_assert (!str);
     else
@@ -1104,15 +1129,19 @@ test_creg_match (const char *test,
                  RegTestData *data,
                  const CregResult *result)
 {
-    guint i;
-    GMatchInfo *info  = NULL;
-    MMModem3gppRegistrationState state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
-    MMModemAccessTechnology access_tech = MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN;
-    gulong lac = 0, ci = 0;
-    GError *error = NULL;
-    gboolean success, cgreg = FALSE, cereg = FALSE, c5greg = FALSE;
-    guint regex_num = 0;
-    GPtrArray *array;
+    g_autoptr(GMatchInfo)         info  = NULL;
+    guint                         i;
+    MMModem3gppRegistrationState  state = MM_MODEM_3GPP_REGISTRATION_STATE_UNKNOWN;
+    MMModemAccessTechnology       access_tech = MM_MODEM_ACCESS_TECHNOLOGY_UNKNOWN;
+    gulong                        lac = 0;
+    gulong                        ci = 0;
+    GError                       *error = NULL;
+    gboolean                      success;
+    gboolean                      cgreg = FALSE;
+    gboolean                      cereg = FALSE;
+    gboolean                      c5greg = FALSE;
+    guint                         regex_num = 0;
+    GPtrArray                    *array;
 
     g_assert (reply);
     g_assert (test);
@@ -1133,8 +1162,7 @@ test_creg_match (const char *test,
             regex_num = i;
             break;
         }
-        g_match_info_free (info);
-        info = NULL;
+        g_clear_pointer (&info, g_match_info_free);
     }
 
     g_debug ("  regex_num (%u) == result->regex_num (%u)",
@@ -1146,7 +1174,6 @@ test_creg_match (const char *test,
 
     success = mm_3gpp_parse_creg_response (info, NULL, &state, &lac, &ci, &access_tech, &cgreg, &cereg, &c5greg, &error);
 
-    g_match_info_free (info);
     g_assert (success);
     g_assert_no_error (error);
     g_assert_cmpuint (state, ==, result->state);
@@ -2756,12 +2783,12 @@ typedef struct {
     MMBearerIpFamily  ip_family;
     const gchar      *cgdcont_test;
     const gchar      *cgdcont_query;
-    guint             expected_cid;
-    gboolean          expected_cid_reused;
-    gboolean          expected_cid_overwritten;
-} CidSelectionTest;
+    gint              expected_profile_id;
+    gboolean          expected_profile_id_reused;
+    gboolean          expected_profile_id_overwritten;
+} ProfileSelectionTest;
 
-static const CidSelectionTest cid_selection_tests[] = {
+static const ProfileSelectionTest profile_selection_tests[] = {
     /* Test: exact APN match */
     {
         .apn           = "ac.vodafone.es",
@@ -2772,9 +2799,9 @@ static const CidSelectionTest cid_selection_tests[] = {
         .cgdcont_query = "+CGDCONT: 1,\"IP\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 2,\"IP\",\"ac.vodafone.es\",\"\",0,0\r\n"
                          "+CGDCONT: 3,\"IP\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 2,
-        .expected_cid_reused      = TRUE,
-        .expected_cid_overwritten = FALSE
+        .expected_profile_id             = 2,
+        .expected_profile_id_reused      = TRUE,
+        .expected_profile_id_overwritten = FALSE
     },
     /* Test: exact APN match reported as activated */
     {
@@ -2786,9 +2813,9 @@ static const CidSelectionTest cid_selection_tests[] = {
         .cgdcont_query = "+CGDCONT: 1,\"IP\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 2,\"IP\",\"ac.vodafone.es.MNC001.MCC214.GPRS\",\"\",0,0\r\n"
                          "+CGDCONT: 3,\"IP\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 2,
-        .expected_cid_reused      = TRUE,
-        .expected_cid_overwritten = FALSE
+        .expected_profile_id             = 2,
+        .expected_profile_id_reused      = TRUE,
+        .expected_profile_id_overwritten = FALSE
     },
     /* Test: first empty slot in between defined contexts */
     {
@@ -2799,9 +2826,9 @@ static const CidSelectionTest cid_selection_tests[] = {
                          "+CGDCONT: (1-10),\"IPV4V6\",,,(0,1),(0,1)\r\n",
         .cgdcont_query = "+CGDCONT: 1,\"IP\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 10,\"IP\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 2,
-        .expected_cid_reused      = FALSE,
-        .expected_cid_overwritten = FALSE
+        .expected_profile_id             = 2,
+        .expected_profile_id_reused      = FALSE,
+        .expected_profile_id_overwritten = FALSE
     },
     /* Test: first empty slot in between defined contexts, different PDP types */
     {
@@ -2812,9 +2839,9 @@ static const CidSelectionTest cid_selection_tests[] = {
                          "+CGDCONT: (1-10),\"IPV4V6\",,,(0,1),(0,1)\r\n",
         .cgdcont_query = "+CGDCONT: 1,\"IPV6\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 10,\"IP\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 2,
-        .expected_cid_reused      = FALSE,
-        .expected_cid_overwritten = FALSE
+        .expected_profile_id             = 2,
+        .expected_profile_id_reused      = FALSE,
+        .expected_profile_id_overwritten = FALSE
     },
     /* Test: first empty slot after last context found */
     {
@@ -2825,9 +2852,9 @@ static const CidSelectionTest cid_selection_tests[] = {
                          "+CGDCONT: (1-10),\"IPV4V6\",,,(0,1),(0,1)\r\n",
         .cgdcont_query = "+CGDCONT: 1,\"IP\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 2,\"IP\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 3,
-        .expected_cid_reused      = FALSE,
-        .expected_cid_overwritten = FALSE
+        .expected_profile_id             = 3,
+        .expected_profile_id_reused      = FALSE,
+        .expected_profile_id_overwritten = FALSE
     },
     /* Test: first empty slot after last context found, different PDP types */
     {
@@ -2838,9 +2865,9 @@ static const CidSelectionTest cid_selection_tests[] = {
                          "+CGDCONT: (1-10),\"IPV4V6\",,,(0,1),(0,1)\r\n",
         .cgdcont_query = "+CGDCONT: 1,\"IP\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 2,\"IPV6\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 3,
-        .expected_cid_reused      = FALSE,
-        .expected_cid_overwritten = FALSE
+        .expected_profile_id             = 3,
+        .expected_profile_id_reused      = FALSE,
+        .expected_profile_id_overwritten = FALSE
     },
     /* Test: no empty slot, rewrite context with empty APN */
     {
@@ -2852,9 +2879,9 @@ static const CidSelectionTest cid_selection_tests[] = {
         .cgdcont_query = "+CGDCONT: 1,\"IP\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 2,\"IP\",\"\",\"\",0,0\r\n"
                          "+CGDCONT: 3,\"IP\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 2,
-        .expected_cid_reused      = FALSE,
-        .expected_cid_overwritten = TRUE
+        .expected_profile_id             = 2,
+        .expected_profile_id_reused      = FALSE,
+        .expected_profile_id_overwritten = TRUE
     },
     /* Test: no empty slot, rewrite last context found */
     {
@@ -2866,9 +2893,9 @@ static const CidSelectionTest cid_selection_tests[] = {
         .cgdcont_query = "+CGDCONT: 1,\"IP\",\"telefonica.es\",\"\",0,0\r\n"
                          "+CGDCONT: 2,\"IP\",\"vzwinternet\",\"\",0,0\r\n"
                          "+CGDCONT: 3,\"IP\",\"inet.es\",\"\",0,0\r\n",
-        .expected_cid             = 3,
-        .expected_cid_reused      = FALSE,
-        .expected_cid_overwritten = TRUE
+        .expected_profile_id             = 3,
+        .expected_profile_id_reused      = FALSE,
+        .expected_profile_id_overwritten = TRUE
     },
     /* Test: CGDCONT? and CGDCONT=? failures, fallback to CID=1 (a.g. some Android phones) */
     {
@@ -2876,39 +2903,58 @@ static const CidSelectionTest cid_selection_tests[] = {
         .ip_family     = MM_BEARER_IP_FAMILY_IPV4,
         .cgdcont_test  = NULL,
         .cgdcont_query = NULL,
-        .expected_cid             = 1,
-        .expected_cid_reused      = FALSE,
-        .expected_cid_overwritten = TRUE
+        .expected_profile_id             = 1,
+        .expected_profile_id_reused      = FALSE,
+        .expected_profile_id_overwritten = TRUE
     },
 };
 
 static void
-test_cid_selection (void)
+test_profile_selection (void)
 {
     guint i;
 
-    for (i = 0; i < G_N_ELEMENTS (cid_selection_tests); i++) {
-        const CidSelectionTest *test;
-        GList                  *context_list;
-        GList                  *context_format_list;
-        guint                   cid;
-        gboolean                cid_reused;
-        gboolean                cid_overwritten;
+    for (i = 0; i < G_N_ELEMENTS (profile_selection_tests); i++) {
+        const ProfileSelectionTest *test;
+        GList                      *context_format_list;
+        GList                      *context_list;
+        GList                      *profile_list;
+        gint                        profile_id;
+        guint                       min_allowed_cid = 1;
+        guint                       max_allowed_cid = G_MAXINT - 1;
+        g_autoptr(MM3gppProfile)    requested = NULL;
+        g_autoptr(MM3gppProfile)    reused = NULL;
+        gboolean                    profile_id_overwritten;
 
-        test = &cid_selection_tests[i];
+        test = &profile_selection_tests[i];
+
+        requested = mm_3gpp_profile_new ();
+        mm_3gpp_profile_set_apn (requested, test->apn);
+        mm_3gpp_profile_set_ip_type (requested, test->ip_family);
 
         context_format_list = test->cgdcont_test ? mm_3gpp_parse_cgdcont_test_response (test->cgdcont_test, NULL, NULL) : NULL;
+        mm_3gpp_pdp_context_format_list_find_range (context_format_list, test->ip_family, &min_allowed_cid, &max_allowed_cid);
+
         context_list = test->cgdcont_query ? mm_3gpp_parse_cgdcont_read_response (test->cgdcont_query, NULL) : NULL;
+        profile_list = mm_3gpp_profile_list_new_from_pdp_context_list (context_list);
 
-        cid = mm_3gpp_select_best_cid (test->apn, test->ip_family,
-                                       context_list, context_format_list,
-                                       NULL,
-                                       &cid_reused, &cid_overwritten);
+        profile_id = mm_3gpp_profile_list_find_best  (profile_list,
+                                                      requested,
+                                                      (GEqualFunc)mm_3gpp_cmp_apn_name,
+                                                      (MM_3GPP_PROFILE_CMP_FLAGS_NO_PROFILE_ID |
+                                                       MM_3GPP_PROFILE_CMP_FLAGS_NO_AUTH |
+                                                       MM_3GPP_PROFILE_CMP_FLAGS_NO_APN_TYPE),
+                                                      min_allowed_cid,
+                                                      max_allowed_cid,
+                                                      NULL, /* log_object */
+                                                      &reused,
+                                                      &profile_id_overwritten);
 
-        g_assert_cmpuint (cid, ==, test->expected_cid);
-        g_assert_cmpuint (cid_reused, ==, test->expected_cid_reused);
-        g_assert_cmpuint (cid_overwritten, ==, test->expected_cid_overwritten);
+        g_assert_cmpuint (profile_id, ==, test->expected_profile_id);
+        g_assert_cmpuint (!!reused, ==, test->expected_profile_id_reused);
+        g_assert_cmpuint (profile_id_overwritten, ==, test->expected_profile_id_overwritten);
 
+        mm_3gpp_profile_list_free (profile_list);
         mm_3gpp_pdp_context_format_list_free (context_format_list);
         mm_3gpp_pdp_context_list_free (context_list);
     }
@@ -3233,21 +3279,23 @@ static void
 common_parse_operator_id (const gchar *operator_id,
                           gboolean expected_success,
                           guint16 expected_mcc,
-                          guint16 expected_mnc)
+                          guint16 expected_mnc,
+                          gboolean expected_three_digit_mnc)
 {
     guint16 mcc;
     guint16 mnc;
+    gboolean three_digit_mnc;
     gboolean result;
     GError *error = NULL;
 
     if (expected_mcc) {
         g_debug ("Parsing Operator ID '%s' "
-                 "(%" G_GUINT16_FORMAT ", %" G_GUINT16_FORMAT  ")...",
-                 operator_id, expected_mcc, expected_mnc);
-        result = mm_3gpp_parse_operator_id (operator_id, &mcc, &mnc, &error);
+                 "(%" G_GUINT16_FORMAT ", %" G_GUINT16_FORMAT  ", %s)...",
+                 operator_id, expected_mcc, expected_mnc, expected_three_digit_mnc ? "TRUE" : "FALSE");
+        result = mm_3gpp_parse_operator_id (operator_id, &mcc, &mnc, &three_digit_mnc, &error);
     } else {
         g_debug ("Validating Operator ID '%s'...", operator_id);
-        result = mm_3gpp_parse_operator_id (operator_id, NULL, NULL, &error);
+        result = mm_3gpp_parse_operator_id (operator_id, NULL, NULL, NULL, &error);
     }
 
     if (error)
@@ -3262,6 +3310,7 @@ common_parse_operator_id (const gchar *operator_id,
         if (expected_mcc) {
             g_assert_cmpuint (expected_mcc, ==, mcc);
             g_assert_cmpuint (expected_mnc, ==, mnc);
+            g_assert_cmpint (expected_three_digit_mnc, ==, three_digit_mnc);
         }
     } else {
         g_assert (error != NULL);
@@ -3274,26 +3323,26 @@ static void
 test_parse_operator_id (void *f, gpointer d)
 {
     /* Valid MCC+MNC(2) */
-    common_parse_operator_id ("41201",  TRUE, 412, 1);
-    common_parse_operator_id ("41201",  TRUE, 0, 0);
+    common_parse_operator_id ("41201",  TRUE, 412, 1, FALSE);
+    common_parse_operator_id ("41201",  TRUE, 0, 0, FALSE);
     /* Valid MCC+MNC(3) */
-    common_parse_operator_id ("342600", TRUE, 342, 600);
-    common_parse_operator_id ("342600", TRUE, 0, 0);
+    common_parse_operator_id ("342600", TRUE, 342, 600, TRUE);
+    common_parse_operator_id ("342600", TRUE, 0, 0, FALSE);
     /* Valid MCC+MNC(2, == 0) */
-    common_parse_operator_id ("72400", TRUE, 724, 0);
-    common_parse_operator_id ("72400", TRUE, 0, 0);
+    common_parse_operator_id ("72400", TRUE, 724, 0, FALSE);
+    common_parse_operator_id ("72400", TRUE, 0, 0, FALSE);
     /* Valid MCC+MNC(3, == 0) */
-    common_parse_operator_id ("724000", TRUE, 724, 0);
-    common_parse_operator_id ("724000", TRUE, 0, 0);
+    common_parse_operator_id ("724000", TRUE, 724, 0, TRUE);
+    common_parse_operator_id ("724000", TRUE, 0, 0, FALSE);
 
     /* Invalid MCC=0 */
-    common_parse_operator_id ("000600", FALSE, 0, 0);
+    common_parse_operator_id ("000600", FALSE, 0, 0, FALSE);
     /* Invalid, non-digits */
-    common_parse_operator_id ("000Z00", FALSE, 0, 0);
+    common_parse_operator_id ("000Z00", FALSE, 0, 0, FALSE);
     /* Invalid, short */
-    common_parse_operator_id ("123", FALSE, 0, 0);
+    common_parse_operator_id ("123", FALSE, 0, 0, FALSE);
     /* Invalid, long */
-    common_parse_operator_id ("1234567", FALSE, 0, 0);
+    common_parse_operator_id ("1234567", FALSE, 0, 0, FALSE);
 }
 
 /*****************************************************************************/
@@ -3304,10 +3353,10 @@ common_parse_cds (const gchar *str,
                   guint expected_pdu_len,
                   const gchar *expected_pdu)
 {
-    GMatchInfo *match_info;
-    GRegex *regex;
-    gchar *pdu_len_str;
-    gchar *pdu;
+    g_autoptr(GMatchInfo)  match_info = NULL;
+    g_autoptr(GRegex)      regex = NULL;
+    g_autofree gchar      *pdu_len_str = NULL;
+    g_autofree gchar      *pdu = NULL;
 
     regex = mm_3gpp_cds_regex_get ();
     g_regex_match (regex, str, 0, &match_info);
@@ -3321,12 +3370,6 @@ common_parse_cds (const gchar *str,
     g_assert (pdu != NULL);
 
     g_assert_cmpstr (pdu, ==, expected_pdu);
-
-    g_free (pdu);
-    g_free (pdu_len_str);
-
-    g_match_info_free (match_info);
-    g_regex_unref (regex);
 }
 
 static void
@@ -3538,25 +3581,25 @@ typedef struct {
 
 static const CclkTest cclk_tests[] = {
     { "+CCLK: \"14/08/05,04:00:21\"", TRUE, TRUE, FALSE,
-        "2014-08-05T04:00:21+00:00", 0 },
+        "2014-08-05T04:00:21Z", 0 },
     { "+CCLK: \"14/08/05,04:00:21\"", TRUE, FALSE, TRUE,
         "2014-08-05T04:00:21+00:00", 0 },
     { "+CCLK: \"14/08/05,04:00:21\"", TRUE, TRUE, TRUE,
-        "2014-08-05T04:00:21+00:00", 0 },
+        "2014-08-05T04:00:21Z", 0 },
 
     { "+CCLK: \"14/08/05,04:00:21+40\"", TRUE, TRUE, FALSE,
-        "2014-08-05T04:00:21+10:00", 600 },
+        "2014-08-05T04:00:21+10", 600 },
     { "+CCLK: \"14/08/05,04:00:21+40\"", TRUE, FALSE, TRUE,
         "2014-08-05T04:00:21+10:00", 600 },
     { "+CCLK: \"14/08/05,04:00:21+40\"", TRUE, TRUE, TRUE,
-        "2014-08-05T04:00:21+10:00", 600 },
+        "2014-08-05T04:00:21+10", 600 },
 
     { "+CCLK: \"15/02/28,20:30:40-32\"", TRUE, TRUE, FALSE,
-        "2015-02-28T20:30:40-08:00", -480 },
+        "2015-02-28T20:30:40-08", -480 },
     { "+CCLK: \"15/02/28,20:30:40-32\"", TRUE, FALSE, TRUE,
-        "2015-02-28T20:30:40-08:00", -480 },
+        "2015-02-28T20:30:40-08", -480 },
     { "+CCLK: \"15/02/28,20:30:40-32\"", TRUE, TRUE, TRUE,
-        "2015-02-28T20:30:40-08:00", -480 },
+        "2015-02-28T20:30:40-08", -480 },
 
     { "+CCLK: 17/07/26,11:42:15+01", TRUE, TRUE, FALSE,
       "2017-07-26T11:42:15+00:15", 15 },
@@ -3566,11 +3609,11 @@ static const CclkTest cclk_tests[] = {
       "2017-07-26T11:42:15+00:15", 15 },
 
     { "+CCLK:   \"15/02/28,20:30:40-32\"", TRUE, TRUE, FALSE,
-        "2015-02-28T20:30:40-08:00", -480 },
+        "2015-02-28T20:30:40-08", -480 },
     { "+CCLK:   \"15/02/28,20:30:40-32\"", TRUE, FALSE, TRUE,
         "2015-02-28T20:30:40-08:00", -480 },
     { "+CCLK:   \"15/02/28,20:30:40-32\"", TRUE, TRUE, TRUE,
-        "2015-02-28T20:30:40-08:00", -480 },
+        "2015-02-28T20:30:40-08", -480 },
 
     { "+CCLK:   17/07/26,11:42:15+01", TRUE, TRUE, FALSE,
       "2017-07-26T11:42:15+00:15", 15 },
@@ -4096,15 +4139,15 @@ static const ClipUrcTest clip_urc_tests[] = {
 static void
 test_clip_indication (void)
 {
-    GRegex *r;
-    guint   i;
+    g_autoptr(GRegex) r = NULL;
+    guint             i;
 
     r = mm_voice_clip_regex_get ();
 
     for (i = 0; i < G_N_ELEMENTS (clip_urc_tests); i++) {
-        GMatchInfo *match_info = NULL;
-        gchar      *number;
-        guint       type;
+        g_autoptr(GMatchInfo)  match_info = NULL;
+        g_autofree gchar      *number = NULL;
+        guint                  type;
 
         g_assert (g_regex_match (r, clip_urc_tests[i].str, 0, &match_info));
         g_assert (g_match_info_matches (match_info));
@@ -4114,12 +4157,7 @@ test_clip_indication (void)
 
         g_assert (mm_get_uint_from_match_info (match_info, 2, &type));
         g_assert_cmpuint (type, ==, clip_urc_tests[i].type);
-
-        g_free (number);
-        g_match_info_free (match_info);
     }
-
-    g_regex_unref (r);
 }
 
 /*****************************************************************************/
@@ -4141,16 +4179,16 @@ static const CcwaUrcTest ccwa_urc_tests[] = {
 static void
 test_ccwa_indication (void)
 {
-    GRegex *r;
-    guint   i;
+    g_autoptr(GRegex) r = NULL;
+    guint             i;
 
     r = mm_voice_ccwa_regex_get ();
 
     for (i = 0; i < G_N_ELEMENTS (ccwa_urc_tests); i++) {
-        GMatchInfo *match_info = NULL;
-        gchar      *number;
-        guint       type;
-        guint       class;
+        g_autoptr(GMatchInfo)  match_info = NULL;
+        g_autofree gchar      *number = NULL;
+        guint                  type;
+        guint                  class;
 
         g_assert (g_regex_match (r, ccwa_urc_tests[i].str, 0, &match_info));
         g_assert (g_match_info_matches (match_info));
@@ -4163,12 +4201,7 @@ test_ccwa_indication (void)
 
         g_assert (mm_get_uint_from_match_info (match_info, 3, &class));
         g_assert_cmpuint (class, ==, ccwa_urc_tests[i].class);
-
-        g_free (number);
-        g_match_info_free (match_info);
     }
-
-    g_regex_unref (r);
 }
 
 /*****************************************************************************/
@@ -4203,8 +4236,8 @@ typedef struct {
 } TestCcwa;
 
 static TestCcwa test_ccwa[] = {
-    { "+CCWA: 0,255", FALSE, FALSE }, /* all disabled */
-    { "+CCWA: 1,255", TRUE,  FALSE }, /* all enabled */
+    { "+CCWA: 0,255\r\n", FALSE, FALSE }, /* all disabled */
+    { "+CCWA: 1,255\r\n", TRUE,  FALSE }, /* all enabled */
     { "+CCWA: 0,1\r\n"
       "+CCWA: 0,4\r\n", FALSE,  FALSE }, /* voice and fax disabled */
     { "+CCWA: 1,1\r\n"
@@ -4279,7 +4312,7 @@ common_test_clcc_response (const gchar      *str,
 static void
 test_clcc_response_empty (void)
 {
-    const gchar *response = "";
+    const gchar *response = "\r\n";
 
     common_test_clcc_response (response, NULL, 0);
 }
@@ -4292,7 +4325,7 @@ test_clcc_response_single (void)
     };
 
     const gchar *response =
-        "+CLCC: 1,1,0,0,0,\"123456789\",161";
+        "+CLCC: 1,1,0,0,0,\"123456789\",161\r\n";
 
     common_test_clcc_response (response, expected_call_info_list, G_N_ELEMENTS (expected_call_info_list));
 }
@@ -4306,7 +4339,7 @@ test_clcc_response_single_long (void)
 
     /* NOTE: priority field is EMPTY */
     const gchar *response =
-        "+CLCC: 1,1,4,0,0,\"123456789\",129,\"\",,0";
+        "+CLCC: 1,1,4,0,0,\"123456789\",129,\"\",,0\r\n";
 
     common_test_clcc_response (response, expected_call_info_list, G_N_ELEMENTS (expected_call_info_list));
 }
@@ -4328,6 +4361,31 @@ test_clcc_response_multiple (void)
         "+CLCC: 3,1,0,0,1,\"987654321\",161,\"Alice\"\r\n"
         "+CLCC: 4,1,0,0,1,\"000000000\",161,\"Bob\",1\r\n"
         "+CLCC: 5,1,5,0,0,\"555555555\",161,\"Mallory\",2,0\r\n";
+
+    common_test_clcc_response (response, expected_call_info_list, G_N_ELEMENTS (expected_call_info_list));
+}
+
+static void
+test_clcc_response_ignore_non_voice (void)
+{
+    static const MMCallInfo expected_call_info_list[] = {
+        { 1, MM_CALL_DIRECTION_INCOMING, MM_CALL_STATE_RINGING_IN, (gchar *) "987654321" },
+        { 4, MM_CALL_DIRECTION_INCOMING, MM_CALL_STATE_RINGING_IN, (gchar *) "111111111" },
+        { 5, MM_CALL_DIRECTION_INCOMING, MM_CALL_STATE_RINGING_IN, (gchar *) "222222222" },
+        { 6, MM_CALL_DIRECTION_INCOMING, MM_CALL_STATE_RINGING_IN, (gchar *) "333333333" },
+    };
+
+    const gchar *response =
+        "+CLCC: 1,1,4,0,0,\"987654321\",161\r\n" /* voice mode */
+        "+CLCC: 2,1,4,1,0,\"123456789\",161\r\n" /* data mode, skip */
+        "+CLCC: 3,1,4,2,0,\"000000000\",161\r\n" /* fax data, skip */
+        "+CLCC: 4,1,4,3,0,\"111111111\",161\r\n" /* voice followed by data, voice mode */
+        "+CLCC: 5,1,4,4,0,\"222222222\",161\r\n" /* alternating voice/data, voice mode */
+        "+CLCC: 6,1,4,5,0,\"333333333\",161\r\n" /* alternating voice/fax, voice mode */
+        "+CLCC: 7,1,4,6,0,\"444444444\",161\r\n" /* voice followed by data, data mode, skip */
+        "+CLCC: 8,1,4,7,0,\"555555555\",161\r\n" /* alternating voice/data, data mode, skip */
+        "+CLCC: 9,1,4,8,0,\"666666666\",161\r\n" /* alternating voice/fax, fax mode, skip */
+        "+CLCC: 10,1,4,9,0,\"777777777\",161\r\n"; /* unknown mode, skip */
 
     common_test_clcc_response (response, expected_call_info_list, G_N_ELEMENTS (expected_call_info_list));
 }
@@ -4429,20 +4487,22 @@ test_parse_uint_list (void)
 typedef struct {
     const guint8 bcd[10];
     gsize bcd_len;
-    const gchar *str;
+    const gchar *low_nybble_first_str;
+    const gchar *high_nybble_first_str;
 } BcdToStringTest;
 
 static const BcdToStringTest bcd_to_string_tests[] = {
-    { { }, 0, "" },
-    { { 0x01 }, 1, "10" },
-    { { 0x1F }, 1, "" },
-    { { 0xE2 }, 1, "2" },
-    { { 0xD3 }, 1, "3" },
-    { { 0xC4 }, 1, "4" },
-    { { 0xB1, 0x23 }, 2, "1" },
-    { { 0x01, 0x23, 0x45, 0x67 }, 4, "10325476" },
-    { { 0x01, 0x23, 0x45, 0xA7 }, 4, "1032547" },
-    { { 0x01, 0x23, 0x45, 0x67 }, 2, "1032" },
+    { { }, 0, "", "" },
+    { { 0x01 }, 1, "10", "01" },
+    { { 0x1F }, 1, "", "1" },
+    { { 0xE2 }, 1, "2", "" },
+    { { 0xD3 }, 1, "3", "" },
+    { { 0xC4 }, 1, "4", "" },
+    { { 0xB1, 0x23 }, 2, "1", "" },
+    { { 0x01, 0x2A }, 2, "10", "012" },
+    { { 0x01, 0x23, 0x45, 0x67 }, 4, "10325476", "01234567" },
+    { { 0x01, 0x23, 0x45, 0xA7 }, 4, "1032547", "012345" },
+    { { 0x01, 0x23, 0x45, 0x67 }, 2, "1032", "0123" },
 };
 
 static void
@@ -4454,9 +4514,92 @@ test_bcd_to_string (void *f, gpointer d)
         gchar *str;
 
         str = mm_bcd_to_string (bcd_to_string_tests[i].bcd,
-                                bcd_to_string_tests[i].bcd_len);
-        g_assert_cmpstr (str, ==, bcd_to_string_tests[i].str);
+                                bcd_to_string_tests[i].bcd_len,
+                                TRUE /* low_nybble_first */);
+        g_assert_cmpstr (str, ==, bcd_to_string_tests[i].low_nybble_first_str);
         g_free (str);
+
+        str = mm_bcd_to_string (bcd_to_string_tests[i].bcd,
+                                bcd_to_string_tests[i].bcd_len,
+                                FALSE /* low_nybble_first */);
+        g_assert_cmpstr (str, ==, bcd_to_string_tests[i].high_nybble_first_str);
+        g_free (str);
+    }
+}
+
+/*****************************************************************************/
+
+typedef struct {
+    const gchar *response;
+    gboolean     expected_error;
+    guint        expected_index;
+    const gchar *expected_operator_code;
+    gboolean     expected_gsm_act;
+    gboolean     expected_gsm_compact_act;
+    gboolean     expected_utran_act;
+    gboolean     expected_eutran_act;
+    gboolean     expected_ngran_act;
+    guint        expected_act_count;
+} TestCpol;
+
+static const TestCpol test_cpol[] = {
+    { "+CPOL: 1,2,\"24412\",0,0,0,0", FALSE, 1, "24412", FALSE, FALSE, FALSE, FALSE, FALSE, 4 },
+    { "+CPOL: 1,2,24412,0,0,0,0", FALSE, 1, "24412", FALSE, FALSE, FALSE, FALSE, FALSE, 4 },
+    { "+CPOL: 1", TRUE },
+    { "+CPOL: 1,2", TRUE },
+    { "+CPOL: 1,1,\"Test\"", TRUE },
+    { "+CPOL: 5,2,123456,0,0,0,0,1", FALSE, 5, "123456", FALSE, FALSE, FALSE, FALSE, TRUE, 5 },
+    { "+CPOL: 99,2,\"63423\",1,0,1,0,1", FALSE, 99, "63423", TRUE, FALSE, TRUE, FALSE, TRUE, 5 },
+    { "+CPOL: 101,2,\"63423\",1,1,1", FALSE, 101, "63423", TRUE, TRUE, TRUE, FALSE, FALSE, 3 },
+    { "+CPOL: 101,2,\"24491\"", FALSE, 101, "24491", FALSE, FALSE, FALSE, FALSE, FALSE, 0 },
+    { "+CPOL: X,2,\"24491\"", TRUE },
+    { "+CPOL:1, 2, 12345, 1, 1, 1, 1, 1", FALSE, 1, "12345", TRUE, TRUE, TRUE, TRUE, TRUE, 5 }
+};
+
+static void
+test_cpol_response (void)
+{
+    guint i;
+
+    for (i = 0; i < G_N_ELEMENTS (test_cpol); i++) {
+        guint    index;
+        gchar   *operator_code = NULL;
+        gboolean gsm_act;
+        gboolean gsm_compact_act;
+        gboolean utran_act;
+        gboolean eutran_act;
+        gboolean ngran_act;
+        guint    act_count;
+        gboolean result;
+        GError  *error = NULL;
+
+        result = mm_sim_parse_cpol_query_response (test_cpol[i].response,
+                                                   &index,
+                                                   &operator_code,
+                                                   &gsm_act,
+                                                   &gsm_compact_act,
+                                                   &utran_act,
+                                                   &eutran_act,
+                                                   &ngran_act,
+                                                   &act_count,
+                                                   &error);
+        if (test_cpol[i].expected_error) {
+            g_assert (!result);
+            g_assert (error);
+            g_error_free (error);
+        } else {
+            g_assert (result);
+            g_assert_no_error (error);
+            g_assert_cmpuint (index, ==, test_cpol[i].expected_index);
+            g_assert_cmpstr (operator_code, ==, test_cpol[i].expected_operator_code);
+            g_assert_cmpuint (gsm_act, ==, test_cpol[i].expected_gsm_act);
+            g_assert_cmpuint (gsm_compact_act, ==, test_cpol[i].expected_gsm_compact_act);
+            g_assert_cmpuint (utran_act, ==, test_cpol[i].expected_utran_act);
+            g_assert_cmpuint (eutran_act, ==, test_cpol[i].expected_eutran_act);
+            g_assert_cmpuint (ngran_act, ==, test_cpol[i].expected_ngran_act);
+            g_assert_cmpuint (act_count, ==, test_cpol[i].expected_act_count);
+        }
+        g_free (operator_code);
     }
 }
 
@@ -4525,6 +4668,7 @@ int main (int argc, char **argv)
     g_test_suite_add (suite, TESTCASE (test_cops_response_sek600i, NULL));
     g_test_suite_add (suite, TESTCASE (test_cops_response_samsung_z810, NULL));
     g_test_suite_add (suite, TESTCASE (test_cops_response_ublox_lara, NULL));
+    g_test_suite_add (suite, TESTCASE (test_cops_response_em9191, NULL));
 
     g_test_suite_add (suite, TESTCASE (test_cops_response_gsm_invalid, NULL));
     g_test_suite_add (suite, TESTCASE (test_cops_response_umts_invalid, NULL));
@@ -4635,7 +4779,7 @@ int main (int argc, char **argv)
     g_test_suite_add (suite, TESTCASE (test_cgdcont_read_response_nokia, NULL));
     g_test_suite_add (suite, TESTCASE (test_cgdcont_read_response_samsung, NULL));
 
-    g_test_suite_add (suite, TESTCASE (test_cid_selection, NULL));
+    g_test_suite_add (suite, TESTCASE (test_profile_selection, NULL));
 
     g_test_suite_add (suite, TESTCASE (test_cgact_read_response_none, NULL));
     g_test_suite_add (suite, TESTCASE (test_cgact_read_response_single_inactive, NULL));
@@ -4686,12 +4830,15 @@ int main (int argc, char **argv)
     g_test_suite_add (suite, TESTCASE (test_clcc_response_single, NULL));
     g_test_suite_add (suite, TESTCASE (test_clcc_response_single_long, NULL));
     g_test_suite_add (suite, TESTCASE (test_clcc_response_multiple, NULL));
+    g_test_suite_add (suite, TESTCASE (test_clcc_response_ignore_non_voice, NULL));
 
     g_test_suite_add (suite, TESTCASE (test_emergency_numbers, NULL));
 
     g_test_suite_add (suite, TESTCASE (test_parse_uint_list, NULL));
 
     g_test_suite_add (suite, TESTCASE (test_bcd_to_string, NULL));
+
+    g_test_suite_add (suite, TESTCASE (test_cpol_response, NULL));
 
     result = g_test_run ();
 

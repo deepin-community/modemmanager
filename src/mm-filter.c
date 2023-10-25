@@ -38,67 +38,93 @@ enum {
 
 struct _MMFilterPrivate {
     MMFilterRule  enabled_rules;
-    GList        *plugin_whitelist_tags;
-    GArray       *plugin_whitelist_vendor_ids;
-    GArray       *plugin_whitelist_product_ids;
+    GList        *plugin_allowlist_tags;
+    GArray       *plugin_allowlist_vendor_ids;
+    GArray       *plugin_allowlist_product_ids;
+    GArray       *plugin_allowlist_subsystem_vendor_ids;
 };
 
 /*****************************************************************************/
 
 void
-mm_filter_register_plugin_whitelist_tag (MMFilter    *self,
+mm_filter_register_plugin_allowlist_tag (MMFilter    *self,
                                          const gchar *tag)
 {
-    if (!g_list_find_custom (self->priv->plugin_whitelist_tags, tag, (GCompareFunc) g_strcmp0)) {
-        mm_obj_dbg (self, "registered plugin whitelist tag: %s", tag);
-        self->priv->plugin_whitelist_tags = g_list_prepend (self->priv->plugin_whitelist_tags, g_strdup (tag));
+    if (!g_list_find_custom (self->priv->plugin_allowlist_tags, tag, (GCompareFunc) g_strcmp0)) {
+        mm_obj_dbg (self, "registered plugin allowlist tag: %s", tag);
+        self->priv->plugin_allowlist_tags = g_list_prepend (self->priv->plugin_allowlist_tags, g_strdup (tag));
     }
 }
 
 void
-mm_filter_register_plugin_whitelist_vendor_id (MMFilter *self,
+mm_filter_register_plugin_allowlist_vendor_id (MMFilter *self,
                                                guint16   vid)
 {
     guint i;
 
-    if (!self->priv->plugin_whitelist_vendor_ids)
-        self->priv->plugin_whitelist_vendor_ids = g_array_sized_new (FALSE, FALSE, sizeof (guint16), 64);
+    if (!self->priv->plugin_allowlist_vendor_ids)
+        self->priv->plugin_allowlist_vendor_ids = g_array_sized_new (FALSE, FALSE, sizeof (guint16), 64);
 
-    for (i = 0; i < self->priv->plugin_whitelist_vendor_ids->len; i++) {
+    for (i = 0; i < self->priv->plugin_allowlist_vendor_ids->len; i++) {
         guint16 item;
 
-        item = g_array_index (self->priv->plugin_whitelist_vendor_ids, guint16, i);
+        item = g_array_index (self->priv->plugin_allowlist_vendor_ids, guint16, i);
         if (item == vid)
             return;
     }
 
-    g_array_append_val (self->priv->plugin_whitelist_vendor_ids, vid);
-    mm_obj_dbg (self, "registered plugin whitelist vendor id: %04x", vid);
+    g_array_append_val (self->priv->plugin_allowlist_vendor_ids, vid);
+    mm_obj_dbg (self, "registered plugin allowlist vendor id: %04x", vid);
 }
 
 void
-mm_filter_register_plugin_whitelist_product_id (MMFilter *self,
+mm_filter_register_plugin_allowlist_product_id (MMFilter *self,
                                                 guint16   vid,
                                                 guint16   pid)
 {
     mm_uint16_pair new_item;
     guint          i;
 
-    if (!self->priv->plugin_whitelist_product_ids)
-        self->priv->plugin_whitelist_product_ids = g_array_sized_new (FALSE, FALSE, sizeof (mm_uint16_pair), 10);
+    if (!self->priv->plugin_allowlist_product_ids)
+        self->priv->plugin_allowlist_product_ids = g_array_sized_new (FALSE, FALSE, sizeof (mm_uint16_pair), 10);
 
-    for (i = 0; i < self->priv->plugin_whitelist_product_ids->len; i++) {
+    for (i = 0; i < self->priv->plugin_allowlist_product_ids->len; i++) {
         mm_uint16_pair *item;
 
-        item = &g_array_index (self->priv->plugin_whitelist_product_ids, mm_uint16_pair, i);
+        item = &g_array_index (self->priv->plugin_allowlist_product_ids, mm_uint16_pair, i);
         if (item->l == vid && item->r == pid)
             return;
     }
 
     new_item.l = vid;
     new_item.r = pid;
-    g_array_append_val (self->priv->plugin_whitelist_product_ids, new_item);
-    mm_obj_dbg (self, "registered plugin whitelist product id: %04x:%04x", vid, pid);
+    g_array_append_val (self->priv->plugin_allowlist_product_ids, new_item);
+    mm_obj_dbg (self, "registered plugin allowlist product id: %04x:%04x", vid, pid);
+}
+
+void
+mm_filter_register_plugin_allowlist_subsystem_vendor_id (MMFilter *self,
+                                                         guint16   vid,
+                                                         guint16   subsystem_vid)
+{
+    mm_uint16_pair new_item;
+    guint          i;
+
+    if (!self->priv->plugin_allowlist_subsystem_vendor_ids)
+        self->priv->plugin_allowlist_subsystem_vendor_ids = g_array_sized_new (FALSE, FALSE, sizeof (mm_uint16_pair), 10);
+
+    for (i = 0; i < self->priv->plugin_allowlist_subsystem_vendor_ids->len; i++) {
+        mm_uint16_pair *item;
+
+        item = &g_array_index (self->priv->plugin_allowlist_subsystem_vendor_ids, mm_uint16_pair, i);
+        if (item->l == vid && item->r == subsystem_vid)
+            return;
+    }
+
+    new_item.l = vid;
+    new_item.r = subsystem_vid;
+    g_array_append_val (self->priv->plugin_allowlist_subsystem_vendor_ids, new_item);
+    mm_obj_dbg (self, "registered plugin allowlist subsystem vendor id: %04x:%04x", vid, subsystem_vid);
 }
 
 /*****************************************************************************/
@@ -114,68 +140,94 @@ mm_filter_port (MMFilter        *self,
     subsystem = mm_kernel_device_get_subsystem (port);
     name      = mm_kernel_device_get_name      (port);
 
-    /* If the device is explicitly whitelisted, we process every port. Also
+    /* If the device is explicitly allowlisted, we process every port. Also
      * allow specifying this flag per-port instead of for the full device, e.g.
      * for platform tty ports where there's only one port anyway. */
-    if ((self->priv->enabled_rules & MM_FILTER_RULE_EXPLICIT_WHITELIST) &&
+    if ((self->priv->enabled_rules & MM_FILTER_RULE_EXPLICIT_ALLOWLIST) &&
         (mm_kernel_device_get_global_property_as_boolean (port, ID_MM_DEVICE_PROCESS) ||
          mm_kernel_device_get_property_as_boolean (port, ID_MM_DEVICE_PROCESS))) {
-        mm_obj_dbg (self, "(%s/%s) port allowed: device is whitelisted", subsystem, name);
+        mm_obj_dbg (self, "(%s/%s) port allowed: device is allowlisted", subsystem, name);
         return TRUE;
     }
 
-    /* If the device is explicitly blacklisted, we ignore every port. */
-    if ((self->priv->enabled_rules & MM_FILTER_RULE_EXPLICIT_BLACKLIST) &&
+    /* If the device is explicitly ignored, we ignore every port. */
+    if ((self->priv->enabled_rules & MM_FILTER_RULE_EXPLICIT_BLOCKLIST) &&
         (mm_kernel_device_get_global_property_as_boolean (port, ID_MM_DEVICE_IGNORE))) {
-        mm_obj_dbg (self, "(%s/%s): port filtered: device is blacklisted", subsystem, name);
+        mm_obj_dbg (self, "(%s/%s): port filtered: device is blocklisted", subsystem, name);
         return FALSE;
     }
 
-    /* If the device is whitelisted by a plugin, we allow it. */
-    if (self->priv->enabled_rules & MM_FILTER_RULE_PLUGIN_WHITELIST) {
+    /* If the device is allowlisted by a plugin, we allow it. */
+    if (self->priv->enabled_rules & MM_FILTER_RULE_PLUGIN_ALLOWLIST) {
         GList   *l;
         guint16  vid = 0;
         guint16  pid = 0;
+        guint16  subsystem_vid = 0;
 
-        for (l = self->priv->plugin_whitelist_tags; l; l = g_list_next (l)) {
+        for (l = self->priv->plugin_allowlist_tags; l; l = g_list_next (l)) {
             if (mm_kernel_device_get_global_property_as_boolean (port, (const gchar *)(l->data)) ||
                 mm_kernel_device_get_property_as_boolean (port, (const gchar *)(l->data))) {
-                mm_obj_dbg (self, "(%s/%s) port allowed: device is whitelisted by plugin (tag)", subsystem, name);
+                mm_obj_dbg (self, "(%s/%s) port allowed: device is allowlisted by plugin (tag)", subsystem, name);
                 return TRUE;
             }
         }
 
         vid = mm_kernel_device_get_physdev_vid (port);
-        if (vid)
+        if (vid) {
             pid = mm_kernel_device_get_physdev_pid (port);
+            subsystem_vid = mm_kernel_device_get_physdev_subsystem_vid (port);
+        }
 
-        if (vid && pid && self->priv->plugin_whitelist_product_ids) {
+        if (vid && pid && self->priv->plugin_allowlist_product_ids) {
             guint i;
 
-            for (i = 0; i < self->priv->plugin_whitelist_product_ids->len; i++) {
+            for (i = 0; i < self->priv->plugin_allowlist_product_ids->len; i++) {
                 mm_uint16_pair *item;
 
-                item = &g_array_index (self->priv->plugin_whitelist_product_ids, mm_uint16_pair, i);
+                item = &g_array_index (self->priv->plugin_allowlist_product_ids, mm_uint16_pair, i);
                 if (item->l == vid && item->r == pid) {
-                    mm_obj_dbg (self, "(%s/%s) port allowed: device is whitelisted by plugin (vid/pid)", subsystem, name);
+                    mm_obj_dbg (self, "(%s/%s) port allowed: device is allowlisted by plugin (vid/pid)", subsystem, name);
                     return TRUE;
                 }
             }
         }
 
-        if (vid && self->priv->plugin_whitelist_vendor_ids) {
+        if (vid && self->priv->plugin_allowlist_vendor_ids) {
             guint i;
 
-            for (i = 0; i < self->priv->plugin_whitelist_vendor_ids->len; i++) {
+            for (i = 0; i < self->priv->plugin_allowlist_vendor_ids->len; i++) {
                 guint16 item;
 
-                item = g_array_index (self->priv->plugin_whitelist_vendor_ids, guint16, i);
+                item = g_array_index (self->priv->plugin_allowlist_vendor_ids, guint16, i);
                 if (item == vid) {
-                    mm_obj_dbg (self, "(%s/%s) port allowed: device is whitelisted by plugin (vid)", subsystem, name);
+                    mm_obj_dbg (self, "(%s/%s) port allowed: device is allowlisted by plugin (vid)", subsystem, name);
                     return TRUE;
                 }
             }
         }
+
+        if (vid && subsystem_vid && self->priv->plugin_allowlist_subsystem_vendor_ids) {
+            guint i;
+
+            for (i = 0; i < self->priv->plugin_allowlist_subsystem_vendor_ids->len; i++) {
+                mm_uint16_pair *item;
+
+                item = &g_array_index (self->priv->plugin_allowlist_subsystem_vendor_ids, mm_uint16_pair, i);
+                if (item->l == vid && item->r == subsystem_vid) {
+                    mm_obj_dbg (self, "(%s/%s) port allowed: device is allowlisted by plugin (vid/subsystem vid)", subsystem, name);
+                    return TRUE;
+                }
+            }
+        }
+    }
+
+    /* If this is a QRTR device, we always allow it. This check comes before
+     * checking for VIRTUAL since qrtr devices don't have a sysfs path, and the
+     * check for VIRTUAL will return FALSE. */
+    if ((self->priv->enabled_rules & MM_FILTER_RULE_QRTR) &&
+        g_str_equal (subsystem, "qrtr")) {
+        mm_obj_dbg (self, "(%s/%s) port allowed: qrtr device", subsystem, name);
+        return TRUE;
     }
 
     /* If this is a virtual device, don't allow it */
@@ -193,10 +245,23 @@ mm_filter_port (MMFilter        *self,
     }
 
     /* If this is a cdc-wdm device, we always allow it */
-    if ((self->priv->enabled_rules & MM_FILTER_RULE_CDC_WDM) &&
-        (g_strcmp0 (subsystem, "usb") == 0 || g_strcmp0 (subsystem, "usbmisc") == 0) &&
-        (name && g_str_has_prefix (name, "cdc-wdm"))) {
-        mm_obj_dbg (self, "(%s/%s) port allowed: cdc-wdm device", subsystem, name);
+    if ((self->priv->enabled_rules & MM_FILTER_RULE_USBMISC) &&
+        (g_strcmp0 (subsystem, "usbmisc") == 0)) {
+        mm_obj_dbg (self, "(%s/%s) port allowed: usbmisc device", subsystem, name);
+        return TRUE;
+    }
+
+    /* If this is a rpmsg channel device, we always allow it */
+    if ((self->priv->enabled_rules & MM_FILTER_RULE_RPMSG) &&
+        (g_strcmp0 (subsystem, "rpmsg") == 0)) {
+        mm_obj_dbg (self, "(%s/%s) port allowed: rpmsg device", subsystem, name);
+        return TRUE;
+    }
+
+    /* If this is a wwan port/device, we always allow it */
+    if ((self->priv->enabled_rules & MM_FILTER_RULE_WWAN) &&
+        (g_strcmp0 (subsystem, "wwan") == 0)) {
+        mm_obj_dbg (self, "(%s/%s) port allowed: wwan device", subsystem, name);
         return TRUE;
     }
 
@@ -206,26 +271,9 @@ mm_filter_port (MMFilter        *self,
         const gchar *physdev_subsystem;
         const gchar *driver;
 
-        /* Blacklist rules first */
+        /* Mixed blocklist/allowlist rules */
 
-        /* Ignore blacklisted tty devices. */
-        if ((self->priv->enabled_rules & MM_FILTER_RULE_TTY_BLACKLIST) &&
-            (mm_kernel_device_get_global_property_as_boolean (port, ID_MM_TTY_BLACKLIST))) {
-            mm_obj_dbg (self, "(%s/%s): port filtered: tty is blacklisted", subsystem, name);
-            return FALSE;
-        }
-
-        /* Is the device in the manual-only greylist? If so, return if this is an
-         * automatic scan. */
-        if ((self->priv->enabled_rules & MM_FILTER_RULE_TTY_MANUAL_SCAN_ONLY) &&
-            (!manual_scan && mm_kernel_device_get_global_property_as_boolean (port, ID_MM_TTY_MANUAL_SCAN_ONLY))) {
-            mm_obj_dbg (self, "(%s/%s): port filtered: tty probed only in manual scan", subsystem, name);
-            return FALSE;
-        }
-
-        /* Mixed blacklist/whitelist rules */
-
-        /* If the physdev is a 'platform' or 'pnp' device that's not whitelisted, ignore it */
+        /* If the physdev is a 'platform' or 'pnp' device that's not allowlisted, ignore it */
         physdev_subsystem = mm_kernel_device_get_physdev_subsystem (port);
         if ((self->priv->enabled_rules & MM_FILTER_RULE_TTY_PLATFORM_DRIVER) &&
             (!g_strcmp0 (physdev_subsystem, "platform") ||
@@ -236,18 +284,13 @@ mm_filter_port (MMFilter        *self,
             return FALSE;
         }
 
-        /* Default allowed? */
-        if (self->priv->enabled_rules & MM_FILTER_RULE_TTY_DEFAULT_ALLOWED) {
-            mm_obj_dbg (self, "(%s/%s) port allowed", subsystem, name);
-            return TRUE;
-        }
-
-        /* Whitelist rules last */
+        /* Allowlist rules last */
 
         /* If the TTY kernel driver is one expected modem kernel driver, allow it */
         driver = mm_kernel_device_get_driver (port);
         if ((self->priv->enabled_rules & MM_FILTER_RULE_TTY_DRIVER) &&
-            (!g_strcmp0 (driver, "option1") ||
+            (!g_strcmp0 (driver, "option") ||
+             !g_strcmp0 (driver, "option1") ||
              !g_strcmp0 (driver, "qcserial") ||
              !g_strcmp0 (driver, "qcaux") ||
              !g_strcmp0 (driver, "nozomi") ||
@@ -415,11 +458,8 @@ log_object_build_id (MMLogObject *_self)
 
 /*****************************************************************************/
 
-/* If TTY rule enabled, either DEFAULT_ALLOWED or DEFAULT_FORBIDDEN must be set. */
-#define VALIDATE_RULE_TTY(rules) (!(rules & MM_FILTER_RULE_TTY) || \
-                                  ((rules & (MM_FILTER_RULE_TTY_DEFAULT_ALLOWED | MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)) && \
-                                   ((rules & (MM_FILTER_RULE_TTY_DEFAULT_ALLOWED | MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)) != \
-                                    (MM_FILTER_RULE_TTY_DEFAULT_ALLOWED | MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN))))
+/* If TTY rule enabled, DEFAULT_FORBIDDEN must be set. */
+#define VALIDATE_RULE_TTY(rules) (!(rules & MM_FILTER_RULE_TTY) || (rules & (MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)))
 
 MMFilter *
 mm_filter_new (MMFilterRule   enabled_rules,
@@ -444,23 +484,22 @@ mm_filter_new (MMFilterRule   enabled_rules,
 #define RULE_ENABLED_STR(flag) ((self->priv->enabled_rules & flag) ? "yes" : "no")
 
     mm_obj_dbg (self, "created");
-    mm_obj_dbg (self, "  explicit whitelist:         %s", RULE_ENABLED_STR (MM_FILTER_RULE_EXPLICIT_WHITELIST));
-    mm_obj_dbg (self, "  explicit blacklist:         %s", RULE_ENABLED_STR (MM_FILTER_RULE_EXPLICIT_BLACKLIST));
-    mm_obj_dbg (self, "  plugin whitelist:           %s", RULE_ENABLED_STR (MM_FILTER_RULE_PLUGIN_WHITELIST));
+    mm_obj_dbg (self, "  explicit allowlist:         %s", RULE_ENABLED_STR (MM_FILTER_RULE_EXPLICIT_ALLOWLIST));
+    mm_obj_dbg (self, "  explicit blocklist:         %s", RULE_ENABLED_STR (MM_FILTER_RULE_EXPLICIT_BLOCKLIST));
+    mm_obj_dbg (self, "  plugin allowlist:           %s", RULE_ENABLED_STR (MM_FILTER_RULE_PLUGIN_ALLOWLIST));
+    mm_obj_dbg (self, "  qrtr devices allowed:       %s", RULE_ENABLED_STR (MM_FILTER_RULE_QRTR));
     mm_obj_dbg (self, "  virtual devices forbidden:  %s", RULE_ENABLED_STR (MM_FILTER_RULE_VIRTUAL));
     mm_obj_dbg (self, "  net devices allowed:        %s", RULE_ENABLED_STR (MM_FILTER_RULE_NET));
-    mm_obj_dbg (self, "  cdc-wdm devices allowed:    %s", RULE_ENABLED_STR (MM_FILTER_RULE_CDC_WDM));
+    mm_obj_dbg (self, "  usbmisc devices allowed:    %s", RULE_ENABLED_STR (MM_FILTER_RULE_USBMISC));
+    mm_obj_dbg (self, "  rpmsg devices allowed:      %s", RULE_ENABLED_STR (MM_FILTER_RULE_RPMSG));
+    mm_obj_dbg (self, "  wwan devices allowed:       %s", RULE_ENABLED_STR (MM_FILTER_RULE_WWAN));
     if (self->priv->enabled_rules & MM_FILTER_RULE_TTY) {
         mm_obj_dbg (self, "  tty devices:");
-        mm_obj_dbg (self, "      blacklist applied:        %s", RULE_ENABLED_STR (MM_FILTER_RULE_TTY_BLACKLIST));
-        mm_obj_dbg (self, "      manual scan only applied: %s", RULE_ENABLED_STR (MM_FILTER_RULE_TTY_MANUAL_SCAN_ONLY));
         mm_obj_dbg (self, "      platform driver check:    %s", RULE_ENABLED_STR (MM_FILTER_RULE_TTY_PLATFORM_DRIVER));
         mm_obj_dbg (self, "      driver check:             %s", RULE_ENABLED_STR (MM_FILTER_RULE_TTY_DRIVER));
         mm_obj_dbg (self, "      cdc-acm interface check:  %s", RULE_ENABLED_STR (MM_FILTER_RULE_TTY_ACM_INTERFACE));
         mm_obj_dbg (self, "      with net check:           %s", RULE_ENABLED_STR (MM_FILTER_RULE_TTY_WITH_NET));
-        if (self->priv->enabled_rules & MM_FILTER_RULE_TTY_DEFAULT_ALLOWED)
-            mm_obj_dbg (self, "      default:                  allowed");
-        else if (self->priv->enabled_rules & MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)
+        if (self->priv->enabled_rules & MM_FILTER_RULE_TTY_DEFAULT_FORBIDDEN)
             mm_obj_dbg (self, "      default:                  forbidden");
         else
             g_assert_not_reached ();
@@ -519,9 +558,10 @@ finalize (GObject *object)
 {
     MMFilter *self = MM_FILTER (object);
 
-    g_clear_pointer (&self->priv->plugin_whitelist_vendor_ids, g_array_unref);
-    g_clear_pointer (&self->priv->plugin_whitelist_product_ids, g_array_unref);
-    g_list_free_full (self->priv->plugin_whitelist_tags, g_free);
+    g_clear_pointer (&self->priv->plugin_allowlist_vendor_ids, g_array_unref);
+    g_clear_pointer (&self->priv->plugin_allowlist_product_ids, g_array_unref);
+    g_clear_pointer (&self->priv->plugin_allowlist_subsystem_vendor_ids, g_array_unref);
+    g_list_free_full (self->priv->plugin_allowlist_tags, g_free);
 
     G_OBJECT_CLASS (mm_filter_parent_class)->finalize (object);
 }

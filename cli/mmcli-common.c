@@ -121,6 +121,7 @@ get_object_lookup_info (const gchar  *str,
                         const gchar  *object_prefix,
                         gchar       **object_path,
                         gchar       **modem_uid,
+                        gchar       **modem_physdev,
                         gboolean     *find_any)
 {
     gboolean all_numeric;
@@ -132,16 +133,19 @@ get_object_lookup_info (const gchar  *str,
         exit (EXIT_FAILURE);
     }
 
-    /* User string may come in four ways:
+    /* User string may come in five ways:
      *   a) full DBus path
      *   b) object index
      *   c) modem UID (for modem or SIM lookup only)
-     *   d) "any" string (for modem or SIM lookup only)
+     *   c) modem physdev path (for modem lookup only)
+     *   e) "any" string (for modem or SIM lookup only)
      */
 
     *object_path = NULL;
     if (modem_uid)
         *modem_uid  = NULL;
+    if (modem_physdev)
+        *modem_physdev = NULL;
     if (find_any)
         *find_any = FALSE;
 
@@ -174,6 +178,13 @@ get_object_lookup_info (const gchar  *str,
         return;
     }
 
+    /* If starts with / we have the physdev path */
+    if (g_str_has_prefix (str, "/")) {
+        g_debug ("Assuming '%s' is the %s physdev path", str, object_type);
+        *modem_physdev = g_strdup (str);
+        return;
+    }
+
     /* Otherwise we have the UID */
     if (modem_uid) {
         g_debug ("Assuming '%s' is the modem UID", str);
@@ -193,6 +204,7 @@ static MMObject *
 find_modem (MMManager   *manager,
             const gchar *modem_path,
             const gchar *modem_uid,
+            const gchar *modem_physdev,
             gboolean     modem_any)
 {
     GList *modems;
@@ -211,7 +223,8 @@ find_modem (MMManager   *manager,
 
         if (modem_any ||
             (modem_path && g_str_equal (mm_object_get_path (obj), modem_path)) ||
-            (modem_uid && g_str_equal (mm_modem_get_device (modem), modem_uid))) {
+            (modem_uid && g_str_equal (mm_modem_get_device (modem), modem_uid)) ||
+            (modem_physdev && g_str_equal (mm_modem_get_physdev (modem), modem_physdev))) {
             found = g_object_ref (obj);
             break;
         }
@@ -231,6 +244,7 @@ find_modem (MMManager   *manager,
 typedef struct {
     gchar    *modem_path;
     gchar    *modem_uid;
+    gchar    *modem_physdev;
     gboolean  modem_any;
 } GetModemContext;
 
@@ -252,6 +266,7 @@ get_modem_context_free (GetModemContext *ctx)
 {
     g_free (ctx->modem_path);
     g_free (ctx->modem_uid);
+    g_free (ctx->modem_physdev);
     g_free (ctx);
 }
 
@@ -283,7 +298,7 @@ get_manager_ready (GDBusConnection *connection,
 
     results = g_new (GetModemResults, 1);
     results->manager = mmcli_get_manager_finish (res);
-    results->object = find_modem (results->manager, ctx->modem_path, ctx->modem_uid, ctx->modem_any);
+    results->object = find_modem (results->manager, ctx->modem_path, ctx->modem_uid, ctx->modem_physdev, ctx->modem_any);
     g_task_return_pointer (task, results, (GDestroyNotify)get_modem_results_free);
     g_object_unref (task);
 }
@@ -302,8 +317,8 @@ mmcli_get_modem (GDBusConnection     *connection,
 
     ctx = g_new0 (GetModemContext, 1);
     get_object_lookup_info (str, "modem", MM_DBUS_MODEM_PREFIX,
-                            &ctx->modem_path, &ctx->modem_uid, &ctx->modem_any);
-    g_assert (!!ctx->modem_path + !!ctx->modem_uid + ctx->modem_any == 1);
+                            &ctx->modem_path, &ctx->modem_uid, &ctx->modem_physdev, &ctx->modem_any);
+    g_assert (!!ctx->modem_path + !!ctx->modem_uid + !!ctx->modem_physdev + ctx->modem_any == 1);
     g_task_set_task_data (task, ctx, (GDestroyNotify) get_modem_context_free);
 
     mmcli_get_manager (connection,
@@ -321,13 +336,14 @@ mmcli_get_modem_sync (GDBusConnection  *connection,
     MMObject *found;
     gchar *modem_path = NULL;
     gchar *modem_uid = NULL;
+    gchar *modem_physdev = NULL;
     gboolean modem_any = FALSE;
 
     manager = mmcli_get_manager_sync (connection);
     get_object_lookup_info (str, "modem", MM_DBUS_MODEM_PREFIX,
-                            &modem_path, &modem_uid, &modem_any);
-    g_assert (!!modem_path + !!modem_uid + modem_any == 1);
-    found = find_modem (manager, modem_path, modem_uid, modem_any);
+                            &modem_path, &modem_uid, &modem_physdev, &modem_any);
+    g_assert (!!modem_path + !!modem_uid + !!modem_physdev + modem_any == 1);
+    found = find_modem (manager, modem_path, modem_uid, modem_physdev, modem_any);
 
     if (o_manager)
         *o_manager = manager;
@@ -335,6 +351,7 @@ mmcli_get_modem_sync (GDBusConnection  *connection,
         g_object_unref (manager);
     g_free (modem_path);
     g_free (modem_uid);
+    g_free (modem_physdev);
 
     return found;
 }
@@ -592,7 +609,7 @@ mmcli_get_bearer (GDBusConnection     *connection,
 
     ctx = g_new0 (GetBearerContext, 1);
     get_object_lookup_info (str, "bearer", MM_DBUS_BEARER_PREFIX,
-                            &ctx->bearer_path, NULL, NULL);
+                            &ctx->bearer_path, NULL, NULL, NULL);
     g_assert (ctx->bearer_path);
     g_task_set_task_data (task, ctx, (GDestroyNotify) get_bearer_context_free);
 
@@ -615,7 +632,7 @@ mmcli_get_bearer_sync (GDBusConnection  *connection,
     gchar *bearer_path = NULL;
 
     get_object_lookup_info (str, "bearer", MM_DBUS_BEARER_PREFIX,
-                            &bearer_path, NULL, NULL);
+                            &bearer_path, NULL, NULL, NULL);
     g_assert (bearer_path);
 
     manager = mmcli_get_manager_sync (connection);
@@ -750,6 +767,53 @@ mmcli_get_sim_finish (GAsyncResult  *res,
 }
 
 static void
+list_sim_slots_ready (MMModem      *modem,
+                      GAsyncResult *res,
+                      GTask        *task)
+{
+    g_autoptr(GPtrArray)  sim_slots = NULL;
+    GetSimContext        *ctx;
+    GetSimResults        *results = NULL;
+    guint                 i;
+    GError               *error = NULL;
+
+    ctx = g_task_get_task_data (task);
+
+    sim_slots = mm_modem_list_sim_slots_finish (modem, res, &error);
+    if (error) {
+        g_printerr ("error: couldn't list SIM slots at '%s': '%s'\n",
+                    mm_modem_get_path (modem),
+                    error->message);
+        exit (EXIT_FAILURE);
+    }
+
+    for (i = 0; i < sim_slots->len; i++) {
+        MMSim *sim;
+
+        sim = MM_SIM (g_ptr_array_index (sim_slots, i));
+        if (sim && g_str_equal (mm_sim_get_path (sim), ctx->sim_path)) {
+            /* Found! */
+            results = g_new (GetSimResults, 1);
+            results->manager = g_object_ref (ctx->manager);
+            results->object  = g_object_ref (ctx->current);
+            results->sim     = g_object_ref (sim);
+            break;
+        }
+    }
+
+    if (results) {
+        g_task_return_pointer (task, results, (GDestroyNotify) get_sim_results_free);
+        g_object_unref (task);
+        return;
+    }
+
+    g_printerr ("error: couldn't get additional SIM '%s' at '%s'\n",
+                ctx->sim_path,
+                mm_modem_get_path (modem));
+    exit (EXIT_FAILURE);
+}
+
+static void
 get_sim_ready (MMModem      *modem,
                GAsyncResult *res,
                GTask        *task)
@@ -800,11 +864,13 @@ get_sim_manager_ready (GDBusConnection *connection,
     }
 
     for (l = modems; l && !ctx->current; l = g_list_next (l)) {
-        MMObject *object;
-        MMModem  *modem;
+        MMObject           *object;
+        MMModem            *modem;
+        const gchar *const *sim_slot_paths;
 
         object = MM_OBJECT (l->data);
         modem = mm_object_get_modem (object);
+        sim_slot_paths = mm_modem_get_sim_slot_paths (modem);
 
         /* check if we can match the first object found */
         if (ctx->sim_any) {
@@ -828,6 +894,19 @@ get_sim_manager_ready (GDBusConnection *connection,
                               g_task_get_cancellable (task),
                               (GAsyncReadyCallback)get_sim_ready,
                               task);
+        } else if (sim_slot_paths) {
+            guint i;
+
+            for (i = 0; sim_slot_paths[i]; i++) {
+                if (g_str_equal (ctx->sim_path, sim_slot_paths[i])) {
+                    ctx->current = g_object_ref (object);
+                    mm_modem_list_sim_slots (modem,
+                                             g_task_get_cancellable (task),
+                                             (GAsyncReadyCallback)list_sim_slots_ready,
+                                             task);
+                    break;
+                }
+            }
         }
         g_object_unref (modem);
     }
@@ -853,7 +932,7 @@ mmcli_get_sim (GDBusConnection     *connection,
 
     ctx = g_new0 (GetSimContext, 1);
     get_object_lookup_info (str, "SIM", MM_DBUS_SIM_PREFIX,
-                            &ctx->sim_path, &ctx->modem_uid, &ctx->sim_any);
+                            &ctx->sim_path, &ctx->modem_uid, NULL, &ctx->sim_any);
     g_assert (!!ctx->sim_path + !!ctx->modem_uid + ctx->sim_any == 1);
     g_task_set_task_data (task, ctx, (GDestroyNotify) get_sim_context_free);
 
@@ -878,7 +957,7 @@ mmcli_get_sim_sync (GDBusConnection  *connection,
     gboolean sim_any = FALSE;
 
     get_object_lookup_info (str, "SIM", MM_DBUS_SIM_PREFIX,
-                            &sim_path, &modem_uid, &sim_any);
+                            &sim_path, &modem_uid, NULL, &sim_any);
     g_assert (!!sim_path + !!modem_uid + sim_any == 1);
 
     manager = mmcli_get_manager_sync (connection);
@@ -890,12 +969,14 @@ mmcli_get_sim_sync (GDBusConnection  *connection,
     }
 
     for (l = modems; !found && l; l = g_list_next (l)) {
-        GError *error = NULL;
-        MMObject *object;
-        MMModem *modem;
+        GError             *error = NULL;
+        MMObject           *object;
+        MMModem            *modem;
+        const gchar *const *sim_slot_paths;
 
         object = MM_OBJECT (l->data);
         modem = mm_object_get_modem (object);
+        sim_slot_paths = mm_modem_get_sim_slot_paths (modem);
 
         /* check if we can match the first object found */
         if (sim_any) {
@@ -925,6 +1006,34 @@ mmcli_get_sim_sync (GDBusConnection  *connection,
 
             if (found && o_object)
                 *o_object = g_object_ref (object);
+        } else if (sim_slot_paths) {
+            guint i;
+
+            for (i = 0; !found && sim_slot_paths[i]; i++) {
+                if (g_str_equal (sim_path, sim_slot_paths[i])) {
+                    g_autoptr(GPtrArray) sim_slots = NULL;
+                    guint                j;
+
+                    sim_slots = mm_modem_list_sim_slots_sync (modem, NULL, &error);
+                    if (error) {
+                        g_printerr ("error: couldn't get SIM slots in modem '%s': '%s'\n",
+                                    mm_modem_get_path (modem),
+                                    error->message);
+                        exit (EXIT_FAILURE);
+                    }
+
+                    for (j = 0; j < sim_slots->len; j++) {
+                        MMSim *sim;
+
+                        sim = MM_SIM (g_ptr_array_index (sim_slots, j));
+                        if (sim && g_str_equal (sim_path, mm_sim_get_path (sim))) {
+                            found = g_object_ref (sim);
+                            if (o_object)
+                                *o_object = g_object_ref (object);
+                        }
+                    }
+                }
+            }
         }
 
         g_object_unref (modem);
@@ -1130,7 +1239,7 @@ mmcli_get_sms (GDBusConnection     *connection,
 
     ctx = g_new0 (GetSmsContext, 1);
     get_object_lookup_info (str, "SMS", MM_DBUS_SMS_PREFIX,
-                            &ctx->sms_path, NULL, NULL);
+                            &ctx->sms_path, NULL, NULL, NULL);
     g_task_set_task_data (task, ctx, (GDestroyNotify) get_sms_context_free);
 
     mmcli_get_manager (connection,
@@ -1152,7 +1261,7 @@ mmcli_get_sms_sync (GDBusConnection  *connection,
     gchar *sms_path = NULL;
 
     get_object_lookup_info (str, "SMS", MM_DBUS_SMS_PREFIX,
-                            &sms_path, NULL, NULL);
+                            &sms_path, NULL, NULL, NULL);
 
     manager = mmcli_get_manager_sync (connection);
     modems = g_dbus_object_manager_get_objects (G_DBUS_OBJECT_MANAGER (manager));
@@ -1393,7 +1502,7 @@ mmcli_get_call (GDBusConnection     *connection,
 
     ctx = g_new0 (GetCallContext, 1);
     get_object_lookup_info (str, "call", MM_DBUS_CALL_PREFIX,
-                            &ctx->call_path, NULL, NULL);
+                            &ctx->call_path, NULL, NULL, NULL);
     g_task_set_task_data (task, ctx, (GDestroyNotify) get_call_context_free);
 
     mmcli_get_manager (connection,
@@ -1415,7 +1524,7 @@ mmcli_get_call_sync (GDBusConnection  *connection,
     gchar *call_path = NULL;
 
     get_object_lookup_info (str, "call", MM_DBUS_CALL_PREFIX,
-                            &call_path, NULL, NULL);
+                            &call_path, NULL, NULL, NULL);
 
     manager = mmcli_get_manager_sync (connection);
     modems = g_dbus_object_manager_get_objects (G_DBUS_OBJECT_MANAGER (manager));

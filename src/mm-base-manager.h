@@ -18,6 +18,8 @@
 #ifndef MM_BASE_MANAGER_H
 #define MM_BASE_MANAGER_H
 
+#include <config.h>
+
 #include <glib-object.h>
 #include <gio/gio.h>
 
@@ -34,9 +36,11 @@
 #define MM_BASE_MANAGER_CONNECTION            "connection"            /* Construct-only */
 #define MM_BASE_MANAGER_AUTO_SCAN             "auto-scan"             /* Construct-only */
 #define MM_BASE_MANAGER_FILTER_POLICY         "filter-policy"         /* Construct-only */
-#define MM_BASE_MANAGER_ENABLE_TEST           "enable-test"           /* Construct-only */
 #define MM_BASE_MANAGER_PLUGIN_DIR            "plugin-dir"            /* Construct-only */
 #define MM_BASE_MANAGER_INITIAL_KERNEL_EVENTS "initial-kernel-events" /* Construct-only */
+#if defined WITH_TESTS
+#define MM_BASE_MANAGER_ENABLE_TEST           "enable-test"           /* Construct-only */
+#endif
 
 typedef struct _MMBaseManagerPrivate MMBaseManagerPrivate;
 
@@ -53,11 +57,15 @@ GType mm_base_manager_get_type (void);
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (MMBaseManager, g_object_unref)
 
 MMBaseManager   *mm_base_manager_new         (GDBusConnection  *bus,
+#if !defined WITH_BUILTIN_PLUGINS
                                               const gchar      *plugin_dir,
+#endif
                                               gboolean          auto_scan,
                                               MMFilterRule      filter_policy,
                                               const gchar      *initial_kernel_events,
+#if defined WITH_TESTS
                                               gboolean          enable_test,
+#endif
                                               GError          **error);
 
 void             mm_base_manager_start       (MMBaseManager *manager,
@@ -65,6 +73,10 @@ void             mm_base_manager_start       (MMBaseManager *manager,
 
 void             mm_base_manager_shutdown    (MMBaseManager *manager,
                                               gboolean disable);
+
+#if defined WITH_SUSPEND_RESUME
+void             mm_base_manager_sync        (MMBaseManager *manager);
+#endif
 
 guint32          mm_base_manager_num_modems  (MMBaseManager *manager);
 
