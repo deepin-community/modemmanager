@@ -1,3 +1,58 @@
+modemmanager (1.24.2-1) unstable; urgency=medium
+
+  * New upstream release (Closes: #1110197)
+  * d/control: drop Rules-Requires-Root.
+    This is no longer needed.
+
+ -- Arnaud Ferraris <aferraris@debian.org>  Mon, 11 Aug 2025 12:00:42 +0200
+
+modemmanager (1.24.0-1) unstable; urgency=medium
+
+  * New upstream release. Final release of RC already in Trixie.
+  * libmm-glib0: Update symbols
+  * d/control: Bump libmbim and libqmi versions.
+    Depend on the final versions rather than the RCs.
+
+ -- Guido Günther <agx@sigxcpu.org>  Fri, 11 Apr 2025 23:32:31 +0200
+
+modemmanager (1.23.95-2) unstable; urgency=medium
+
+  * Upload to unstable
+  * Bump standards version to 4.7.2
+
+ -- Guido Günther <agx@sigxcpu.org>  Thu, 13 Mar 2025 14:34:38 +0100
+
+modemmanager (1.23.95-1) experimental; urgency=medium
+
+  * New upstream version 1.23.95
+  * Add superficial autopktests
+  * Bump libqmi and libmbim build dependencies
+  * Update symbols
+  * Bump standards version
+  * Depend on dh-sequence-gir
+
+ -- Guido Günther <agx@sigxcpu.org>  Tue, 11 Mar 2025 17:49:57 +0100
+
+modemmanager (1.23.12-1) experimental; urgency=medium
+
+  [ Arnaud Ferraris ]
+  * d/control: depend on gobject-introspection-bin.
+    This is now the package containing `dh_girepository`, having been split
+    from `gobject-introspection`.
+    Fixes: lintian: missing-build-dependency-for-dh-addon gir
+
+  [ Jeremy Bicha ]
+  * Drop unnecessary Build-Depends: gnome-common, intltool, libtool
+
+  [ Guido Günther ]
+  * gbp.conf: Use branches that don't conflict with released versions
+  * New upstream version 1.23.12
+  * docs: README got renamed to README.md
+  * Update symbols
+  * d/control: Bump libqmi build-dep
+
+ -- Guido Günther <agx@sigxcpu.org>  Tue, 25 Feb 2025 15:19:33 +0100
+
 modemmanager (1.22.0-3) unstable; urgency=medium
 
   [ Jeremy Bícha ]

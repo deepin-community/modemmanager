@@ -36,6 +36,7 @@
 
 #include "mm-log-object.h"
 #include "mm-port-enums-types.h"
+#include "mm-daemon-enums-types.h"
 #include "mm-serial-parsers.h"
 #include "mm-modem-helpers.h"
 
@@ -59,6 +60,8 @@ enum {
     PROP_VENDOR_ID,
     PROP_PRODUCT_ID,
     PROP_SUBSYSTEM_VENDOR_ID,
+    PROP_SUBSYSTEM_DEVICE_ID,
+
     PROP_CONNECTION,
     PROP_REPROBE,
     PROP_DATA_NET_SUPPORTED,
@@ -84,6 +87,7 @@ struct _MMBaseModemPrivate {
      * should be done by the modem. */
     GCancellable *cancellable;
     gulong invalid_if_cancelled;
+    guint  invalid_from_idle;
 
     gchar *device;
     gchar *physdev;
@@ -93,10 +97,12 @@ struct _MMBaseModemPrivate {
     guint vendor_id;
     guint product_id;
     guint subsystem_vendor_id;
+    guint subsystem_device_id;
 
     gboolean hotplugged;
     gboolean valid;
     gboolean reprobe;
+    gboolean torn_down;
 
     guint max_timeouts;
 
@@ -121,10 +127,6 @@ struct _MMBaseModemPrivate {
     /* Some audio-capable devices will have a port for audio specifically */
     MMPortSerial *audio;
 
-    /* Support for parallel enable/disable operations */
-    GList *enable_tasks;
-    GList *disable_tasks;
-
 #if defined WITH_QMI
     /* QMI ports */
     GList *qmi;
@@ -138,6 +140,14 @@ struct _MMBaseModemPrivate {
     /* Additional port links grabbed after having
      * organized ports */
     GHashTable *link_ports;
+
+    /* Scheduled operations. The forbidden_forever flag will be set to TRUE
+     * if an "override" operation is requested, and will never be set to FALSE
+     * back, it is expected the modem object will eventually be removed after
+     * the operation has finished,
+     */
+    GList    *scheduled_operations;
+    gboolean  scheduled_operations_forbidden_forever;
 };
 
 guint
@@ -198,10 +208,10 @@ base_modem_create_net_port (MMBaseModem *self,
 }
 
 static MMPort *
-base_modem_create_tty_port (MMBaseModem        *self,
-                            const gchar        *name,
-                            MMKernelDevice     *kernel_device,
-                            MMPortType          ptype)
+base_modem_create_tty_port (MMBaseModem    *self,
+                            const gchar    *name,
+                            MMKernelDevice *kernel_device,
+                            MMPortType      ptype)
 {
     MMPort      *port = NULL;
     const gchar *flow_control_tag;
@@ -314,6 +324,13 @@ base_modem_create_wwan_port (MMBaseModem *self,
     if (ptype == MM_PORT_TYPE_AT)
         return MM_PORT (mm_port_serial_at_new (name, MM_PORT_SUBSYS_WWAN));
 
+    if (ptype == MM_PORT_TYPE_XMMRPC)
+        return MM_PORT (g_object_new (MM_TYPE_PORT,
+                                      MM_PORT_DEVICE, name,
+                                      MM_PORT_SUBSYS, MM_PORT_SUBSYS_WWAN,
+                                      MM_PORT_TYPE, MM_PORT_TYPE_XMMRPC,
+                                      NULL));
+
     return NULL;
 }
 
@@ -356,6 +373,10 @@ base_modem_internal_grab_port (MMBaseModem         *self,
         return NULL;
     }
 
+    g_assert (MM_BASE_MODEM_GET_CLASS (self)->create_tty_port);
+    g_assert (MM_BASE_MODEM_GET_CLASS (self)->create_usbmisc_port);
+    g_assert (MM_BASE_MODEM_GET_CLASS (self)->create_wwan_port);
+
     /* Explicitly ignored ports, grab them but explicitly flag them as ignored
      * right away, all the same way (i.e. regardless of subsystem). */
     if (ptype == MM_PORT_TYPE_IGNORED)
@@ -363,9 +384,9 @@ base_modem_internal_grab_port (MMBaseModem         *self,
     else if (g_str_equal (subsys, "net"))
         port = base_modem_create_net_port (self, name);
     else if (g_str_equal (subsys, "tty"))
-        port = base_modem_create_tty_port (self, name, kernel_device, ptype);
+        port = MM_BASE_MODEM_GET_CLASS (self)->create_tty_port (self, name, kernel_device, ptype);
     else if (g_str_equal (subsys, "usbmisc"))
-        port = base_modem_create_usbmisc_port (self, name, ptype);
+        port = MM_BASE_MODEM_GET_CLASS (self)->create_usbmisc_port (self, name, ptype);
     else if (g_str_equal (subsys, "rpmsg"))
         port = base_modem_create_rpmsg_port (self, name, ptype);
 #if defined WITH_QRTR
@@ -375,7 +396,7 @@ base_modem_internal_grab_port (MMBaseModem         *self,
     else if (g_str_equal (subsys, "virtual"))
         port = base_modem_create_virtual_port (self, name);
     else if (g_str_equal (subsys, "wwan"))
-        port = base_modem_create_wwan_port (self, name, ptype);
+        port = MM_BASE_MODEM_GET_CLASS (self)->create_wwan_port (self, name, ptype);
 
     if (!port) {
         g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
@@ -701,6 +722,175 @@ mm_base_modem_wait_link_port (MMBaseModem         *self,
 }
 
 /******************************************************************************/
+/* Common support to perform state update/sync operations with the base modem. */
+
+typedef enum {
+    STATE_OPERATION_TYPE_INITIALIZE,
+    STATE_OPERATION_TYPE_ENABLE,
+    STATE_OPERATION_TYPE_DISABLE,
+#if defined WITH_SUSPEND_RESUME
+    STATE_OPERATION_TYPE_SYNC,
+    STATE_OPERATION_TYPE_TERSE,
+#endif
+} StateOperationType;
+
+typedef struct {
+    StateOperation       operation;
+    StateOperationFinish operation_finish;
+    gssize               operation_id;
+} StateOperationContext;
+
+static void
+state_operation_context_free (StateOperationContext *ctx)
+{
+    g_assert (ctx->operation_id < 0);
+    g_slice_free (StateOperationContext, ctx);
+}
+
+static gboolean
+state_operation_finish (MMBaseModem   *self,
+                        GAsyncResult  *res,
+                        GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+state_operation_ready (MMBaseModem  *self,
+                       GAsyncResult *res,
+                       GTask        *task)
+{
+    GError *error = NULL;
+
+    StateOperationContext *ctx;
+
+    ctx = g_task_get_task_data (task);
+
+    if (ctx->operation_id >= 0) {
+        mm_base_modem_operation_unlock (self, ctx->operation_id);
+        ctx->operation_id = (gssize) -1;
+    }
+
+    if (!ctx->operation_finish (self, res, &error))
+        g_task_return_error (task, error);
+    else
+        g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+state_operation_run (GTask *task)
+{
+    MMBaseModem           *self;
+    StateOperationContext *ctx;
+
+    self = g_task_get_source_object (task);
+    ctx  = g_task_get_task_data (task);
+
+    ctx->operation (self,
+                    self->priv->cancellable,
+                    (GAsyncReadyCallback) state_operation_ready,
+                    task);
+}
+
+static void
+lock_before_state_operation_ready (MMBaseModem  *self,
+                                   GAsyncResult *res,
+                                   GTask        *task)
+{
+    GError                *error = NULL;
+    StateOperationContext *ctx;
+
+    ctx = g_task_get_task_data (task);
+
+    ctx->operation_id = mm_base_modem_operation_lock_finish (self, res, &error);
+    if (ctx->operation_id < 0) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    state_operation_run (task);
+}
+
+static void
+state_operation (MMBaseModem                  *self,
+                 StateOperationType            operation_type,
+                 MMBaseModemOperationLock      operation_lock,
+                 MMBaseModemOperationPriority  operation_priority,
+                 GAsyncReadyCallback           callback,
+                 gpointer                      user_data)
+{
+    GTask                 *task;
+    StateOperationContext *ctx;
+    gboolean               optional;
+    const gchar           *operation_description;
+
+    ctx = g_slice_new0 (StateOperationContext);
+    ctx->operation_id = (gssize) -1;
+
+    /* configure operation to run */
+    switch (operation_type) {
+        case STATE_OPERATION_TYPE_INITIALIZE:
+            operation_description = "initialization";
+            optional = FALSE;
+            ctx->operation        = MM_BASE_MODEM_GET_CLASS (self)->initialize;
+            ctx->operation_finish = MM_BASE_MODEM_GET_CLASS (self)->initialize_finish;
+            break;
+        case STATE_OPERATION_TYPE_ENABLE:
+            operation_description = "enabling";
+            optional = FALSE;
+            ctx->operation        = MM_BASE_MODEM_GET_CLASS (self)->enable;
+            ctx->operation_finish = MM_BASE_MODEM_GET_CLASS (self)->enable_finish;
+            break;
+        case STATE_OPERATION_TYPE_DISABLE:
+            operation_description = "disabling";
+            optional = FALSE;
+            ctx->operation        = MM_BASE_MODEM_GET_CLASS (self)->disable;
+            ctx->operation_finish = MM_BASE_MODEM_GET_CLASS (self)->disable_finish;
+            break;
+#if defined WITH_SUSPEND_RESUME
+        case STATE_OPERATION_TYPE_SYNC:
+            operation_description = "sync";
+            optional = TRUE;
+            ctx->operation        = MM_BASE_MODEM_GET_CLASS (self)->sync;
+            ctx->operation_finish = MM_BASE_MODEM_GET_CLASS (self)->sync_finish;
+            break;
+        case STATE_OPERATION_TYPE_TERSE:
+            operation_description = "terse";
+            optional = TRUE;
+            ctx->operation        = MM_BASE_MODEM_GET_CLASS (self)->terse;
+            ctx->operation_finish = MM_BASE_MODEM_GET_CLASS (self)->terse_finish;
+            break;
+#endif
+        default:
+            g_assert_not_reached ();
+    }
+
+    task = g_task_new (self, NULL, callback, user_data);
+    g_task_set_task_data (task, ctx, (GDestroyNotify) state_operation_context_free);
+
+    if (optional && (!ctx->operation || !ctx->operation_finish)) {
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED, "Unsupported");
+        g_object_unref (task);
+        return;
+    }
+    g_assert (ctx->operation && ctx->operation_finish);
+
+    if (operation_lock == MM_BASE_MODEM_OPERATION_LOCK_ALREADY_ACQUIRED) {
+        state_operation_run (task);
+        return;
+    }
+
+    g_assert (operation_lock == MM_BASE_MODEM_OPERATION_LOCK_REQUIRED);
+    mm_base_modem_operation_lock (self,
+                                  operation_priority,
+                                  operation_description,
+                                  (GAsyncReadyCallback) lock_before_state_operation_ready,
+                                  task);
+}
+
+/******************************************************************************/
 
 #if defined WITH_SUSPEND_RESUME
 
@@ -709,43 +899,43 @@ mm_base_modem_sync_finish (MMBaseModem   *self,
                            GAsyncResult  *res,
                            GError       **error)
 {
-    return g_task_propagate_boolean (G_TASK (res), error);
-}
-
-static void
-sync_ready (MMBaseModem  *self,
-            GAsyncResult *res,
-            GTask        *task)
-{
-    GError *error = NULL;
-
-    if (!MM_BASE_MODEM_GET_CLASS (self)->sync_finish (self, res, &error))
-        g_task_return_error (task, error);
-    else
-        g_task_return_boolean (task, TRUE);
-    g_object_unref (task);
+    return state_operation_finish (self, res, error);
 }
 
 void
-mm_base_modem_sync (MMBaseModem         *self,
-                    GAsyncReadyCallback  callback,
-                    gpointer             user_data)
+mm_base_modem_sync (MMBaseModem              *self,
+                    MMBaseModemOperationLock  operation_lock,
+                    GAsyncReadyCallback       callback,
+                    gpointer                  user_data)
 {
-    GTask *task;
+    state_operation (self,
+                     STATE_OPERATION_TYPE_SYNC,
+                     operation_lock,
+                     MM_BASE_MODEM_OPERATION_PRIORITY_DEFAULT,
+                     callback,
+                     user_data);
+}
 
-    task = g_task_new (self, NULL, callback, user_data);
+gboolean
+mm_base_modem_terse_finish (MMBaseModem   *self,
+                            GAsyncResult  *res,
+                            GError       **error)
+{
+    return state_operation_finish (self, res, error);
+}
 
-    if (!MM_BASE_MODEM_GET_CLASS (self)->sync ||
-        !MM_BASE_MODEM_GET_CLASS (self)->sync_finish) {
-        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_UNSUPPORTED,
-                                 "Suspend/resume quick synchronization unsupported");
-        g_object_unref (task);
-        return;
-    }
-
-    MM_BASE_MODEM_GET_CLASS (self)->sync (self,
-                                          (GAsyncReadyCallback) sync_ready,
-                                          task);
+void
+mm_base_modem_terse (MMBaseModem              *self,
+                     MMBaseModemOperationLock  operation_lock,
+                     GAsyncReadyCallback       callback,
+                     gpointer                  user_data)
+{
+    state_operation (self,
+                     STATE_OPERATION_TYPE_TERSE,
+                     operation_lock,
+                     MM_BASE_MODEM_OPERATION_PRIORITY_DEFAULT,
+                     callback,
+                     user_data);
 }
 
 #endif /* WITH_SUSPEND_RESUME */
@@ -757,143 +947,73 @@ mm_base_modem_disable_finish (MMBaseModem   *self,
                               GAsyncResult  *res,
                               GError       **error)
 {
-    return g_task_propagate_boolean (G_TASK (res), error);
-}
-
-static void
-disable_ready (MMBaseModem  *self,
-               GAsyncResult *res)
-{
-    GError *error = NULL;
-    GList  *l;
-    GList  *disable_tasks;
-
-    g_assert (self->priv->disable_tasks);
-    disable_tasks = self->priv->disable_tasks;
-    self->priv->disable_tasks = NULL;
-
-    MM_BASE_MODEM_GET_CLASS (self)->disable_finish (self, res, &error);
-    for (l = disable_tasks; l; l = g_list_next (l)) {
-        if (error)
-            g_task_return_error (G_TASK (l->data), g_error_copy (error));
-        else
-            g_task_return_boolean (G_TASK (l->data), TRUE);
-    }
-    g_clear_error (&error);
-
-    g_list_free_full (disable_tasks, g_object_unref);
+    return state_operation_finish (self, res, error);
 }
 
 void
-mm_base_modem_disable (MMBaseModem         *self,
-                       GAsyncReadyCallback  callback,
-                       gpointer             user_data)
+mm_base_modem_disable (MMBaseModem                  *self,
+                       MMBaseModemOperationLock      operation_lock,
+                       MMBaseModemOperationPriority  operation_priority,
+                       GAsyncReadyCallback           callback,
+                       gpointer                      user_data)
 {
-    GTask    *task;
-    gboolean  run_disable;
-
-    g_assert (MM_BASE_MODEM_GET_CLASS (self)->disable != NULL);
-    g_assert (MM_BASE_MODEM_GET_CLASS (self)->disable_finish != NULL);
-
-    /* If the list of disable tasks is empty, we need to run */
-    run_disable = !self->priv->disable_tasks;
-
-    /* Store task */
-    task = g_task_new (self, self->priv->cancellable, callback, user_data);
-    self->priv->disable_tasks = g_list_append (self->priv->disable_tasks, task);
-
-    if (!run_disable)
-        return;
-
-    MM_BASE_MODEM_GET_CLASS (self)->disable (
-        self,
-        self->priv->cancellable,
-        (GAsyncReadyCallback) disable_ready,
-        NULL);
+    state_operation (self,
+                     STATE_OPERATION_TYPE_DISABLE,
+                     operation_lock,
+                     operation_priority,
+                     callback,
+                     user_data);
 }
+
+/******************************************************************************/
 
 gboolean
 mm_base_modem_enable_finish (MMBaseModem   *self,
                              GAsyncResult  *res,
                              GError       **error)
 {
-    return g_task_propagate_boolean (G_TASK (res), error);
-}
-
-static void
-enable_ready (MMBaseModem  *self,
-              GAsyncResult *res)
-{
-    GError *error = NULL;
-    GList  *l;
-    GList  *enable_tasks;
-
-    g_assert (self->priv->enable_tasks);
-    enable_tasks = self->priv->enable_tasks;
-    self->priv->enable_tasks = NULL;
-
-    MM_BASE_MODEM_GET_CLASS (self)->enable_finish (self, res, &error);
-    for (l = enable_tasks; l; l = g_list_next (l)) {
-        if (error)
-            g_task_return_error (G_TASK (l->data), g_error_copy (error));
-        else
-            g_task_return_boolean (G_TASK (l->data), TRUE);
-    }
-    g_clear_error (&error);
-
-    g_list_free_full (enable_tasks, g_object_unref);
+    return state_operation_finish (self, res, error);
 }
 
 void
-mm_base_modem_enable (MMBaseModem         *self,
-                      GAsyncReadyCallback  callback,
-                      gpointer             user_data)
+mm_base_modem_enable (MMBaseModem              *self,
+                      MMBaseModemOperationLock  operation_lock,
+                      GAsyncReadyCallback       callback,
+                      gpointer                  user_data)
 {
-    GTask    *task;
-    gboolean  run_enable;
-
-    g_assert (MM_BASE_MODEM_GET_CLASS (self)->enable != NULL);
-    g_assert (MM_BASE_MODEM_GET_CLASS (self)->enable_finish != NULL);
-
-    /* If the list of enable tasks is empty, we need to run */
-    run_enable = !self->priv->enable_tasks;
-
-    /* Store task */
-    task = g_task_new (self, self->priv->cancellable, callback, user_data);
-    self->priv->enable_tasks = g_list_append (self->priv->enable_tasks, task);
-
-    if (!run_enable)
-        return;
-
-    MM_BASE_MODEM_GET_CLASS (self)->enable (
-        self,
-        self->priv->cancellable,
-        (GAsyncReadyCallback) enable_ready,
-        NULL);
+    state_operation (self,
+                     STATE_OPERATION_TYPE_ENABLE,
+                     operation_lock,
+                     MM_BASE_MODEM_OPERATION_PRIORITY_DEFAULT,
+                     callback,
+                     user_data);
 }
+
+/******************************************************************************/
 
 gboolean
-mm_base_modem_initialize_finish (MMBaseModem *self,
-                                 GAsyncResult *res,
-                                 GError **error)
+mm_base_modem_initialize_finish (MMBaseModem   *self,
+                                 GAsyncResult  *res,
+                                 GError       **error)
 {
-    return MM_BASE_MODEM_GET_CLASS (self)->initialize_finish (self, res, error);
+    return state_operation_finish (self, res, error);
 }
 
 void
-mm_base_modem_initialize (MMBaseModem *self,
-                          GAsyncReadyCallback callback,
-                          gpointer user_data)
+mm_base_modem_initialize (MMBaseModem              *self,
+                          MMBaseModemOperationLock  operation_lock,
+                          GAsyncReadyCallback       callback,
+                          gpointer                  user_data)
 {
-    g_assert (MM_BASE_MODEM_GET_CLASS (self)->initialize != NULL);
-    g_assert (MM_BASE_MODEM_GET_CLASS (self)->initialize_finish != NULL);
-
-    MM_BASE_MODEM_GET_CLASS (self)->initialize (
-        self,
-        self->priv->cancellable,
-        callback,
-        user_data);
+    state_operation (self,
+                     STATE_OPERATION_TYPE_INITIALIZE,
+                     operation_lock,
+                     MM_BASE_MODEM_OPERATION_PRIORITY_DEFAULT,
+                     callback,
+                     user_data);
 }
+
+/******************************************************************************/
 
 void
 mm_base_modem_set_hotplugged (MMBaseModem *self,
@@ -1102,57 +1222,69 @@ mm_base_modem_peek_data_ports (MMBaseModem *self)
     return self->priv->data;
 }
 
-MMPortSerialAt *
-mm_base_modem_get_best_at_port (MMBaseModem *self,
-                                GError **error)
+MMIfacePortAt *
+mm_base_modem_get_best_at_port (MMBaseModem  *self,
+                                GError      **error)
 {
-    MMPortSerialAt *best;
+    MMIfacePortAt *best;
 
     best = mm_base_modem_peek_best_at_port (self, error);
     return (best ? g_object_ref (best) : NULL);
 }
 
-MMPortSerialAt *
-mm_base_modem_peek_best_at_port (MMBaseModem *self,
-                                 GError **error)
+MMIfacePortAt *
+mm_base_modem_peek_best_at_port (MMBaseModem  *self,
+                                 GError      **error)
 {
+    gboolean supported;
+
+#if defined WITH_MBIM
+    /* Prefer an AT-capable MBIM port instead of a serial port */
+    if (self->priv->mbim) {
+        GList *l;
+
+        for (l = self->priv->mbim; l; l = g_list_next (l)) {
+            if (MM_IS_IFACE_PORT_AT (l->data) &&
+                mm_iface_port_at_check_support (MM_IFACE_PORT_AT (l->data), &supported, NULL) &&
+                supported)
+                return MM_IFACE_PORT_AT (l->data);
+        }
+    }
+#endif
+
+#if defined WITH_QMI
+    /* Prefer an AT-capable QMI port instead of a serial port */
+    if (self->priv->qmi) {
+        GList *l;
+
+        for (l = self->priv->qmi; l; l = g_list_next (l)) {
+            if (MM_IS_IFACE_PORT_AT (l->data) &&
+                mm_iface_port_at_check_support (MM_IFACE_PORT_AT (l->data), &supported, NULL) &&
+                supported)
+                return MM_IFACE_PORT_AT (l->data);
+        }
+    }
+#endif
+
     /* Decide which port to use */
-    if (self->priv->primary &&
-        !mm_port_get_connected (MM_PORT (self->priv->primary)))
-        return self->priv->primary;
+    if (self->priv->primary && !mm_port_get_connected (MM_PORT (self->priv->primary))) {
+        g_assert (MM_IS_IFACE_PORT_AT (self->priv->primary));
+        g_assert (mm_iface_port_at_check_support (MM_IFACE_PORT_AT (self->priv->primary), &supported, NULL) && supported);
+        return MM_IFACE_PORT_AT (self->priv->primary);
+    }
 
     /* If primary port is connected, check if we can get the secondary
      * port */
-    if (self->priv->secondary &&
-        !mm_port_get_connected (MM_PORT (self->priv->secondary)))
-        return self->priv->secondary;
-
-    /* Otherwise, we cannot get any port */
-    g_set_error (error,
-                 MM_CORE_ERROR,
-                 MM_CORE_ERROR_CONNECTED,
-                 "No AT port available to run command");
-    return NULL;
-}
-
-gboolean
-mm_base_modem_has_at_port (MMBaseModem *self)
-{
-    GHashTableIter iter;
-    gpointer value;
-    gpointer key;
-
-    if (!self->priv->ports)
-        return FALSE;
-
-    /* We'll iterate the ht of ports, looking for any port which is AT */
-    g_hash_table_iter_init (&iter, self->priv->ports);
-    while (g_hash_table_iter_next (&iter, &key, &value)) {
-        if (MM_IS_PORT_SERIAL_AT (value))
-            return TRUE;
+    if (self->priv->secondary && !mm_port_get_connected (MM_PORT (self->priv->secondary))) {
+        g_assert (MM_IS_IFACE_PORT_AT (self->priv->secondary));
+        g_assert (mm_iface_port_at_check_support (MM_IFACE_PORT_AT (self->priv->secondary), &supported, NULL) && supported);
+        return MM_IFACE_PORT_AT (self->priv->secondary);
     }
 
-    return FALSE;
+    /* Otherwise, we cannot get any port */
+    g_set_error (error, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
+                 "No AT port available to run command");
+    return NULL;
 }
 
 static gint
@@ -1204,6 +1336,9 @@ mm_base_modem_get_port_infos (MMBaseModem *self,
             break;
         case MM_PORT_TYPE_MBIM:
             port_info.type = MM_MODEM_PORT_TYPE_MBIM;
+            break;
+        case MM_PORT_TYPE_XMMRPC:
+            port_info.type = MM_MODEM_PORT_TYPE_XMMRPC;
             break;
         case MM_PORT_TYPE_IGNORED:
             port_info.type = MM_MODEM_PORT_TYPE_IGNORED;
@@ -1304,27 +1439,6 @@ mm_base_modem_get_port (MMBaseModem *self,
     return (port ? g_object_ref (port) : NULL);
 }
 
-static void
-initialize_ready (MMBaseModem *self,
-                  GAsyncResult *res)
-{
-    g_autoptr(GError) error = NULL;
-
-    if (!mm_base_modem_initialize_finish (self, res, &error)) {
-        if (g_error_matches (error, MM_CORE_ERROR, MM_CORE_ERROR_ABORTED)) {
-            /* FATAL error, won't even be exported in DBus */
-            mm_obj_err (self, "fatal error initializing: %s", error->message);
-        } else {
-            /* non-fatal error */
-            mm_obj_warn (self, "error initializing: %s", error->message);
-            mm_base_modem_set_valid (self, TRUE);
-        }
-    } else {
-        mm_obj_dbg (self, "modem initialized");
-        mm_base_modem_set_valid (self, TRUE);
-    }
-}
-
 static inline void
 log_port (MMBaseModem *self,
           MMPort      *port,
@@ -1355,6 +1469,7 @@ mm_base_modem_organize_ports (MMBaseModem *self,
     MMPortSerialGps *gps = NULL;
     MMPortSerial *audio = NULL;
     MMPortSerialAt *data_at_primary = NULL;
+    MMPort *xmmrpc = NULL;
     GList *l;
     /* These lists don't keep full references, so they should be
      * g_list_free()-ed on error exits */
@@ -1448,6 +1563,12 @@ mm_base_modem_organize_ports (MMBaseModem *self,
             g_assert (MM_IS_PORT_SERIAL (candidate));
             if (!audio)
                 audio = MM_PORT_SERIAL (candidate);
+            break;
+
+        case MM_PORT_TYPE_XMMRPC:
+            g_assert (MM_IS_PORT (candidate));
+            if (!xmmrpc)
+                xmmrpc = MM_PORT (candidate);
             break;
 
 #if defined WITH_QMI
@@ -1577,6 +1698,7 @@ mm_base_modem_organize_ports (MMBaseModem *self,
     log_port (self, MM_PORT (gps_control),     "gps (control)");
     log_port (self, MM_PORT (gps),             "gps (nmea)");
     log_port (self, MM_PORT (audio),           "audio");
+    log_port (self, MM_PORT (xmmrpc),          "xmmrpc");
 #if defined WITH_QMI
     for (l = qmi; l; l = g_list_next (l))
         log_port (self, MM_PORT (l->data),     "qmi");
@@ -1633,16 +1755,8 @@ mm_base_modem_organize_ports (MMBaseModem *self,
         g_assert (MM_IS_PORT_NET (self->priv->data->data));
         /* let the MMPortQmi know which net driver is being used, taken
          * from the first item in the net port list */
-        g_list_foreach (qmi,
-                        (GFunc)mm_port_qmi_set_net_driver,
-                        (gpointer) mm_kernel_device_get_driver (
-                            mm_port_peek_kernel_device (
-                                MM_PORT (self->priv->data->data))));
-        g_list_foreach (qmi,
-                        (GFunc)mm_port_qmi_set_net_sysfs_path,
-                        (gpointer) mm_kernel_device_get_sysfs_path (
-                            mm_port_peek_kernel_device (
-                                MM_PORT (self->priv->data->data))));
+        g_list_foreach (qmi, (GFunc)mm_port_qmi_set_net_details, (gpointer) MM_PORT (self->priv->data->data));
+
         g_list_foreach (qmi, (GFunc)g_object_ref, NULL);
         self->priv->qmi = g_steal_pointer (&qmi);
     }
@@ -1654,11 +1768,6 @@ mm_base_modem_organize_ports (MMBaseModem *self,
         self->priv->mbim = g_steal_pointer (&mbim);
     }
 #endif
-
-    /* As soon as we get the ports organized, we initialize the modem */
-    mm_base_modem_initialize (self,
-                              (GAsyncReadyCallback)initialize_ready,
-                              NULL);
 
     return TRUE;
 }
@@ -1713,6 +1822,277 @@ mm_base_modem_authorize (MMBaseModem *self,
                                 self->priv->authp_cancellable,
                                 (GAsyncReadyCallback)authorize_ready,
                                 task);
+}
+
+/*****************************************************************************/
+/* Exclusive operation */
+
+typedef struct {
+    gssize                        id;
+    MMBaseModemOperationPriority  priority;
+    gchar                        *description;
+    GTask                        *wait_task;
+} OperationInfo;
+
+static void
+operation_info_free (OperationInfo *info)
+{
+    g_assert (!info->wait_task);
+    g_free (info->description);
+    g_slice_free (OperationInfo, info);
+}
+
+/* Exclusive operation lock */
+
+gssize
+mm_base_modem_operation_lock_finish (MMBaseModem   *self,
+                                     GAsyncResult  *res,
+                                     GError       **error)
+{
+    return g_task_propagate_int (G_TASK (res), error);
+}
+
+static void
+base_modem_operation_run (MMBaseModem *self)
+{
+    OperationInfo *info;
+    GTask         *task;
+
+    if (!self->priv->scheduled_operations)
+        return;
+
+    /* Do nothing if head operation is already running */
+    info = (OperationInfo *)(self->priv->scheduled_operations->data);
+    if (!info->wait_task)
+        return;
+
+    /* Run the operation in head of the list */
+    mm_obj_dbg (self, "[operation %" G_GSSIZE_FORMAT "] %s - %s: lock acquired",
+                info->id,
+                mm_base_modem_operation_priority_get_string (info->priority),
+                info->description);
+    task = g_steal_pointer (&info->wait_task);
+    g_task_return_int (task, info->id);
+    g_object_unref (task);
+}
+
+static gboolean
+abort_pending_operation_in_idle_cb (GTask *task)
+{
+    g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_ABORTED,
+                             "Operation aborted");
+    g_object_unref (task);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+abort_pending_operations (MMBaseModem *self)
+{
+    GList *head = NULL;
+    GList *abort_operations;
+
+    /* Steal the whole list before iterating it */
+    abort_operations = g_steal_pointer (&self->priv->scheduled_operations);
+
+    while (abort_operations) {
+        OperationInfo *info;
+        GTask         *task;
+
+        info = (OperationInfo *)(abort_operations->data);
+
+        /* Head operation may already be running, we should not abort that one */
+        if (!info->wait_task) {
+            /* Keep the head item as a single-element list */
+            g_assert (!head);
+            head = abort_operations;
+            abort_operations = g_list_remove_link (abort_operations, head);
+            continue;
+        }
+
+        g_assert (info->wait_task);
+        mm_obj_dbg (self, "[operation %" G_GSSIZE_FORMAT "] %s - %s: aborted early",
+                    info->id,
+                    mm_base_modem_operation_priority_get_string (info->priority),
+                    info->description);
+
+        task = g_steal_pointer (&info->wait_task);
+        g_idle_add ((GSourceFunc) abort_pending_operation_in_idle_cb, task);
+        abort_operations = g_list_delete_link (abort_operations, abort_operations);
+        operation_info_free (info);
+    }
+
+    /* Keep the running head, if any, in the list of scheduled operations */
+    self->priv->scheduled_operations = head;
+}
+
+void
+mm_base_modem_operation_lock (MMBaseModem                   *self,
+                              MMBaseModemOperationPriority   priority,
+                              const gchar                   *description,
+                              GAsyncReadyCallback            callback,
+                              gpointer                       user_data)
+{
+    GTask          *task;
+    OperationInfo  *info;
+    static gssize   operation_id = 0;
+
+    task = g_task_new (self, NULL, callback, user_data);
+    if (self->priv->scheduled_operations_forbidden_forever) {
+        mm_obj_dbg (self, "operation forbidden as override has already been requested");
+        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_ABORTED,
+                                 "Operation aborted");
+        g_object_unref (task);
+        return;
+    }
+
+    info = g_slice_new0 (OperationInfo);
+    info->id = operation_id;
+    info->priority = priority;
+    info->description = g_strdup (description);
+    info->wait_task = task;
+
+    if (operation_id == G_MAXSSIZE) {
+        mm_obj_dbg (self, "operation id reset");
+        operation_id = 0;
+    } else
+        operation_id++;
+
+    if (info->priority == MM_BASE_MODEM_OPERATION_PRIORITY_OVERRIDE) {
+        mm_obj_dbg (self, "[operation %" G_GSSIZE_FORMAT "] %s - %s: override requested - no new operations will be allowed",
+                    info->id,
+                    mm_base_modem_operation_priority_get_string (info->priority),
+                    info->description);
+        g_assert (!self->priv->scheduled_operations_forbidden_forever);
+        self->priv->scheduled_operations_forbidden_forever = TRUE;
+        abort_pending_operations (self);
+        self->priv->scheduled_operations = g_list_append (self->priv->scheduled_operations, info);
+    } else if (info->priority == MM_BASE_MODEM_OPERATION_PRIORITY_DEFAULT) {
+        mm_obj_dbg (self, "[operation %" G_GSSIZE_FORMAT "] %s - %s: scheduled",
+                    info->id,
+                    mm_base_modem_operation_priority_get_string (info->priority),
+                    info->description);
+        self->priv->scheduled_operations = g_list_append (self->priv->scheduled_operations, info);
+    } else
+        g_assert_not_reached ();
+
+    base_modem_operation_run (self);
+}
+
+/* Exclusive operation unlock */
+
+void
+mm_base_modem_operation_unlock (MMBaseModem *self,
+                                gssize       operation_id)
+{
+    OperationInfo *info;
+
+    g_assert (self->priv->scheduled_operations);
+
+    info = (OperationInfo *)(self->priv->scheduled_operations->data);
+    g_assert (!info->wait_task);
+    g_assert (info->id == operation_id);
+
+    mm_obj_dbg (self, "[operation %" G_GSSIZE_FORMAT "] %s - %s: lock released",
+                info->id,
+                mm_base_modem_operation_priority_get_string (info->priority),
+                info->description);
+
+    /* Remove head list item and free its contents */
+    self->priv->scheduled_operations = g_list_delete_link (self->priv->scheduled_operations,
+                                                           self->priv->scheduled_operations);
+    operation_info_free (info);
+
+    /* Run next, if any */
+    base_modem_operation_run (self);
+}
+
+/*****************************************************************************/
+
+typedef struct {
+    GDBusMethodInvocation        *invocation;
+    MMBaseModemOperationPriority  operation_priority;
+    gchar                        *operation_description;
+} AuthorizeAndOperationLockContext;
+
+static void
+authorize_and_operation_lock_context_free (AuthorizeAndOperationLockContext *ctx)
+{
+    g_object_unref (ctx->invocation);
+    g_free (ctx->operation_description);
+    g_slice_free (AuthorizeAndOperationLockContext, ctx);
+}
+
+gssize
+mm_base_modem_authorize_and_operation_lock_finish (MMBaseModem   *self,
+                                                   GAsyncResult  *res,
+                                                   GError       **error)
+{
+    return g_task_propagate_int (G_TASK (res), error);
+}
+
+static void
+lock_after_authorize_ready (MMBaseModem  *self,
+                            GAsyncResult *res,
+                            GTask        *task)
+{
+    GError *error = NULL;
+    gssize  operation_id;
+
+    operation_id = mm_base_modem_operation_lock_finish (self, res, &error);
+    if (operation_id < 0)
+        g_task_return_error (task, error);
+    else
+        g_task_return_int (task, operation_id);
+    g_object_unref (task);
+}
+
+static void
+authorize_before_lock_ready (MMBaseModem  *self,
+                             GAsyncResult *res,
+                             GTask        *task)
+{
+    GError                           *error = NULL;
+    AuthorizeAndOperationLockContext *ctx;
+
+    if (!mm_base_modem_authorize_finish (self, res, &error)) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    ctx = g_task_get_task_data (task);
+    mm_base_modem_operation_lock (self,
+                                  ctx->operation_priority,
+                                  ctx->operation_description,
+                                  (GAsyncReadyCallback) lock_after_authorize_ready,
+                                  task);
+}
+
+void
+mm_base_modem_authorize_and_operation_lock (MMBaseModem                  *self,
+                                            GDBusMethodInvocation        *invocation,
+                                            const gchar                  *authorization,
+                                            MMBaseModemOperationPriority  operation_priority,
+                                            const gchar                  *operation_description,
+                                            GAsyncReadyCallback           callback,
+                                            gpointer                      user_data)
+{
+    GTask                            *task;
+    AuthorizeAndOperationLockContext *ctx;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    ctx = g_slice_new0 (AuthorizeAndOperationLockContext);
+    ctx->invocation = g_object_ref (invocation);
+    ctx->operation_priority = operation_priority;
+    ctx->operation_description = g_strdup (operation_description);
+    g_task_set_task_data (task, ctx, (GDestroyNotify)authorize_and_operation_lock_context_free);
+
+    mm_base_modem_authorize (self,
+                             invocation,
+                             authorization,
+                             (GAsyncReadyCallback)authorize_before_lock_ready,
+                             task);
 }
 
 /*****************************************************************************/
@@ -1773,15 +2153,32 @@ mm_base_modem_get_subsystem_vendor_id (MMBaseModem *self)
     return self->priv->subsystem_vendor_id;
 }
 
+guint
+mm_base_modem_get_subsystem_device_id (MMBaseModem *self)
+{
+    g_return_val_if_fail (MM_IS_BASE_MODEM (self), 0);
+
+    return self->priv->subsystem_device_id;
+}
+
 /*****************************************************************************/
+
+static void
+clear_invalid_from_idle (MMBaseModem *self)
+{
+    if (self->priv->invalid_from_idle)
+        g_source_remove (self->priv->invalid_from_idle);
+    self->priv->invalid_from_idle = 0;
+}
 
 static gboolean
 base_modem_invalid_idle (MMBaseModem *self)
 {
+    clear_invalid_from_idle (self);
+
     /* Ensure the modem is set invalid if we get the modem-wide cancellable
      * cancelled */
     mm_base_modem_set_valid (self, FALSE);
-    g_object_unref (self);
     return G_SOURCE_REMOVE;
 }
 
@@ -1789,9 +2186,14 @@ static void
 base_modem_cancelled (GCancellable *cancellable,
                       MMBaseModem *self)
 {
+    clear_invalid_from_idle (self);
+
     /* NOTE: Don't call set_valid() directly here, do it in an idle, and ensure
      * that we pass a valid reference of the modem object as context. */
-    g_idle_add ((GSourceFunc)base_modem_invalid_idle, g_object_ref (self));
+    self->priv->invalid_from_idle = g_idle_add_full (G_PRIORITY_DEFAULT_IDLE,
+                                                     (GSourceFunc)base_modem_invalid_idle,
+                                                     g_object_ref (self),
+                                                     (GDestroyNotify) g_object_unref);
 }
 
 /*****************************************************************************/
@@ -1803,9 +2205,107 @@ setup_ports_table (GHashTable **ht)
     *ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_object_unref);
 }
 
+typedef struct {
+    volatile gint  refcount;
+    GError        *error;
+    /* The Context owns the GTask so that we can ensure the Task returns only
+     * when all ports are closed. The reference count tracks open ports and
+     * the context will return the Task when it reaches zero (indicating all
+     * outstanding operations are complete and ports are closed).
+     */
+    GTask         *task;
+} TeardownContext;
+
+static TeardownContext *
+teardown_context_new (GObject             *source_object,
+                      GAsyncReadyCallback  callback,
+                      gpointer             user_data)
+{
+    TeardownContext *ctx;
+
+    ctx = g_slice_new0 (TeardownContext);
+    ctx->refcount = 1;
+    ctx->task = g_task_new (source_object, NULL, callback, user_data);
+    return ctx;
+}
+
 static void
-cleanup_modem_port (MMBaseModem *self,
-                    MMPort      *port)
+teardown_context_ref (TeardownContext *ctx)
+{
+    g_atomic_int_inc (&ctx->refcount);
+}
+
+static void
+teardown_context_unref (TeardownContext *ctx)
+{
+    if (g_atomic_int_dec_and_test (&ctx->refcount)) {
+        if (ctx->error)
+            g_task_return_error (ctx->task, g_steal_pointer (&ctx->error));
+        else
+            g_task_return_boolean (ctx->task, TRUE);
+        g_clear_object (&ctx->task);
+        g_slice_free (TeardownContext, ctx);
+    }
+}
+
+#if defined (WITH_MBIM) || defined (WITH_QMI)
+
+static void
+teardown_context_add_error (TeardownContext *ctx,
+                            MMPort          *port,
+                            GError          *error)
+{
+    if (!ctx->error) {
+        ctx->error = g_error_copy (error);
+        g_prefix_error (&ctx->error,
+                        "[%s] teardown error: ",
+                        mm_port_get_device (port));
+    } else {
+        g_prefix_error (&ctx->error,
+                        "[%s] teardown error: %s; ",
+                        mm_port_get_device (port),
+                        error->message);
+    }
+}
+
+#endif
+
+#if defined WITH_MBIM
+
+static void
+mbim_port_close_ready (MMPortMbim      *port,
+                       GAsyncResult    *res,
+                       TeardownContext *ctx)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (!mm_port_mbim_close_finish (port, res, &error))
+        teardown_context_add_error (ctx, MM_PORT (port), error);
+    teardown_context_unref (ctx);
+}
+
+#endif
+
+#if defined WITH_QMI
+
+static void
+qmi_port_close_ready (MMPortQmi       *port,
+                      GAsyncResult    *res,
+                      TeardownContext *ctx)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (!mm_port_qmi_close_finish (port, res, &error))
+        teardown_context_add_error (ctx, MM_PORT (port), error);
+    teardown_context_unref (ctx);
+}
+
+#endif
+
+static void
+cleanup_modem_port (MMBaseModem     *self,
+                    MMPort          *port,
+                    TeardownContext *ctx)
 {
     mm_obj_dbg (self, "cleaning up port '%s/%s'...",
                 mm_port_subsys_get_string (mm_port_get_subsys (MM_PORT (port))),
@@ -1815,10 +2315,20 @@ cleanup_modem_port (MMBaseModem *self,
     g_signal_handlers_disconnect_by_func (port, port_timed_out_cb, self);
     g_signal_handlers_disconnect_by_func (port, port_removed_cb, self);
 
+    if (ctx)
+        teardown_context_ref (ctx);
+
+    /* No need to close serial ports here as they do not require a specific
+     * shutdown procedure with message exchanges and callbacks. They will be
+     * closed when the modem is invalidated or disposed.
+     */
+
 #if defined WITH_MBIM
     /* We need to close the MBIM port cleanly when disposing the modem object */
     if (MM_IS_PORT_MBIM (port)) {
-        mm_port_mbim_close (MM_PORT_MBIM (port), NULL, NULL);
+        mm_port_mbim_close (MM_PORT_MBIM (port),
+                            ctx ? (GAsyncReadyCallback)mbim_port_close_ready : NULL,
+                            ctx);
         return;
     }
 #endif
@@ -1829,27 +2339,61 @@ cleanup_modem_port (MMBaseModem *self,
      * allocating too many newer allocations will fail with client-ids-exhausted
      * errors. */
     if (MM_IS_PORT_QMI (port)) {
-        mm_port_qmi_close (MM_PORT_QMI (port), NULL, NULL);
+        mm_port_qmi_close (MM_PORT_QMI (port),
+                           ctx ? (GAsyncReadyCallback)qmi_port_close_ready : NULL,
+                           ctx);
         return;
     }
 #endif
+
+    if (ctx)
+        teardown_context_unref (ctx);
 }
 
 static void
-teardown_ports_table (MMBaseModem  *self,
-                      GHashTable  **ht)
+teardown_ports_tables (MMBaseModem     *self,
+                       TeardownContext *ctx)
 {
+    GHashTable **tables[2] = {
+        &self->priv->link_ports,
+        &self->priv->ports,
+    };
     GHashTableIter iter;
     gpointer       value;
     gpointer       key;
+    guint          i;
 
-    if (!*ht)
-        return;
+    for (i = 0; i < G_N_ELEMENTS (tables); i++) {
+        if (*tables[i]) {
+            g_hash_table_iter_init (&iter, *tables[i]);
+            while (g_hash_table_iter_next (&iter, &key, &value))
+                cleanup_modem_port (self, MM_PORT (value), ctx);
+            g_hash_table_destroy (*tables[i]);
+            *tables[i] = NULL;
+        }
+    }
+}
 
-    g_hash_table_iter_init (&iter, *ht);
-    while (g_hash_table_iter_next (&iter, &key, &value))
-        cleanup_modem_port (self, MM_PORT (value));
-    g_hash_table_destroy (g_steal_pointer (ht));
+gboolean
+mm_base_modem_teardown_ports_finish (MMBaseModem   *self,
+                                     GAsyncResult  *res,
+                                     GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+void
+mm_base_modem_teardown_ports (MMBaseModem         *self,
+                              GAsyncReadyCallback  callback,
+                              gpointer             user_data)
+{
+    TeardownContext *ctx;
+
+    self->priv->torn_down = TRUE;
+
+    ctx = teardown_context_new (G_OBJECT (self), callback, user_data);
+    teardown_ports_tables (self, ctx);
+    teardown_context_unref (ctx);
 }
 
 /*****************************************************************************/
@@ -1939,6 +2483,9 @@ set_property (GObject *object,
     case PROP_SUBSYSTEM_VENDOR_ID:
         self->priv->subsystem_vendor_id = g_value_get_uint (value);
         break;
+    case PROP_SUBSYSTEM_DEVICE_ID:
+        self->priv->subsystem_device_id = g_value_get_uint (value);
+        break;
     case PROP_CONNECTION:
         g_clear_object (&self->priv->connection);
         self->priv->connection = g_value_dup_object (value);
@@ -1994,6 +2541,9 @@ get_property (GObject *object,
     case PROP_SUBSYSTEM_VENDOR_ID:
         g_value_set_uint (value, self->priv->subsystem_vendor_id);
         break;
+    case PROP_SUBSYSTEM_DEVICE_ID:
+        g_value_set_uint (value, self->priv->subsystem_device_id);
+        break;
     case PROP_CONNECTION:
         g_value_set_object (value, self->priv->connection);
         break;
@@ -2018,8 +2568,7 @@ finalize (GObject *object)
      * mm_auth_provider_cancel_for_owner (self->priv->authp, object);
     */
 
-    g_assert (!self->priv->enable_tasks);
-    g_assert (!self->priv->disable_tasks);
+    g_assert (!self->priv->scheduled_operations);
 
     mm_obj_dbg (self, "completely disposed");
 
@@ -2050,6 +2599,8 @@ dispose (GObject *object)
     g_cancellable_cancel (self->priv->cancellable);
     g_clear_object (&self->priv->cancellable);
 
+    clear_invalid_from_idle (self);
+
     g_clear_object (&self->priv->primary);
     g_clear_object (&self->priv->secondary);
     g_list_free_full (g_steal_pointer (&self->priv->data), g_object_unref);
@@ -2064,8 +2615,9 @@ dispose (GObject *object)
     g_list_free_full (g_steal_pointer (&self->priv->mbim), g_object_unref);
 #endif
 
-    teardown_ports_table (self, &self->priv->link_ports);
-    teardown_ports_table (self, &self->priv->ports);
+    if (!self->priv->torn_down)
+        mm_obj_warn (self, "teardown not called before dispose");
+    teardown_ports_tables (self, NULL);
 
     g_clear_object (&self->priv->connection);
 
@@ -2085,7 +2637,10 @@ mm_base_modem_class_init (MMBaseModemClass *klass)
 
     g_type_class_add_private (object_class, sizeof (MMBaseModemPrivate));
 
-    /* Virtual methods */
+    klass->create_tty_port = base_modem_create_tty_port;
+    klass->create_usbmisc_port = base_modem_create_usbmisc_port;
+    klass->create_wwan_port = base_modem_create_wwan_port;
+
     object_class->get_property = get_property;
     object_class->set_property = set_property;
     object_class->finalize = finalize;
@@ -2163,6 +2718,14 @@ mm_base_modem_class_init (MMBaseModemClass *klass)
                            0, G_MAXUINT, 0,
                            G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
     g_object_class_install_property (object_class, PROP_SUBSYSTEM_VENDOR_ID, properties[PROP_SUBSYSTEM_VENDOR_ID]);
+
+    properties[PROP_SUBSYSTEM_DEVICE_ID] =
+        g_param_spec_uint (MM_BASE_MODEM_SUBSYSTEM_DEVICE_ID,
+                           "Hardware subsystem device ID",
+                           "Hardware subsystem device ID. Available for pci devices.",
+                           0, G_MAXUINT, 0,
+                           G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY);
+    g_object_class_install_property (object_class, PROP_SUBSYSTEM_DEVICE_ID, properties[PROP_SUBSYSTEM_DEVICE_ID]);
 
     properties[PROP_CONNECTION] =
         g_param_spec_object (MM_BASE_MODEM_CONNECTION,
