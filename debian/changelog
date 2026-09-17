@@ -1,9 +1,3 @@
-modemmanager (1.24.0-1+deb13u2) unstable; urgency=medium
-
-  * Rebuild with LTO enabled (dpkg vendor feature optimize/lto).
-
- -- tunaichao <tunaichao@uniontech.com>  Fri, 11 Sep 2026 17:09:25 +0800
-
 modemmanager (1.24.0-1+deb13u1) trixie; urgency=medium
 
   * d/gbp.conf: target stable branch
